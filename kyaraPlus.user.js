@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Plus
 // @namespace    https://github.com/Mxyuki/Kyara-Script
-// @version      1.1.1
+// @version      1.1.2
 // @description  Améliore kyara.games : rareté et exemplaires possédés sur les offres d’échange, bouton « Donner » sous chaque carte, wishlist en premier, offres cachées par le site, verrouillage depuis la collection, comptoir masquable.
 // @author       Myuki
 // @homepageURL  https://github.com/Mxyuki/Kyara-Script
@@ -74,7 +74,6 @@
     collectionSlot: '.cell > a.slot',
     collectionBar: '.mk',
     collectionLockIcon: '.pin',
-    collectionSell: '.sell', // in .mk: sell button, or « 🔒 Verrouillée » (class "sell wait") when locked
     wikiLockButton: 'button[aria-pressed]', // text « 🔒 Verrouiller » / « 🔓 Déverrouiller », aria-pressed="true" when locked
     // Collection › Albums view (same URL /collection, toggled by the « Albums » button)
     albumList: 'ul.albums',
@@ -660,21 +659,14 @@
       position: absolute; top: 6px; right: 6px; z-index: 6; pointer-events: none;
       padding: 2px 5px; border-radius: 8px; font-size: 13px; background: rgba(0,0,0,.65);
     }
-    /* Toggle that replaces the site's « 🔒 Verrouillée » label (it copies the site's classes, so it looks the same) */
-    .kp-lock-toggle { cursor: pointer; font: inherit; }
-    .kp-lock-toggle .kp-l-hover, .kp-lock-toggle:hover .kp-l-idle { display: none; }
-    .kp-lock-toggle:hover .kp-l-hover { display: inline; }
-    .kp-lock-pill {
-      display: inline-flex; align-items: center; height: 24px; padding: 0 10px; white-space: nowrap;
-      border-radius: 999px; border: 1px solid ${COLORS.wishlist}; background: transparent;
-      font: 700 11px system-ui, sans-serif; color: ${COLORS.wishlist};
-    }
-    /* Small lock button next to the site's sell button, on unlocked cards */
+    /* Small lock toggle next to the site's sell button / label (left untouched) */
     .kp-lock-mini {
       display: inline-grid; place-items: center; width: 26px; height: 26px; padding: 0; cursor: pointer; flex: none;
       border-radius: 999px; border: 1px solid var(--line2, #2e2b36); background: transparent; font-size: 12px;
+      opacity: .55;
     }
-    .kp-lock-mini:hover { border-color: ${COLORS.wishlist}; }
+    .kp-lock-mini:hover { border-color: ${COLORS.wishlist}; opacity: 1; }
+    .kp-lock-mini[aria-pressed="true"] { border-color: ${COLORS.wishlist}; background: rgba(0,0,0,.35); opacity: 1; }
     [data-kp-control][data-kp-busy] { opacity: .6; cursor: wait; }
     .kp-hidden-frame {
       position: fixed; left: -10000px; top: 0; width: 1200px; height: 800px; /* desktop size so the site renders its button */
@@ -1102,8 +1094,7 @@
 
   /**
    * Collection page: lock / unlock each owned card in place (no need to open its wiki page).
-   * - Locked card: the site's « 🔒 Verrouillée » label is replaced by an identical-looking toggle.
-   * - Unlocked card: a small 🔒 button next to the site's sell button.
+   * A small 🔒 toggle next to the site's sell button / label, which stays as the site renders it.
    */
   const collectionLocks = {
     name: 'collectionLocks',
@@ -1137,42 +1128,19 @@
     },
 
     /**
-     * The toggle in the card's bar (.mk). Its look depends on what the site shows there:
-     * - « full »: replaces the site's lock label (copying its classes), or a locked-looking pill;
-     * - « mini »: a small 🔒 next to the site's (real) sell button.
+     * A small 🔒 toggle in the card's bar (.mk), next to the site's own element (sell button or label),
+     * which is left untouched: it is used for other things than the lock (e.g. resale delay).
      */
     renderControl(bar, id, locked) {
       const busy = this.busy.has(id);
-      const siteSell = bar.querySelector(`:scope > ${SITE.collectionSell}:not([data-kp-control])`);
-      // The site's label says "locked" (it stays so after we unlock, until the page is reloaded)
-      const siteShowsLock = !!siteSell && (siteSell.classList.contains('wait') || /verrouill/i.test(siteSell.textContent));
-      const full = locked || siteShowsLock;
-
-      // The site's element is stale or replaced as soon as our toggle shows the lock state
-      if (siteSell) setAttr(siteSell, 'data-kp-hidden', full ? '' : null);
-
       let control = bar.querySelector(':scope > [data-kp-control]');
-      if (!control) bar.appendChild(control = el('button', { type: 'button', 'data-kp-control': '', onClick: () => this.toggle(id) }));
+      if (!control) bar.appendChild(control = el('button', { type: 'button', class: 'kp-lock-mini', 'data-kp-control': '', onClick: () => this.toggle(id) }));
       setAttr(control, 'data-kp-busy', busy ? '' : null);
-
-      const look = siteShowsLock ? siteSell.className : '';
-      const signature = [full, locked, busy, look].join('|');
-      if (control.dataset.kpSignature === signature) return;
-      control.dataset.kpSignature = signature;
-
-      if (full) {
-        control.className = (siteShowsLock ? look : 'kp-lock-pill') + ' kp-lock-toggle';
-        control.replaceChildren(
-          el('span', { class: 'kp-l-idle', text: busy ? '…' : locked ? '🔒 Verrouillée' : '🔓 Déverrouillée' }),
-          el('span', { class: 'kp-l-hover', text: busy ? '…' : locked ? '🔓 Déverrouiller' : '🔒 Verrouiller' }));
-        control.title = locked
-          ? 'Carte verrouillée : clique pour la déverrouiller'
-          : 'Carte déverrouillée : recharge la page pour la vendre, ou clique pour la reverrouiller';
-      } else {
-        control.className = 'kp-lock-mini';
-        control.textContent = busy ? '…' : '🔒';
-        control.title = 'Verrouiller cette carte : elle ne pourra plus être vendue, échangée ni recyclée';
-      }
+      setAttr(control, 'aria-pressed', String(locked));
+      setText(control, busy ? '…' : '🔒');
+      setAttr(control, 'title', locked
+        ? 'Carte verrouillée : clique pour la déverrouiller'
+        : 'Verrouiller cette carte : elle ne pourra plus être vendue, échangée ni recyclée');
     },
 
     /**
