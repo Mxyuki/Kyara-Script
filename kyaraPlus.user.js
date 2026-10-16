@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Plus
 // @namespace    https://github.com/Mxyuki/Kyara-Script
-// @version      1.1
+// @version      1.1.1
 // @description  Améliore kyara.games : rareté et exemplaires possédés sur les offres d’échange, bouton « Donner » sous chaque carte, wishlist en premier, offres cachées par le site, verrouillage depuis la collection, comptoir masquable.
 // @author       Myuki
 // @homepageURL  https://github.com/Mxyuki/Kyara-Script
@@ -49,9 +49,8 @@
     wishlist: 'kp-wishlist',
     showChat: 'kp-show-chat',
     lockRequest: 'kp-lock-request', // { url: '…{id}…', stateKey, idKey } learned from the site
-    albumFilters: 'kp-album-filters', // { min, miss: ['c','u',…] }
-    duplicateFilter: 'kp-duplicate-filter', // true: exchanges only show offers asking for a card you own ×2+
   };
+  // Filters (albums, « Que j’ai en double ») are NOT stored: they reset on every page load.
 
   /** Site DOM selectors. The site is Svelte: never rely on the svelte-xxxx hash classes. */
   const SITE = {
@@ -832,43 +831,48 @@
 
   /** True when the offer asks for at least one card you own in 2+ copies. */
   const asksForDuplicate = (wantIds) => wantIds.some((id) => ownedQty(id) >= 2);
-  const duplicateFilterOn = () => !!storage.get(STORAGE.duplicateFilter, false) && !!state.collection;
 
   /**
-   * Exchanges: « Que j’ai en double » pill next to the site's filter pills.
+   * Exchanges (/marche?onglet=offres): « Que j’ai en double » pill right after the site's « Que je peux accepter ».
    * When on, only offers asking for a card you own ×2+ are shown (site offers here, hidden offers in `hiddenOffers`).
+   * Off on every page load (not stored).
    */
   const duplicateFilter = {
     name: 'duplicateFilter',
+    on: false,
+
+    isOn() { return this.on && !!state.collection; },
+
     run() {
-      const filters = document.querySelector(SITE.offerFilters);
-      if (filters) this.renderPill(filters);
-      const on = duplicateFilterOn();
+      this.renderPill();
+      const on = this.isOn();
       document.querySelectorAll(SITE.offer).forEach((offer) => {
         const wantIds = [...offer.querySelectorAll(`${SITE.offerWant} ${SITE.offerThumb}`)].map((a) => wikiId(a.getAttribute('href'))).filter(Boolean);
         setAttr(offer, 'data-kp-hidden', on && !asksForDuplicate(wantIds) ? '' : null);
       });
     },
 
-    renderPill(filters) {
-      const sitePills = [...filters.querySelectorAll(':scope > .pill:not([data-kp-pill])')];
-      let pill = filters.querySelector(':scope > [data-kp-pill]');
+    renderPill() {
+      // Only the exchanges filter bar has « Que je peux accepter »: other market tabs have a .filters bar too
+      const anchor = [...document.querySelectorAll(SITE.offerPill)]
+        .find((p) => !p.hasAttribute('data-kp-pill') && /accepter/i.test(p.textContent));
+      document.querySelectorAll('[data-kp-pill]').forEach((p) => { if (!anchor || p.previousElementSibling !== anchor) p.remove(); });
+      if (!anchor) return;
+
+      let pill = anchor.nextElementSibling && anchor.nextElementSibling.hasAttribute('data-kp-pill') ? anchor.nextElementSibling : null;
       if (!pill) {
         pill = el('button', {
           type: 'button',
           'data-kp-pill': '',
           text: 'Que j’ai en double',
           title: 'N’afficher que les échanges qui demandent une carte que tu as en au moins 2 exemplaires',
-          onClick: () => { storage.set(STORAGE.duplicateFilter, !storage.get(STORAGE.duplicateFilter, false)); scheduleRender(); },
+          onClick: () => { this.on = !this.on; scheduleRender(); },
         });
-        // Right after « Que je peux accepter » (else after the last site pill)
-        const anchor = sitePills.find((p) => /accepter/i.test(p.textContent)) || sitePills[sitePills.length - 1];
-        if (anchor) anchor.after(pill); else filters.appendChild(pill);
+        anchor.after(pill);
       }
-      const on = !!storage.get(STORAGE.duplicateFilter, false);
-      const base = sitePills[0] ? sitePills[0].className.replace(/\bon\b/g, '').trim() : 'pill';
-      setAttr(pill, 'class', on ? `${base} on` : base);
-      setAttr(pill, 'aria-pressed', String(on));
+      const base = anchor.className.replace(/\bon\b/g, '').replace(/\s+/g, ' ').trim();
+      setAttr(pill, 'class', this.on ? `${base} on` : base);
+      setAttr(pill, 'aria-pressed', String(this.on));
     },
   };
 
@@ -988,7 +992,7 @@
 
       const canGive = (o) => (o.wantIds || []).some((w) => freeCopies(w) > 0);
       const rank = (o) => (inWishlist(o.characterId) ? (canGive(o) ? 0 : 1) : canGive(o) ? 2 : 3);
-      const duplicatesOnly = duplicateFilterOn();
+      const duplicatesOnly = duplicateFilter.isOn();
       const missing = state.serverOffers
         .filter((o) => !shown.has(o.id))
         .filter((o) => !duplicatesOnly || asksForDuplicate((o.wantIds || []).map(String)))
@@ -1232,19 +1236,19 @@
   /**
    * Collection › Albums: filters (minimum album size, « il ne me manque que » rarities).
    * The site shows 120 albums per page: while a filter is active, « Afficher plus » is clicked until all are loaded.
+   * Kept in memory only: no filter on every page load.
    */
   const albumFilters = {
     name: 'albumFilters',
     lastMoreClick: 0,
+    current: { min: 0, miss: [] },
 
-    settings() {
-      const s = storage.get(STORAGE.albumFilters, {});
-      return { min: Math.max(0, +s.min || 0), miss: Array.isArray(s.miss) ? s.miss : [] };
-    },
+    settings() { return this.current; },
     save(patch) {
-      storage.set(STORAGE.albumFilters, { ...this.settings(), ...patch });
+      this.current = { ...this.current, ...patch };
       scheduleRender();
     },
+    reset() { this.current = { min: 0, miss: [] }; },
     isActive(s) { return s.min > 0 || s.miss.length > 0; },
 
     /**
@@ -1309,7 +1313,7 @@
           el('span', { class: 'kp-af-group' },
             el('span', { class: 'kp-af-label', text: 'Il ne me manque que' }),
             rarityChips),
-          el('button', { type: 'button', class: 'kp-af-reset', text: 'Réinitialiser', onClick: () => { storage.remove(STORAGE.albumFilters); this.syncPanel(panel, this.settings()); scheduleRender(); } }),
+          el('button', { type: 'button', class: 'kp-af-reset', text: 'Réinitialiser', onClick: () => { this.reset(); this.syncPanel(panel, this.settings()); scheduleRender(); } }),
           el('span', { class: 'kp-af-count' }));
         tools.appendChild(panel);
         this.syncPanel(panel, s);
