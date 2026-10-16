@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Plus
 // @namespace    https://github.com/Mxyuki/Kyara-Script
-// @version      1.1.3
+// @version      1.2.0
 // @description  Améliore kyara.games : rareté et exemplaires possédés sur les offres d’échange, bouton « Donner » sous chaque carte, wishlist en premier, offres cachées par le site, verrouillage depuis la collection, comptoir masquable.
 // @author       Myuki
 // @homepageURL  https://github.com/Mxyuki/Kyara-Script
@@ -35,6 +35,8 @@
     offers: /\/api\/[^?]*offers(\?|$)/,
     characters: /\/api\/[^?]*characters(\?|$)/,
     wishlist: /\/api\/[^?]*wish/i,
+    tradeAvailable: /\/api\/trades\/available\/([0-9a-f-]+)(?:\?|$)/i, // a player's tradable cards [{ characterId, n }]
+    prices: /\/api\/fair-play\/prices\?/, // ?ids=1,2,3 -> { "<cardId>": price }
     lock: /\/api\/(?:[^?]*\/)?pin(?:[/?]|$)/, // POST, sent by the 🔒 button of a wiki page
   };
 
@@ -49,6 +51,7 @@
     wishlist: 'kp-wishlist',
     showChat: 'kp-show-chat',
     lockRequest: 'kp-lock-request', // { url: '…{id}…', stateKey, idKey } learned from the site
+    catalogUrl: 'kp-catalog-url', // path of the site's card catalogue request, to load it on pages that do not
   };
   // Filters (albums, « Que j’ai en double ») are NOT stored: they reset on every page load.
 
@@ -86,7 +89,32 @@
     albumTools: '.al-tools',
     albumMore: '.more button', // « Afficher plus · 1 035 albums » (120 albums per page)
     viewButtons: '.views button', // « Cartes » / « Albums »
+    // Profile › trade window (« Proposer un échange à <pseudo> »)
+    profilePage: /^\/profil\/([0-9a-f-]+)/i,
+    tradeShelf: '[role="dialog"] .shelf',
+    tradeTab: '.tabs [role="tab"]', // « Mes cartes » / « Cartes de <pseudo> », aria-selected="true" when shown
+    partnerTab: /^\s*cartes de\s/i,
+    tradeChips: '.filters .chips',
+    tradeSearch: '.filters input[type="search"]',
+    tradeChip: 'button.only', // aria-pressed. Mine: « Mes doubles », « Il lui manque »; partner's: « Je l’ai », « Il me manque »
+    tradeChipOwned: /je l.ai/i, // partner's tab: only the cards I own
+    tradeChipMissing: /il me manque/i, // partner's tab: only the cards I do not own
+    tradeRarityChip: '.chips button:not(.only)', // « Toutes », M L E R U C; class « on » when selected
+    tradeGrid: 'ul.grid:not([data-kp-grid])', // shows 60 cards at most: the search is needed to reach the others
+    // img src …/<cardId>.webp, span.r (rarity letter), span.nm (name), span.lack « Il me manque » (only if I do not own it),
+    // span.pr.mono price « 1 002 ◆ », span.have « ×N dispo »
+    tradeTile: 'button.tile',
+    tradeTilePrice: '.pr',
+    cardImageId: /\/(\d+)[^/]*\.webp(?:[?#]|$)/, // card id in a card image URL
   };
+
+  /** Trade API URL of a player's tradable cards. */
+  const tradeAvailableUrl = (userId) => `/api/trades/available/${userId}`;
+  /** Card prices (the « ◆ » value the site shows), by batch of ids like the site asks for them. */
+  const pricesUrl = (ids) => `/api/fair-play/prices?ids=${ids.join(',')}`;
+  const PRICES_BATCH = 60;
+  /** My collection, as the site requests it (used when this page did not load it). */
+  const COLLECTION_URL = '/api/me/collection?lean=1';
 
   /** Hash used to open an album in a new tab: /collection#kp-album=<name>. */
   const ALBUM_HASH = 'kp-album=';
@@ -193,6 +221,10 @@
     /** Open exchange offers as sent by the server (the site only displays 120 of them). */
     serverOffers: [],
     offersVersion: 0,
+    /** Map<userId, Map<cardId, n>>: tradable copies of other players (trade window). */
+    tradeAvailable: new Map(),
+    /** Map<cardId, price> from /api/fair-play/prices (the site's requests and ours). */
+    prices: new Map(),
   };
 
   const ownedQty = (id) => (state.collection && state.collection.get(String(id))?.qty) || 0;
@@ -311,6 +343,29 @@
     return map.size ? { map, sample: entries[0] } : null;
   }
 
+  /** /api/trades/available/<userId> -> Map<cardId, n> ([{ characterId, n }], n = tradable copies). */
+  function parseTradeAvailable(data) {
+    const entries = findEntries(data);
+    if (!entries) return null;
+    const map = new Map();
+    for (const e of entries) {
+      const id = entryId(e);
+      if (id) map.set(id, (map.get(id) || 0) + (+(e && e.n) || 1));
+    }
+    return map;
+  }
+
+  /** /api/fair-play/prices?ids=… -> Map<cardId, price> ({ "28331": 200, … }; a list of { id, price } is accepted too). */
+  function parsePrices(data) {
+    if (!data || typeof data !== 'object') return null;
+    const pairs = Array.isArray(data)
+      ? data.map((e) => [entryId(e), e && (e.price ?? e.value ?? e.median)])
+      : Object.entries(data);
+    const map = new Map();
+    for (const [id, price] of pairs) if (id && Number.isFinite(+price) && price !== null) map.set(String(id), +price);
+    return map;
+  }
+
   /** /api/.../offers -> open exchange offers [{ id, user:{pseudo}, characterId, wantIds, expiresAt, ... }] */
   function parseOffers(data) {
     const list = findEntries(data);
@@ -346,12 +401,31 @@
     },
     {
       match: API.characters,
-      handle(data) {
+      handle(data, url) {
         const parsed = parseCatalog(data);
         if (!parsed) return;
         state.catalog = parsed.map;
+        if (url) { const u = new URL(url, location.origin); storage.set(STORAGE.catalogUrl, u.pathname + u.search); }
         const withRarity = [...parsed.map.values()].filter((c) => c.rarity).length;
         log(`catalogue : ${parsed.map.size} cartes (${withRarity} avec rareté). Exemple :`, JSON.stringify(parsed.sample).slice(0, 300));
+      },
+    },
+    {
+      match: API.tradeAvailable,
+      handle(data, url) {
+        const userId = (API.tradeAvailable.exec(url) || [])[1];
+        const cards = parseTradeAvailable(data);
+        if (!userId || !cards) return warn('format des cartes échangeables non reconnu', data);
+        state.tradeAvailable.set(userId.toLowerCase(), cards);
+        log('cartes échangeables du joueur :', cards.size, 'dont', [...cards.values()].filter((n) => n > 1).length, 'en double');
+      },
+    },
+    {
+      match: API.prices,
+      handle(data) {
+        const prices = parsePrices(data);
+        if (!prices) return warn('format des prix non reconnu', data);
+        for (const [id, price] of prices) state.prices.set(id, price);
       },
     },
     {
@@ -373,10 +447,10 @@
   const isRequest = (x) => typeof Request !== 'undefined' && x instanceof Request;
 
   /** Feed a response to its handler. Resolves true once fresh data was handled (never rejects). */
-  function readResponse(promise, handler) {
+  function readResponse(promise, handler, url) {
     return promise
       .then((res) => (res.ok ? res.clone().json() : null))
-      .then((data) => { if (!data) return false; handler.handle(data); scheduleRender(); return true; })
+      .then((data) => { if (!data) return false; handler.handle(data, String(url)); scheduleRender(); return true; })
       .catch(() => false); // not JSON, 304, network error…
   }
 
@@ -392,7 +466,7 @@
           const request = { input: isRequest(input) ? input.clone() : input, init };
           if (handler.match === API.collection) lastCollectionRequest = request;
           const offersBefore = state.offersVersion;
-          readResponse(promise, handler).then(() => {
+          readResponse(promise, handler, url).then(() => {
             // Other "offers" APIs exist: only keep the one that returned the exchange list
             if (handler.match === API.offers && state.offersVersion > offersBefore) lastOffersRequest = request;
           });
@@ -444,11 +518,52 @@
     const { input, init } = request;
     const url = isRequest(input) ? input.url : input;
     const handler = HANDLERS.find((h) => h.match === api);
-    return readResponse(nativeFetch(url, { ...(init || {}), headers: siteHeaders(request), cache: 'no-store' }), handler);
+    return readResponse(nativeFetch(url, { ...(init || {}), headers: siteHeaders(request), cache: 'no-store' }), handler, url);
   }
 
   const reloadCollection = () => replayRequest(lastCollectionRequest, API.collection);
+  /** GET my collection: the site's own request if seen, else its usual URL (read only). */
+  function loadCollection() {
+    if (lastCollectionRequest) return reloadCollection();
+    const handler = HANDLERS.find((h) => h.match === API.collection);
+    return readResponse(nativeFetch(COLLECTION_URL, { credentials: 'same-origin', cache: 'no-store' }), handler, COLLECTION_URL);
+  }
   const reloadOffers = () => replayRequest(lastOffersRequest, API.offers);
+
+  /** GET a player's tradable cards (read only), when the site did not load them itself. */
+  function loadTradeAvailable(userId) {
+    const url = tradeAvailableUrl(userId);
+    const handler = HANDLERS.find((h) => h.match === API.tradeAvailable);
+    return readResponse(nativeFetch(url, { headers: siteHeaders() || undefined, credentials: 'same-origin', cache: 'no-store' }), handler, url);
+  }
+
+  /** Card ids whose price was already asked (by us), so each one is asked once per page load. */
+  const pricesAsked = new Set();
+
+  /** GET the prices of the given cards that are not known yet, by batches like the site (read only). */
+  function loadPrices(ids) {
+    const missing = ids.map(String).filter((id) => !state.prices.has(id) && !pricesAsked.has(id));
+    if (!missing.length) return Promise.resolve(true);
+    missing.forEach((id) => pricesAsked.add(id));
+    const handler = HANDLERS.find((h) => h.match === API.prices);
+    const batches = [];
+    for (let i = 0; i < missing.length; i += PRICES_BATCH) {
+      const url = pricesUrl(missing.slice(i, i + PRICES_BATCH));
+      batches.push(readResponse(nativeFetch(url, { headers: siteHeaders() || undefined, credentials: 'same-origin' }), handler, url));
+    }
+    return Promise.all(batches).then((oks) => oks.every(Boolean));
+  }
+
+  /** « 1 002 ◆ », like the site. */
+  const priceText = (price) => `${Math.round(price).toLocaleString('fr-FR')} ◆`;
+
+  /** GET the card catalogue (names, rarities) like the site does, when this page did not load it. */
+  function loadCatalog() {
+    if (state.catalog.size) return Promise.resolve(true);
+    const url = storage.get(STORAGE.catalogUrl, null) || '/api/characters';
+    const handler = HANDLERS.find((h) => h.match === API.characters);
+    return readResponse(nativeFetch(url, { headers: siteHeaders() || undefined, credentials: 'same-origin' }), handler, url);
+  }
 
   /**
    * Learn the lock request from a real one sent by the site (wiki page 🔒 button):
@@ -649,6 +764,12 @@
     .kp-refresh[data-kp-busy] { cursor: wait; opacity: .7; }
     .kp-refresh[data-kp-busy] svg { animation: kp-spin .8s linear infinite; }
     @keyframes kp-spin { to { transform: rotate(360deg); } }
+
+    /* ---- Profile › trade window: « Ses doubles » chip ---- */
+    [data-kp-dupes] .kp-n { margin-left: 4px; opacity: .7; }
+    [data-kp-dupes][data-kp-busy] { cursor: wait; opacity: .7; }
+    .kp-trade-empty { grid-column: 1 / -1; list-style: none; margin: 12px 0; text-align: center; font-size: 13px; color: var(--fg2, #b7b2bd); }
+    [data-kp-grid] .kp-adding { opacity: .5; cursor: wait; }
 
     /* ---- Offers the site does not display ---- */
     .kp-extra { display: flex; flex-direction: column; gap: 10px; margin-top: 18px; }
@@ -1305,6 +1426,174 @@
     },
   };
 
+  /**
+   * Profile › trade window, « Cartes de <pseudo> » tab: « Ses doubles » chip after the site's chips.
+   * The site's grid shows 60 cards at most, so filtering it is not enough: when on, the site's grid is hidden and
+   * ours lists every card the player can trade in 2+ copies (n > 1 in /api/trades/available/<id>, read from the
+   * site's own request, else fetched once). Clicking one of ours types its name in the site's search and clicks
+   * the site's own tile, then restores the search. In memory only: off when the window closes.
+   */
+  const partnerDuplicates = {
+    name: 'partnerDuplicates',
+    on: false,
+    busy: false,
+    adding: null, // card id being added through the site's search
+    userId: null,
+
+    run() {
+      const shelf = document.querySelector(SITE.tradeShelf);
+      const profile = SITE.profilePage.exec(location.pathname);
+      if (!shelf || !profile) { this.on = false; this.userId = null; return; }
+      const userId = profile[1].toLowerCase();
+      if (userId !== this.userId) { this.userId = userId; this.on = false; }
+
+      const partnerShown = [...shelf.querySelectorAll(SITE.tradeTab)]
+        .some((t) => t.getAttribute('aria-selected') === 'true' && SITE.partnerTab.test(t.textContent));
+      const chips = shelf.querySelector(SITE.tradeChips);
+      let chip = shelf.querySelector('[data-kp-dupes]');
+      if (!partnerShown || !chips) {
+        if (chip) chip.remove();
+        return this.renderGrid(shelf, null);
+      }
+
+      const siteChips = [...chips.querySelectorAll(SITE.tradeChip)].filter((c) => !c.hasAttribute('data-kp-dupes'));
+      if (!chip) {
+        chip = el('button', {
+          type: 'button',
+          'data-kp-dupes': '',
+          title: 'N’afficher que les cartes qu’il peut échanger en au moins 2 exemplaires',
+          onClick: () => this.toggle(),
+        }, 'Ses doubles', el('span', { class: 'kp-n' }));
+        if (siteChips.length) siteChips[siteChips.length - 1].after(chip);
+        else chips.prepend(chip);
+      }
+      const base = siteChips.length ? siteChips[0].className.replace(/\bon\b/g, '').replace(/\s+/g, ' ').trim() : '';
+      setAttr(chip, 'class', this.on ? `${base} on` : base);
+      setAttr(chip, 'aria-pressed', String(this.on));
+      setAttr(chip, 'data-kp-busy', this.busy ? '' : null);
+
+      const cards = state.tradeAvailable.get(userId);
+      const count = cards ? [...cards.values()].filter((n) => n > 1).length : null;
+      setText(chip.querySelector('.kp-n'), count === null ? '' : String(count));
+      this.renderGrid(shelf, this.on && cards ? cards : null);
+    },
+
+    /** Card id of a site tile, from its image URL. */
+    tileId(tile) {
+      const img = tile.querySelector('img');
+      return img && (SITE.cardImageId.exec(img.getAttribute('src') || '') || [])[1];
+    },
+
+    /** The site's own filters, applied to our grid too: « Je l’ai », « Il me manque », rarity chips. */
+    siteFilters(shelf) {
+      const chips = shelf.querySelector(SITE.tradeChips);
+      const pressed = (re) => !!chips && [...chips.querySelectorAll(SITE.tradeChip)]
+        .some((c) => !c.hasAttribute('data-kp-dupes') && c.getAttribute('aria-pressed') === 'true' && re.test(c.textContent));
+      const rarities = chips ? [...chips.querySelectorAll(SITE.tradeRarityChip)]
+        .filter((b) => b.classList.contains('on')).map((b) => rarityFromCode(b.textContent.trim())).filter(Boolean) : [];
+      return { owned: pressed(SITE.tradeChipOwned), missing: pressed(SITE.tradeChipMissing), rarities };
+    },
+
+    /** Our grid of duplicates in place of the site's one (cards = null: back to the site's grid). */
+    renderGrid(shelf, cards) {
+      const siteGrid = shelf.querySelector(SITE.tradeGrid);
+      let grid = shelf.querySelector('[data-kp-grid]');
+      if (siteGrid) setAttr(siteGrid, 'data-kp-hidden', cards ? '' : null);
+      if (!cards) { if (grid) grid.remove(); return; }
+
+      // While adding a card, the search holds its name: keep filtering with the user's own query
+      const search = shelf.querySelector(SITE.tradeSearch);
+      const query = this.adding ? (grid && grid.dataset.kpQuery) || '' : ((search && search.value) || '').trim().toLowerCase();
+      const filters = this.siteFilters(shelf);
+      const known = !!state.collection; // without my collection, « Je l’ai » / « Il me manque » cannot be applied
+      const dupes = [...cards].filter(([, n]) => n > 1);
+      loadPrices(dupes.map(([id]) => id)); // once per card, re-renders when they arrive
+      const list = dupes
+        .map(([id, n]) => ({ id, n, owned: ownedQty(id) > 0, price: state.prices.has(id) ? priceText(state.prices.get(id)) : null, ...cardInfo(id) }))
+        .filter((c) => !query || c.name.toLowerCase().includes(query))
+        .filter((c) => !known || ((!filters.owned || c.owned) && (!filters.missing || !c.owned)))
+        .filter((c) => !filters.rarities.length || filters.rarities.includes(c.rarity))
+        .sort((a, b) => RARITIES.indexOf(b.rarity) - RARITIES.indexOf(a.rarity) || a.name.localeCompare(b.name));
+      const filtered = !!(query || filters.owned || filters.missing || filters.rarities.length);
+
+      if (!grid) {
+        grid = el('ul', { 'data-kp-grid': '' });
+        const filters = shelf.querySelector(SITE.offerFilters);
+        if (siteGrid) siteGrid.after(grid);
+        else if (filters) filters.after(grid);
+        else shelf.appendChild(grid);
+      }
+      setAttr(grid, 'class', siteGrid ? siteGrid.className : 'grid');
+
+      const signature = [list.map((c) => `${c.id}:${c.n}:${known && c.owned}:${c.price || ''}`).join(','), state.catalog.size, query, filtered, this.adding].join('@');
+      if (grid.dataset.kpSignature === signature) return;
+      grid.dataset.kpSignature = signature;
+      grid.dataset.kpQuery = query;
+
+      // Same markup and classes as the site's tiles: img, .r, .nm, .lack, .pr, .have
+      const cls = (sel, fallback) => (siteGrid && siteGrid.querySelector(`${SITE.tradeTile} ${sel}`)?.className) || fallback;
+      const tileClass = (siteGrid && siteGrid.querySelector(SITE.tradeTile)?.className) || 'tile';
+      grid.replaceChildren(...(list.length ? list.map((c) => el('li', { '--rc': rarityColor(c.rarity) },
+        el('button', {
+          type: 'button',
+          class: tileClass + (this.adding === c.id ? ' kp-adding' : ''),
+          'aria-label': `Ajouter ${c.name}`,
+          title: c.known ? `Ajouter ${c.name}` : 'Nom inconnu : catalogue des cartes non chargé',
+          onClick: () => this.add(shelf, c),
+        },
+        el('img', { alt: '', loading: 'lazy', referrerpolicy: 'no-referrer', class: cls('img', ''), src: cardImage(c.id) }),
+        c.rarity && el('span', { class: cls('.r', 'r'), text: RARITY_LETTERS[RARITIES.indexOf(c.rarity)] }),
+        el('span', { class: cls('.nm', 'nm'), text: c.name }),
+        known && !c.owned && el('span', { class: cls('.lack', 'lack'), text: 'Il me manque' }),
+        c.price && el('span', { class: cls(SITE.tradeTilePrice, 'pr mono'), text: c.price }),
+        el('span', { class: cls('.have', 'have'), text: `×${c.n} dispo` }))))
+        : [el('li', { class: 'kp-trade-empty', text: filtered ? 'Aucun double ne correspond à tes filtres.' : 'Aucune carte en double à échanger.' })]));
+    },
+
+    /** Add a card to « Tu reçois »: bring it into the site's grid with its search, then click the site's tile. */
+    async add(shelf, card) {
+      if (this.adding) return;
+      if (!card.known) return alert('Kyara Plus : nom de la carte inconnu (catalogue des cartes non chargé), impossible de la chercher.');
+      const search = shelf.querySelector(SITE.tradeSearch);
+      if (!search) return;
+      const previous = search.value;
+      const setSearch = (value) => { search.value = value; search.dispatchEvent(new Event('input', { bubbles: true })); };
+      this.adding = card.id;
+      scheduleRender();
+      try {
+        setSearch(card.name);
+        const tile = await waitFor(() => [...shelf.querySelectorAll(`${SITE.tradeGrid} ${SITE.tradeTile}`)]
+          .find((t) => this.tileId(t) === card.id), 3000);
+        tile.click();
+      } catch {
+        warn('carte introuvable dans la liste du site :', card.name);
+        alert(`Kyara Plus : « ${card.name} » n’apparaît pas dans la liste du site (un de ses filtres la cache peut-être).`);
+      } finally {
+        setSearch(previous);
+        this.adding = null;
+        scheduleRender();
+      }
+    },
+
+    toggle() {
+      this.on = !this.on;
+      if (this.on && !this.busy && this.userId && (!state.tradeAvailable.has(this.userId) || !state.catalog.size || !state.collection)) {
+        this.busy = true;
+        const userId = this.userId;
+        Promise.all([
+          state.tradeAvailable.has(userId) ? true : loadTradeAvailable(userId),
+          loadCatalog(),
+          state.collection ? true : loadCollection(), // for « Il me manque » / « Je l’ai »
+        ]).then(([cards, catalog, collection]) => {
+          if (!cards) warn('impossible de charger les cartes échangeables du joueur');
+          if (!catalog) warn('impossible de charger le catalogue des cartes');
+          if (!collection) warn('impossible de charger ta collection');
+        }).finally(() => { this.busy = false; scheduleRender(); });
+      }
+      scheduleRender();
+    },
+  };
+
   const RARITY_LETTERS = ['C', 'U', 'R', 'E', 'L', 'M'];
 
   /** Read an album button: { name, owned, total, rarities: { c: { owned, total }, … } }. */
@@ -1497,7 +1786,7 @@
     retry() { setTimeout(scheduleRender, 300); },
   };
 
-  const FEATURES = [chatToggle, marketChatTab, offerCards, duplicateFilter, offersRefresh, hiddenOffers, collectionLocks, albumFilters, albumTabs];
+  const FEATURES = [chatToggle, marketChatTab, offerCards, duplicateFilter, offersRefresh, hiddenOffers, collectionLocks, albumFilters, albumTabs, partnerDuplicates];
 
   /* ==========================================================================
    * 9. CORE — render loop driven by DOM changes (the site is a Svelte SPA)
@@ -1520,7 +1809,7 @@
 
   function start() {
     new MutationObserver(scheduleRender).observe(document.documentElement, {
-      childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class', 'disabled', 'aria-pressed'],
+      childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class', 'disabled', 'aria-pressed', 'aria-selected'],
     });
     // Typing in the site's search box filters the list
     document.addEventListener('input', (e) => { if (e.target.matches?.(SITE.search)) scheduleRender(); }, true);
