@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Plus
 // @namespace    https://github.com/Mxyuki/Kyara-Script
-// @version      1.1.2
+// @version      1.1.3
 // @description  Améliore kyara.games : rareté et exemplaires possédés sur les offres d’échange, bouton « Donner » sous chaque carte, wishlist en premier, offres cachées par le site, verrouillage depuis la collection, comptoir masquable.
 // @author       Myuki
 // @homepageURL  https://github.com/Mxyuki/Kyara-Script
@@ -70,6 +70,8 @@
     chatPage: /^\/marche\/chat/,
     marketPage: /^\/marche/,
     marketTabs: '.tabs[role="tablist"]', // Acheter, Vendre, Enchères, Échanges, Mon activité
+    exchangesTab: /échanges/i, // text of the market tab showing the exchange offers
+    myOffersPill: /mes offres/i, // text of the last exchange filter pill
     collectionPage: /^\/collection/,
     collectionSlot: '.cell > a.slot',
     collectionBar: '.mk',
@@ -190,6 +192,7 @@
     catalog: new Map(),
     /** Open exchange offers as sent by the server (the site only displays 120 of them). */
     serverOffers: [],
+    offersVersion: 0,
   };
 
   const ownedQty = (id) => (state.collection && state.collection.get(String(id))?.qty) || 0;
@@ -337,6 +340,7 @@
         const offers = parseOffers(data);
         if (!offers) return;
         state.serverOffers = offers;
+        state.offersVersion++;
         log('offres d’échange reçues :', offers.length, 'ouvertes');
       },
     },
@@ -364,6 +368,7 @@
 
   const nativeFetch = window.fetch;
   let lastCollectionRequest = null; // kept in memory only, to reload the collection after a trade
+  let lastOffersRequest = null; // idem, to reload the exchange offers (refresh button)
 
   const isRequest = (x) => typeof Request !== 'undefined' && x instanceof Request;
 
@@ -384,8 +389,13 @@
       if (method === 'GET') {
         const handler = HANDLERS.find((h) => h.match.test(url));
         if (handler) {
-          if (handler.match === API.collection) lastCollectionRequest = { input: isRequest(input) ? input.clone() : input, init };
-          readResponse(promise, handler);
+          const request = { input: isRequest(input) ? input.clone() : input, init };
+          if (handler.match === API.collection) lastCollectionRequest = request;
+          const offersBefore = state.offersVersion;
+          readResponse(promise, handler).then(() => {
+            // Other "offers" APIs exist: only keep the one that returned the exchange list
+            if (handler.match === API.offers && state.offersVersion > offersBefore) lastOffersRequest = request;
+          });
         }
       } else {
         const body = isRequest(input) ? input.clone().text() : Promise.resolve(init && init.body);
@@ -418,9 +428,9 @@
    * Headers of the site's own collection request (kept in memory only), reused for our requests.
    * Cache validators are dropped so the server always answers with fresh data (never a 304).
    */
-  function siteHeaders() {
-    if (!lastCollectionRequest) return null;
-    const { input, init } = lastCollectionRequest;
+  function siteHeaders(request = lastCollectionRequest) {
+    if (!request) return null;
+    const { input, init } = request;
     const headers = new Headers(isRequest(input) ? input.headers : undefined);
     new Headers((init && init.headers) || undefined).forEach((value, key) => headers.set(key, value));
     headers.delete('if-none-match');
@@ -428,14 +438,17 @@
     return headers;
   }
 
-  /** Reload the collection like the site did (same URL, same headers). Resolves true if fresh data arrived. */
-  function reloadCollection() {
-    if (!lastCollectionRequest) return Promise.resolve(false);
-    const { input, init } = lastCollectionRequest;
+  /** Send a site GET again (same URL, same headers, fresh data) and feed it to its handler. Resolves true if fresh data arrived. */
+  function replayRequest(request, api) {
+    if (!request) return Promise.resolve(false);
+    const { input, init } = request;
     const url = isRequest(input) ? input.url : input;
-    const handler = HANDLERS.find((h) => h.match === API.collection);
-    return readResponse(nativeFetch(url, { ...(init || {}), headers: siteHeaders(), cache: 'no-store' }), handler);
+    const handler = HANDLERS.find((h) => h.match === api);
+    return readResponse(nativeFetch(url, { ...(init || {}), headers: siteHeaders(request), cache: 'no-store' }), handler);
   }
+
+  const reloadCollection = () => replayRequest(lastCollectionRequest, API.collection);
+  const reloadOffers = () => replayRequest(lastOffersRequest, API.offers);
 
   /**
    * Learn the lock request from a real one sent by the site (wiki page 🔒 button):
@@ -593,9 +606,8 @@
     }
     .kp-owned { font-size: 12px; font-weight: 700; }
 
-    /* ---- Wishlist: highlighted and first (CSS order, the site's list is never reordered) ---- */
-    li.offer[data-kp-wish="2"] { order: -2; }
-    li.offer[data-kp-wish="1"] { order: -1; }
+    /* ---- Order: wishlist first, then rarest first (CSS order, the site's list is never reordered) ---- */
+    li.offer { order: var(--kp-order, 0); }
     li.offer[data-kp-wish], .kp-xoffer.kp-wish { border-color: ${COLORS.wishlist} !important; box-shadow: 0 0 0 1px ${COLORS.wishlist}; }
     .kp-wish-tag { font-size: 12px; font-weight: 700; color: ${COLORS.wishlist}; }
     li.offer.kp-flash { box-shadow: 0 0 0 3px ${COLORS.wishlist} !important; }
@@ -630,6 +642,13 @@
     .kp-state { font-size: 11px; text-align: center; color: var(--fg2, #b7b2bd); }
     .kp-give { width: 100%; justify-content: center; }
     .kp-give.kp-warn { background: ${COLORS.single}; border-color: ${COLORS.single}; color: #111; }
+
+    /* ---- Exchanges: refresh button after « Mes offres » (copies the pill's classes) ---- */
+    .kp-refresh { display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
+    .kp-refresh svg { width: 14px; height: 14px; display: block; }
+    .kp-refresh[data-kp-busy] { cursor: wait; opacity: .7; }
+    .kp-refresh[data-kp-busy] svg { animation: kp-spin .8s linear infinite; }
+    @keyframes kp-spin { to { transform: rotate(360deg); } }
 
     /* ---- Offers the site does not display ---- */
     .kp-extra { display: flex; flex-direction: column; gap: 10px; margin-top: 18px; }
@@ -759,6 +778,19 @@
 
   const stateText = (text) => el('div', { class: 'kp-state', text });
 
+  /** Refresh icon (circular arrow, like fa-refresh), drawn inline: the site has no icon font. */
+  function refreshIcon() {
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS, 'svg');
+    for (const [k, v] of Object.entries({ viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '2.5', 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true' })) svg.setAttribute(k, v);
+    for (const d of ['M20 12a8 8 0 1 1-2.34-5.66', 'M20 3.5v5h-5']) {
+      const path = document.createElementNS(NS, 'path');
+      path.setAttribute('d', d);
+      svg.appendChild(path);
+    }
+    return svg;
+  }
+
   /* ==========================================================================
    * 8. FEATURES — each one is idempotent and safe to run on every DOM change
    * ======================================================================== */
@@ -821,6 +853,15 @@
     link.remove();
   }
 
+  /**
+   * Display order of an offer (lower first): wishlist you can accept, wishlist, then the others;
+   * inside each group, by rarity of the offered card, Mythique first. Unknown rarity: last of its group.
+   */
+  function offerOrder(wish, rarity) {
+    const rank = rarity ? RARITIES.indexOf(rarity) + 1 : 0; // 0 unknown … 6 Mythique
+    return -(wish * 10 + rank);
+  }
+
   /** True when the offer asks for at least one card you own in 2+ copies. */
   const asksForDuplicate = (wantIds) => wantIds.some((id) => ownedQty(id) >= 2);
 
@@ -865,6 +906,90 @@
       const base = anchor.className.replace(/\bon\b/g, '').replace(/\s+/g, ' ').trim();
       setAttr(pill, 'class', this.on ? `${base} on` : base);
       setAttr(pill, 'aria-pressed', String(this.on));
+    },
+  };
+
+  /** A filter pill's label without its counter (« Mes offres 1 » -> « Mes offres »). */
+  const pillLabel = (pill) => pill.textContent.replace(/\d+/g, '').replace(/\s+/g, ' ').trim();
+
+  /**
+   * Exchanges: refresh button right after « Mes offres ». The site's list only reloads when its exchanges
+   * view is mounted again, so we switch to another site tab and back (its own buttons): the site then sends
+   * its own offers request. If it does not, we replay that request ourselves (hidden offers stay fresh).
+   */
+  const offersRefresh = {
+    name: 'offersRefresh',
+    busy: false,
+
+    run() {
+      const anchor = [...document.querySelectorAll(SITE.offerPill)]
+        .find((p) => !p.hasAttribute('data-kp-pill') && !p.hasAttribute('data-kp-refresh') && SITE.myOffersPill.test(p.textContent));
+      document.querySelectorAll('[data-kp-refresh]').forEach((b) => { if (!anchor || b.previousElementSibling !== anchor) b.remove(); });
+      if (!anchor) return;
+
+      let button = anchor.nextElementSibling && anchor.nextElementSibling.hasAttribute('data-kp-refresh') ? anchor.nextElementSibling : null;
+      if (!button) {
+        button = el('button', {
+          type: 'button',
+          'data-kp-refresh': '',
+          title: 'Actualiser les échanges',
+          'aria-label': 'Actualiser les échanges',
+          onClick: () => this.refresh(),
+        }, refreshIcon());
+        anchor.after(button);
+      }
+      const base = anchor.className.replace(/\bon\b/g, '').replace(/\s+/g, ' ').trim();
+      setAttr(button, 'class', `${base} kp-refresh`);
+      setAttr(button, 'data-kp-busy', this.busy ? '' : null);
+    },
+
+    async refresh() {
+      if (this.busy) return;
+      this.busy = true;
+      scheduleRender();
+      const before = state.offersVersion;
+      const pressed = this.sitePills().filter((p) => p.getAttribute('aria-pressed') === 'true').map(pillLabel);
+      try {
+        await this.remountExchanges();
+        await waitFor(() => state.offersVersion > before, 5000);
+        log('échanges actualisés par le site');
+      } catch {
+        // The site did not reload its list: at least get fresh data for the hidden offers
+        if (await reloadOffers()) log('échanges actualisés (requête rejouée)');
+        else warn('impossible d’actualiser les échanges');
+      } finally {
+        await this.restorePills(pressed);
+        this.busy = false;
+        scheduleRender();
+      }
+    },
+
+    /** The site's own filter pills (« Que je n’ai pas », « Que je peux accepter », « Mes offres »). */
+    sitePills() {
+      return [...document.querySelectorAll(SITE.offerPill)].filter((p) => !p.hasAttribute('data-kp-pill') && !p.hasAttribute('data-kp-refresh'));
+    },
+
+    /** Remounting resets the site's pills: press again (site's own buttons) the ones that were on. */
+    async restorePills(labels) {
+      if (!labels.length) return;
+      try { await waitFor(() => this.sitePills().length, 3000); } catch { return warn('filtres du site introuvables après l’actualisation'); }
+      for (const label of labels) {
+        const pill = this.sitePills().find((p) => pillLabel(p) === label);
+        if (pill && pill.getAttribute('aria-pressed') !== 'true') pill.click();
+        await sleep(50); // let the site re-render before looking for the next pill
+      }
+    },
+
+    /** Click another market tab, then « Échanges » again, through the site's own tab buttons. */
+    async remountExchanges() {
+      const tabs = () => [...document.querySelectorAll(`${SITE.marketTabs} button`)].filter((b) => !b.hasAttribute('data-kp-tab'));
+      const exchanges = () => tabs().find((b) => SITE.exchangesTab.test(b.textContent));
+      const other = tabs().find((b) => b !== exchanges());
+      if (!exchanges() || !other) throw new Error('onglets introuvables');
+      other.click();
+      await waitFor(() => { const b = exchanges(); return b && !b.classList.contains('on'); }, 3000);
+      exchanges().click();
+      await waitFor(() => { const b = exchanges(); return b && b.classList.contains('on'); }, 3000);
     },
   };
 
@@ -959,13 +1084,17 @@
       });
     },
 
-    /** "2" = in wishlist and you can accept it now, "1" = in wishlist. */
+    /** data-kp-wish "2" = in wishlist and you can accept it now, "1" = in wishlist. Also sets the display order. */
     markWishlist(offer) {
       const link = offer.querySelector(SITE.offerGiveLink);
       const info = offer.querySelector(SITE.offerGiveInfo);
       if (!link || !info) return;
       const wished = inWishlist(wikiId(link.getAttribute('href')));
-      setAttr(offer, 'data-kp-wish', wished ? (offer.querySelector('.kp-give') ? '2' : '1') : null);
+      const wish = wished ? (offer.querySelector('.kp-give') ? 2 : 1) : 0;
+      setAttr(offer, 'data-kp-wish', wish ? String(wish) : null);
+      const img = link.querySelector('img');
+      const order = String(offerOrder(wish, img && rarityFromImg(img)));
+      if (offer.style.getPropertyValue('--kp-order') !== order) offer.style.setProperty('--kp-order', order);
       const tag = info.querySelector(':scope > .kp-wish-tag');
       if (wished && !tag) info.appendChild(el('span', { class: 'kp-wish-tag', text: '♥ Dans ta wishlist' }));
       else if (!wished && tag) tag.remove();
@@ -983,7 +1112,7 @@
       if (!shown.size) return this.clear();
 
       const canGive = (o) => (o.wantIds || []).some((w) => freeCopies(w) > 0);
-      const rank = (o) => (inWishlist(o.characterId) ? (canGive(o) ? 0 : 1) : canGive(o) ? 2 : 3);
+      const rank = (o) => offerOrder(inWishlist(o.characterId) ? (canGive(o) ? 2 : 1) : 0, cardInfo(o.characterId).rarity) * 2 + (canGive(o) ? 0 : 1);
       const duplicatesOnly = duplicateFilter.isOn();
       const missing = state.serverOffers
         .filter((o) => !shown.has(o.id))
@@ -1368,7 +1497,7 @@
     retry() { setTimeout(scheduleRender, 300); },
   };
 
-  const FEATURES = [chatToggle, marketChatTab, offerCards, duplicateFilter, hiddenOffers, collectionLocks, albumFilters, albumTabs];
+  const FEATURES = [chatToggle, marketChatTab, offerCards, duplicateFilter, offersRefresh, hiddenOffers, collectionLocks, albumFilters, albumTabs];
 
   /* ==========================================================================
    * 9. CORE — render loop driven by DOM changes (the site is a Svelte SPA)
