@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Plus
 // @namespace    https://github.com/Mxyuki/Kyara-Script
-// @version      1.0
+// @version      1.1
 // @description  Améliore kyara.games : rareté et exemplaires possédés sur les offres d’échange, bouton « Donner » sous chaque carte, wishlist en premier, offres cachées par le site, verrouillage depuis la collection, comptoir masquable.
 // @author       Myuki
 // @homepageURL  https://github.com/Mxyuki/Kyara-Script
@@ -49,6 +49,8 @@
     wishlist: 'kp-wishlist',
     showChat: 'kp-show-chat',
     lockRequest: 'kp-lock-request', // { url: '…{id}…', stateKey, idKey } learned from the site
+    albumFilters: 'kp-album-filters', // { min, miss: ['c','u',…] }
+    duplicateFilter: 'kp-duplicate-filter', // true: exchanges only show offers asking for a card you own ×2+
   };
 
   /** Site DOM selectors. The site is Svelte: never rely on the svelte-xxxx hash classes. */
@@ -62,15 +64,32 @@
     offerThumb: 'a.thumb',
     offerActionButtons: '.acts button',
     search: '.filters input[type="search"]',
-    activeFilter: '.filters [aria-pressed="true"]',
+    activeFilter: '.filters [aria-pressed="true"]:not([data-kp-pill])', // the site's own filter pills
+    offerFilters: '.filters', // search + pills « Que je n’ai pas », « Que je peux accepter », « Mes offres »
+    offerPill: '.filters .pill',
     chat: '.chat-side, .chat-fab',
+    chatPage: /^\/marche\/chat/,
+    marketPage: /^\/marche/,
+    marketTabs: '.tabs[role="tablist"]', // Acheter, Vendre, Enchères, Échanges, Mon activité
     collectionPage: /^\/collection/,
     collectionSlot: '.cell > a.slot',
     collectionBar: '.mk',
     collectionLockIcon: '.pin',
     collectionSell: '.sell', // in .mk: sell button, or « 🔒 Verrouillée » (class "sell wait") when locked
     wikiLockButton: 'button[aria-pressed]', // text « 🔒 Verrouiller » / « 🔓 Déverrouiller », aria-pressed="true" when locked
+    // Collection › Albums view (same URL /collection, toggled by the « Albums » button)
+    albumList: 'ul.albums',
+    album: 'button.album',
+    albumName: '.a-name',
+    albumMeta: '.a-meta', // « 57/195 · 29 % »
+    albumRarities: '.a-rar > span', // « C 38/98 », « U 11/44 »… (a rarity the album does not have is absent)
+    albumTools: '.al-tools',
+    albumMore: '.more button', // « Afficher plus · 1 035 albums » (120 albums per page)
+    viewButtons: '.views button', // « Cartes » / « Albums »
   };
+
+  /** Hash used to open an album in a new tab: /collection#kp-album=<name>. */
+  const ALBUM_HASH = 'kp-album=';
 
   /** Card image URL by card id. */
   const cardImage = (id) => `/cards/sm/${id}.webp`;
@@ -663,9 +682,32 @@
       border: 0; opacity: 0; pointer-events: none;
     }
 
+    /* ---- Collection › Albums: filters ---- */
+    .al-tools:has(> .kp-album-filters) { flex-wrap: wrap; }
+    .kp-album-filters {
+      flex: 1 0 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin-top: 8px; padding: 10px 12px;
+      border: 1px solid var(--line, #25232c); border-radius: 12px; background: var(--panel, #15141a); font-size: 13px;
+    }
+    .kp-af-group { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+    .kp-af-label { color: var(--fg2, #b7b2bd); }
+    .kp-af-input {
+      height: 28px; padding: 0 8px; border-radius: 8px; border: 1px solid var(--line2, #2e2b36);
+      background: transparent; color: var(--fg, #edeae4); font: inherit;
+    }
+    .kp-af-input[type="number"] { width: 70px; }
+    .kp-af-rar {
+      position: relative; display: inline-flex; align-items: center; height: 26px; padding: 0 10px; cursor: pointer; user-select: none;
+      border-radius: 999px; border: 1px solid var(--kp-rc); color: var(--kp-rc); font-weight: 700;
+    }
+    .kp-af-rar input { position: absolute; opacity: 0; pointer-events: none; }
+    .kp-af-rar:has(input:checked) { background: var(--kp-rc); color: #111; }
+    .kp-af-rar:has(input:focus-visible) { outline: 2px solid var(--fg, #edeae4); outline-offset: 2px; }
+    .kp-af-count { margin-left: auto; color: var(--fg2, #b7b2bd); }
+    .kp-af-reset { height: 28px; padding: 0 10px; border-radius: 999px; border: 1px solid var(--line2, #2e2b36); background: transparent; color: var(--fg3, #c9c5ce); font: inherit; cursor: pointer; }
+
     /* ---- Comptoir (market chat): hidden unless toggled ---- */
-    html:not(.kp-show-chat) .chat-side, html:not(.kp-show-chat) .chat-fab { display: none !important; }
-    html:not(.kp-show-chat) .layout:has(.chat-side) { grid-template-columns: minmax(0, 1fr) !important; }
+    html:not(.kp-show-chat):not(.kp-chat-page) .chat-side, html:not(.kp-show-chat):not(.kp-chat-page) .chat-fab { display: none !important; }
+    html:not(.kp-show-chat):not(.kp-chat-page) .layout:has(.chat-side) { grid-template-columns: minmax(0, 1fr) !important; }
     #kp-chat-toggle {
       position: fixed; left: 16px; bottom: 16px; z-index: 50; padding: 8px 14px; border-radius: 999px; cursor: pointer;
       font: 700 12px system-ui, sans-serif; color: var(--fg, #edeae4); background: var(--panel2, #17161d);
@@ -730,11 +772,13 @@
    * 8. FEATURES — each one is idempotent and safe to run on every DOM change
    * ======================================================================== */
 
-  /** Hide the market chat ("le comptoir") with a toggle button to bring it back. */
+  /** Hide the market chat ("le comptoir") with a toggle button to bring it back (never on the chat's own page). */
   const chatToggle = {
     name: 'chatToggle',
     run() {
-      const hasChat = !!document.querySelector(SITE.chat);
+      const onChatPage = SITE.chatPage.test(location.pathname);
+      document.documentElement.classList.toggle('kp-chat-page', onChatPage);
+      const hasChat = !onChatPage && !!document.querySelector(SITE.chat);
       let button = document.getElementById('kp-chat-toggle');
       if (!hasChat) { if (button) button.remove(); return; }
 
@@ -749,6 +793,82 @@
         document.body.appendChild(button);
       }
       setText(button, shown ? 'Masquer le comptoir' : 'Afficher le comptoir');
+    },
+  };
+
+  /** Market tabs: a « Comptoir » tab after « Mon activité », opening /marche/chat (the site's tab look is copied). */
+  const marketChatTab = {
+    name: 'marketChatTab',
+    run() {
+      if (!SITE.marketPage.test(location.pathname)) return;
+      const tabs = document.querySelector(SITE.marketTabs);
+      if (!tabs) return;
+      const siteTab = [...tabs.querySelectorAll('button')].find((b) => !b.hasAttribute('data-kp-tab'));
+      let tab = tabs.querySelector(':scope > [data-kp-tab]');
+      if (!tab) {
+        tab = el('button', {
+          type: 'button',
+          'data-kp-tab': '',
+          text: 'Comptoir',
+          title: 'Ouvrir le comptoir (chat du marché)',
+          onClick: () => navigate('/marche/chat'),
+          onAuxclick: (e) => { if (e.button === 1) { e.preventDefault(); window.open('/marche/chat', '_blank'); } },
+        });
+        tabs.appendChild(tab);
+      }
+      // Same classes as an unselected site tab; selected look on the chat page itself
+      const base = siteTab ? siteTab.className.replace(/\bon\b/g, '').trim() : '';
+      setAttr(tab, 'class', SITE.chatPage.test(location.pathname) ? `${base} on` : base);
+    },
+  };
+
+  /** Navigate inside the site (SvelteKit intercepts clicks on links: no full reload). */
+  function navigate(href) {
+    const link = el('a', { href, hidden: true });
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }
+
+  /** True when the offer asks for at least one card you own in 2+ copies. */
+  const asksForDuplicate = (wantIds) => wantIds.some((id) => ownedQty(id) >= 2);
+  const duplicateFilterOn = () => !!storage.get(STORAGE.duplicateFilter, false) && !!state.collection;
+
+  /**
+   * Exchanges: « Que j’ai en double » pill next to the site's filter pills.
+   * When on, only offers asking for a card you own ×2+ are shown (site offers here, hidden offers in `hiddenOffers`).
+   */
+  const duplicateFilter = {
+    name: 'duplicateFilter',
+    run() {
+      const filters = document.querySelector(SITE.offerFilters);
+      if (filters) this.renderPill(filters);
+      const on = duplicateFilterOn();
+      document.querySelectorAll(SITE.offer).forEach((offer) => {
+        const wantIds = [...offer.querySelectorAll(`${SITE.offerWant} ${SITE.offerThumb}`)].map((a) => wikiId(a.getAttribute('href'))).filter(Boolean);
+        setAttr(offer, 'data-kp-hidden', on && !asksForDuplicate(wantIds) ? '' : null);
+      });
+    },
+
+    renderPill(filters) {
+      const sitePills = [...filters.querySelectorAll(':scope > .pill:not([data-kp-pill])')];
+      let pill = filters.querySelector(':scope > [data-kp-pill]');
+      if (!pill) {
+        pill = el('button', {
+          type: 'button',
+          'data-kp-pill': '',
+          text: 'Que j’ai en double',
+          title: 'N’afficher que les échanges qui demandent une carte que tu as en au moins 2 exemplaires',
+          onClick: () => { storage.set(STORAGE.duplicateFilter, !storage.get(STORAGE.duplicateFilter, false)); scheduleRender(); },
+        });
+        // Right after « Que je peux accepter » (else after the last site pill)
+        const anchor = sitePills.find((p) => /accepter/i.test(p.textContent)) || sitePills[sitePills.length - 1];
+        if (anchor) anchor.after(pill); else filters.appendChild(pill);
+      }
+      const on = !!storage.get(STORAGE.duplicateFilter, false);
+      const base = sitePills[0] ? sitePills[0].className.replace(/\bon\b/g, '').trim() : 'pill';
+      setAttr(pill, 'class', on ? `${base} on` : base);
+      setAttr(pill, 'aria-pressed', String(on));
     },
   };
 
@@ -868,9 +988,13 @@
 
       const canGive = (o) => (o.wantIds || []).some((w) => freeCopies(w) > 0);
       const rank = (o) => (inWishlist(o.characterId) ? (canGive(o) ? 0 : 1) : canGive(o) ? 2 : 3);
-      const missing = state.serverOffers.filter((o) => !shown.has(o.id)).sort((a, b) => rank(a) - rank(b));
+      const duplicatesOnly = duplicateFilterOn();
+      const missing = state.serverOffers
+        .filter((o) => !shown.has(o.id))
+        .filter((o) => !duplicatesOnly || asksForDuplicate((o.wantIds || []).map(String)))
+        .sort((a, b) => rank(a) - rank(b));
 
-      const signature = [missing.map((o) => o.id).join(','), state.collectionVersion, state.wishlist.size, state.catalog.size].join('@');
+      const signature = [missing.map((o) => o.id).join(','), state.collectionVersion, state.wishlist.size, state.catalog.size, duplicatesOnly].join('@');
       const bottom = document.getElementById('kp-extra');
       if (bottom && bottom.dataset.signature === signature) return;
       this.clear();
@@ -1080,7 +1204,199 @@
     },
   };
 
-  const FEATURES = [chatToggle, offerCards, hiddenOffers, collectionLocks];
+  const RARITY_LETTERS = ['C', 'U', 'R', 'E', 'L', 'M'];
+
+  /** Read an album button: { name, owned, total, rarities: { c: { owned, total }, … } }. */
+  const albumCache = new WeakMap();
+  function readAlbum(button) {
+    const meta = button.querySelector(SITE.albumMeta)?.textContent || '';
+    const cached = albumCache.get(button);
+    if (cached && cached.meta === meta) return cached;
+    const [, owned = 0, total = 0] = /(\d[\d\s]*)\s*\/\s*(\d[\d\s]*)/.exec(meta) || [];
+    const rarities = {};
+    for (const span of button.querySelectorAll(SITE.albumRarities)) {
+      const m = /([CURELM])\s*(\d+)\s*\/\s*(\d+)/.exec(span.textContent);
+      if (m) rarities[m[1].toLowerCase()] = { owned: +m[2], total: +m[3] };
+    }
+    const album = {
+      meta,
+      name: (button.querySelector(SITE.albumName)?.textContent || '').trim(),
+      owned: +String(owned).replace(/\s/g, ''),
+      total: +String(total).replace(/\s/g, ''),
+      rarities,
+    };
+    albumCache.set(button, album);
+    return album;
+  }
+
+  /**
+   * Collection › Albums: filters (minimum album size, « il ne me manque que » rarities).
+   * The site shows 120 albums per page: while a filter is active, « Afficher plus » is clicked until all are loaded.
+   */
+  const albumFilters = {
+    name: 'albumFilters',
+    lastMoreClick: 0,
+
+    settings() {
+      const s = storage.get(STORAGE.albumFilters, {});
+      return { min: Math.max(0, +s.min || 0), miss: Array.isArray(s.miss) ? s.miss : [] };
+    },
+    save(patch) {
+      storage.set(STORAGE.albumFilters, { ...this.settings(), ...patch });
+      scheduleRender();
+    },
+    isActive(s) { return s.min > 0 || s.miss.length > 0; },
+
+    /**
+     * With rarities checked, an album matches when the only cards it is missing are of those rarities
+     * (check C → albums missing only commons; check C + R → albums missing only commons and/or rares).
+     * Complete albums never match: they are missing nothing.
+     */
+    matches(album, s) {
+      if (album.total < s.min) return false;
+      if (!s.miss.length) return true;
+      const missing = Object.keys(album.rarities).filter((letter) => album.rarities[letter].owned < album.rarities[letter].total);
+      return missing.length > 0 && missing.every((letter) => s.miss.includes(letter));
+    },
+
+    run() {
+      const list = document.querySelector(SITE.albumList);
+      if (!list) return;
+      const s = this.settings();
+      const panel = this.renderPanel(s);
+
+      let shown = 0, loaded = 0;
+      for (const button of list.querySelectorAll(SITE.album)) {
+        const item = button.closest('li') || button;
+        const visible = !this.isActive(s) || this.matches(readAlbum(button), s);
+        setAttr(item, 'data-kp-hidden', visible ? null : '');
+        loaded++;
+        if (visible) shown++;
+      }
+
+      // Load every page while filtering, else the filter only sees the first 120 albums
+      const more = [...document.querySelectorAll(SITE.albumMore)].find((b) => /afficher plus/i.test(b.textContent));
+      const loading = this.isActive(s) && !!more;
+      if (loading) {
+        if (Date.now() - this.lastMoreClick > 400) {
+          this.lastMoreClick = Date.now();
+          more.click();
+        }
+        setTimeout(scheduleRender, 450); // keep going even if the page does not change in between
+      }
+      if (panel) {
+        setText(panel.querySelector('.kp-af-count'), this.isActive(s)
+          ? `${plural(shown, 'album')} sur ${loaded}${loading ? ' · chargement…' : ''}`
+          : `${plural(loaded, 'album')} chargés`);
+      }
+    },
+
+    renderPanel(s) {
+      const tools = document.querySelector(SITE.albumTools);
+      if (!tools) return null;
+      let panel = tools.querySelector(':scope > .kp-album-filters');
+      if (!panel) {
+        const rarityChips = RARITY_LETTERS.map((letter) => {
+          const rarity = rarityFromCode(letter);
+          return el('label', { class: 'kp-af-rar', '--kp-rc': rgbCss(rarity), title: `${rarity.name} : n’afficher que les albums où il ne te manque que les raretés cochées` },
+            el('input', { type: 'checkbox', value: letter.toLowerCase(), onChange: () => this.saveFromPanel(panel) }),
+            letter);
+        });
+        panel = el('div', { class: 'kp-album-filters' },
+          el('label', { class: 'kp-af-group' },
+            el('span', { class: 'kp-af-label', text: 'Min. cartes dans l’album' }),
+            el('input', { class: 'kp-af-input', type: 'number', min: '0', step: '1', name: 'min', onInput: () => this.saveFromPanel(panel) })),
+          el('span', { class: 'kp-af-group' },
+            el('span', { class: 'kp-af-label', text: 'Il ne me manque que' }),
+            rarityChips),
+          el('button', { type: 'button', class: 'kp-af-reset', text: 'Réinitialiser', onClick: () => { storage.remove(STORAGE.albumFilters); this.syncPanel(panel, this.settings()); scheduleRender(); } }),
+          el('span', { class: 'kp-af-count' }));
+        tools.appendChild(panel);
+        this.syncPanel(panel, s);
+      }
+      return panel;
+    },
+
+    /** Panel inputs <- saved settings (only when they differ, to keep the caret while typing). */
+    syncPanel(panel, s) {
+      const min = panel.querySelector('input[name="min"]');
+      if (+min.value !== s.min || (s.min === 0 && min.value !== '')) min.value = s.min ? String(s.min) : '';
+      for (const box of panel.querySelectorAll('input[type="checkbox"]')) box.checked = s.miss.includes(box.value);
+    },
+
+    saveFromPanel(panel) {
+      this.save({
+        min: Math.max(0, parseInt(panel.querySelector('input[name="min"]').value, 10) || 0),
+        miss: [...panel.querySelectorAll('input[type="checkbox"]:checked')].map((b) => b.value),
+      });
+    },
+  };
+
+  /**
+   * Albums open in a new tab with a middle click (or Ctrl/Cmd + click).
+   * Albums are buttons, not links: the new tab gets /collection#kp-album=<name>, and there
+   * this feature switches to the Albums view, loads pages until it finds the album, and clicks it.
+   */
+  const albumTabs = {
+    name: 'albumTabs',
+    pending: null, // { name, since }
+    lastMoreClick: 0,
+
+    /** Installed once (see start): open the clicked album in a new tab. */
+    install() {
+      const albumOf = (e) => (e.target.closest ? e.target.closest(SITE.album) : null);
+      const open = (button) => {
+        const { name } = readAlbum(button);
+        if (name) window.open(`/collection#${ALBUM_HASH}${encodeURIComponent(name)}`, '_blank');
+      };
+      // Middle button: prevent the autoscroll on mousedown, open on auxclick
+      document.addEventListener('mousedown', (e) => { if (e.button === 1 && albumOf(e)) e.preventDefault(); }, true);
+      document.addEventListener('auxclick', (e) => {
+        const button = e.button === 1 && albumOf(e);
+        if (!button) return;
+        e.preventDefault();
+        open(button);
+      }, true);
+      document.addEventListener('click', (e) => {
+        const button = (e.ctrlKey || e.metaKey) && albumOf(e);
+        if (!button) return;
+        e.preventDefault();
+        e.stopPropagation(); // keep this tab as it is
+        open(button);
+      }, true);
+    },
+
+    run() {
+      if (!SITE.collectionPage.test(location.pathname)) return;
+      if (!this.pending && location.hash.startsWith('#' + ALBUM_HASH)) {
+        this.pending = { name: decodeURIComponent(location.hash.slice(1 + ALBUM_HASH.length)), since: Date.now() };
+      }
+      if (!this.pending) return;
+      if (Date.now() - this.pending.since > 30000) { warn('album introuvable :', this.pending.name); this.pending = null; return; }
+
+      const list = document.querySelector(SITE.albumList);
+      if (!list) { // switch to the Albums view
+        const albumsView = [...document.querySelectorAll(SITE.viewButtons)].find((b) => /^\s*albums\s*$/i.test(b.textContent));
+        if (albumsView && albumsView.getAttribute('aria-pressed') !== 'true') albumsView.click();
+        return this.retry();
+      }
+      const target = [...list.querySelectorAll(SITE.album)].find((b) => readAlbum(b).name === this.pending.name);
+      if (target) {
+        this.pending = null;
+        history.replaceState(history.state, '', location.pathname + location.search); // drop the hash
+        target.click();
+        return;
+      }
+      const more = [...document.querySelectorAll(SITE.albumMore)].find((b) => /afficher plus/i.test(b.textContent));
+      if (more && Date.now() - this.lastMoreClick > 400) { this.lastMoreClick = Date.now(); more.click(); }
+      this.retry();
+    },
+
+    /** The page may not change while we wait: try again a bit later. */
+    retry() { setTimeout(scheduleRender, 300); },
+  };
+
+  const FEATURES = [chatToggle, marketChatTab, offerCards, duplicateFilter, hiddenOffers, collectionLocks, albumFilters, albumTabs];
 
   /* ==========================================================================
    * 9. CORE — render loop driven by DOM changes (the site is a Svelte SPA)
@@ -1113,6 +1429,7 @@
       history[method] = function () { const result = original.apply(this, arguments); scheduleRender(); return result; };
     }
     window.addEventListener('popstate', scheduleRender);
+    albumTabs.install();
     scheduleRender();
   }
 
