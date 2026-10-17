@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Plus
 // @namespace    https://github.com/Mxyuki/Kyara-Script
-// @version      1.2.0
+// @version      1.3.0
 // @description  Améliore kyara.games : rareté et exemplaires possédés sur les offres d’échange, bouton « Donner » sous chaque carte, wishlist en premier, offres cachées par le site, verrouillage depuis la collection, comptoir masquable.
 // @author       Myuki
 // @homepageURL  https://github.com/Mxyuki/Kyara-Script
@@ -36,6 +36,7 @@
     characters: /\/api\/[^?]*characters(\?|$)/,
     wishlist: /\/api\/[^?]*wish/i,
     tradeAvailable: /\/api\/trades\/available\/([0-9a-f-]+)(?:\?|$)/i, // a player's tradable cards [{ characterId, n }]
+    tradeOwned: /\/api\/trades\/owned\/([0-9a-f-]+)(?:\?|$)/i, // every card a player owns: [4, 353, …] (ids only, no count)
     prices: /\/api\/fair-play\/prices\?/, // ?ids=1,2,3 -> { "<cardId>": price }
     lock: /\/api\/(?:[^?]*\/)?pin(?:[/?]|$)/, // POST, sent by the 🔒 button of a wiki page
   };
@@ -105,11 +106,18 @@
     // span.pr.mono price « 1 002 ◆ », span.have « ×N dispo »
     tradeTile: 'button.tile',
     tradeTilePrice: '.pr',
+    // Profile page: « Proposer un échange » button (opens the trade window)
+    profileButtons: 'button, a',
+    profileTradeButton: /proposer un [ée]change/i,
     cardImageId: /\/(\d+)[^/]*\.webp(?:[?#]|$)/, // card id in a card image URL
   };
 
   /** Trade API URL of a player's tradable cards. */
   const tradeAvailableUrl = (userId) => `/api/trades/available/${userId}`;
+  /** Trade API URL of every card a player owns (ids only). */
+  const tradeOwnedUrl = (userId) => `/api/trades/owned/${userId}`;
+  /** Cards shown at once in a player's collection (« Afficher plus » for the next ones). */
+  const PLAYER_PAGE = 120;
   /** Card prices (the « ◆ » value the site shows), by batch of ids like the site asks for them. */
   const pricesUrl = (ids) => `/api/fair-play/prices?ids=${ids.join(',')}`;
   const PRICES_BATCH = 60;
@@ -159,6 +167,8 @@
   const rarityColor = (rarity) => (rarity ? rgbCss(rarity) : 'var(--line2, #2e2b36)');
   const wikiId = (href) => { const m = /\/wiki\/(\d+)/.exec(href || ''); return m ? m[1] : null; };
   const plural = (n, word) => `${n} ${word}${n > 1 ? 's' : ''}`;
+  /** Lowercase without accents, for searches (« Épique » matches « epique »). */
+  const fold = (text) => String(text || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 
   const storage = {
     get(key, fallback) {
@@ -223,6 +233,8 @@
     offersVersion: 0,
     /** Map<userId, Map<cardId, n>>: tradable copies of other players (trade window). */
     tradeAvailable: new Map(),
+    /** Map<userId, Set<cardId>>: every card of other players (profile › « Voir sa collection »). */
+    tradeOwned: new Map(),
     /** Map<cardId, price> from /api/fair-play/prices (the site's requests and ours). */
     prices: new Map(),
   };
@@ -239,7 +251,7 @@
 
   function cardInfo(id) {
     const c = state.catalog.get(String(id));
-    return { name: (c && c.name) || `Carte #${id}`, rarity: c ? c.rarity : null, known: !!(c && c.name) };
+    return { name: (c && c.name) || `Carte #${id}`, rarity: c ? c.rarity : null, series: (c && c.series) || '', known: !!(c && c.name) };
   }
 
   /* ==========================================================================
@@ -327,7 +339,7 @@
     if (!entries || !entries.length) return null;
     const map = new Map();
     for (const e of entries) {
-      let id, name, rarity;
+      let id, name, rarity, series;
       if (Array.isArray(e)) {
         id = e.find((x) => typeof x === 'number');
         rarity = e.find((x) => typeof x === 'string' && rarityFromCode(x));
@@ -336,9 +348,11 @@
         id = e.id ?? e.characterId;
         name = e.name ?? e.nom ?? e.title;
         rarity = e.rarity ?? e.rarete ?? e.rar ?? e.r;
+        series = e.series ?? e.serie;
+        if (series && typeof series === 'object') series = series.name ?? series.title;
       }
       if (id === undefined || id === null) continue;
-      map.set(String(id), { name: typeof name === 'string' ? name : null, rarity: rarityFromCode(rarity) });
+      map.set(String(id), { name: typeof name === 'string' ? name : null, rarity: rarityFromCode(rarity), series: typeof series === 'string' ? series : null });
     }
     return map.size ? { map, sample: entries[0] } : null;
   }
@@ -353,6 +367,12 @@
       if (id) map.set(id, (map.get(id) || 0) + (+(e && e.n) || 1));
     }
     return map;
+  }
+
+  /** /api/trades/owned/<userId> -> Set<cardId> ([4, 353, …]: ids only, no copy count). */
+  function parseTradeOwned(data) {
+    const entries = findEntries(data);
+    return entries ? new Set(entries.map(entryId).filter(Boolean)) : null;
   }
 
   /** /api/fair-play/prices?ids=… -> Map<cardId, price> ({ "28331": 200, … }; a list of { id, price } is accepted too). */
@@ -418,6 +438,16 @@
         if (!userId || !cards) return warn('format des cartes échangeables non reconnu', data);
         state.tradeAvailable.set(userId.toLowerCase(), cards);
         log('cartes échangeables du joueur :', cards.size, 'dont', [...cards.values()].filter((n) => n > 1).length, 'en double');
+      },
+    },
+    {
+      match: API.tradeOwned,
+      handle(data, url) {
+        const userId = (API.tradeOwned.exec(url) || [])[1];
+        const cards = parseTradeOwned(data);
+        if (!userId || !cards) return warn('format de la collection du joueur non reconnu', data);
+        state.tradeOwned.set(userId.toLowerCase(), cards);
+        log('collection du joueur :', cards.size, 'cartes');
       },
     },
     {
@@ -530,12 +560,13 @@
   }
   const reloadOffers = () => replayRequest(lastOffersRequest, API.offers);
 
-  /** GET a player's tradable cards (read only), when the site did not load them itself. */
-  function loadTradeAvailable(userId) {
-    const url = tradeAvailableUrl(userId);
-    const handler = HANDLERS.find((h) => h.match === API.tradeAvailable);
+  /** GET one of a player's card lists (read only), when the site did not load it itself. */
+  function loadPlayerCards(url, api) {
+    const handler = HANDLERS.find((h) => h.match === api);
     return readResponse(nativeFetch(url, { headers: siteHeaders() || undefined, credentials: 'same-origin', cache: 'no-store' }), handler, url);
   }
+  const loadTradeAvailable = (userId) => loadPlayerCards(tradeAvailableUrl(userId), API.tradeAvailable);
+  const loadTradeOwned = (userId) => loadPlayerCards(tradeOwnedUrl(userId), API.tradeOwned);
 
   /** Card ids whose price was already asked (by us), so each one is asked once per page load. */
   const pricesAsked = new Set();
@@ -552,6 +583,11 @@
       batches.push(readResponse(nativeFetch(url, { headers: siteHeaders() || undefined, credentials: 'same-origin' }), handler, url));
     }
     return Promise.all(batches).then((oks) => oks.every(Boolean));
+  }
+
+  /** Prices of many cards, a few batches at a time (a whole collection can be thousands of cards). */
+  async function loadPricesInTurn(ids) {
+    for (let i = 0; i < ids.length; i += PRICES_BATCH * 3) await loadPrices(ids.slice(i, i + PRICES_BATCH * 3));
   }
 
   /** « 1 002 ◆ », like the site. */
@@ -770,6 +806,47 @@
     [data-kp-dupes][data-kp-busy] { cursor: wait; opacity: .7; }
     .kp-trade-empty { grid-column: 1 / -1; list-style: none; margin: 12px 0; text-align: center; font-size: 13px; color: var(--fg2, #b7b2bd); }
     [data-kp-grid] .kp-adding { opacity: .5; cursor: wait; }
+
+    /* ---- Profile: « Voir sa collection » panel ---- */
+    [data-kp-collection] { margin-left: 8px; }
+    [data-kp-collection] .kp-n { margin-left: 6px; opacity: .7; }
+    .kp-pc-backdrop {
+      position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: 12px;
+      background: rgba(0,0,0,.6);
+    }
+    .kp-pc {
+      display: flex; flex-direction: column; gap: 10px; width: min(1180px, 100%); max-height: calc(100vh - 24px);
+      padding: 14px 16px; border-radius: 16px; border: 1px solid var(--line, #25232c);
+      background: var(--panel, #15141a); color: var(--fg, #edeae4); font-size: 13px; box-shadow: 0 12px 40px rgba(0,0,0,.6);
+    }
+    .kp-pc-head { display: flex; align-items: center; gap: 12px; }
+    .kp-pc-head h2 { margin: 0; font-size: 18px; }
+    .kp-pc-count { color: var(--fg2, #b7b2bd); }
+    .kp-pc-close { margin-left: auto; width: 32px; height: 32px; border-radius: 999px; border: 1px solid var(--line2, #2e2b36); background: transparent; color: inherit; font-size: 16px; cursor: pointer; }
+    .kp-pc-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+    .kp-pc-filters input[type="search"] { flex: 1 1 220px; min-width: 0; }
+    .kp-pc-filters select.kp-af-input { padding-right: 4px; }
+    .kp-pc-filters option { background: var(--panel, #15141a); }
+    .kp-pc-toggle {
+      position: relative; display: inline-flex; align-items: center; height: 28px; padding: 0 12px; cursor: pointer; user-select: none;
+      border-radius: 999px; border: 1px solid var(--line2, #2e2b36); color: var(--fg3, #c9c5ce);
+    }
+    .kp-pc-toggle input { position: absolute; opacity: 0; pointer-events: none; }
+    .kp-pc-toggle:has(input:checked) { background: var(--fg, #edeae4); color: #111; border-color: var(--fg, #edeae4); }
+    .kp-pc-toggle:has(input:focus-visible) { outline: 2px solid var(--fg, #edeae4); outline-offset: 2px; }
+    .kp-pc-note { margin: 0; padding: 8px 10px; border-radius: 10px; border: 1px solid ${COLORS.single}; color: ${COLORS.single}; font-size: 12px; }
+    .kp-pc-body { overflow-y: auto; min-height: 120px; }
+    .kp-pc-grid { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); }
+    .kp-pc-card { display: flex; flex-direction: column; gap: 3px; min-width: 0; padding: 6px; border-radius: 12px; background: var(--panel2, #17161d); border: 2px solid var(--kp-rc); }
+    .kp-pc-card a { display: block; position: relative; }
+    .kp-pc-card img { display: block; width: 100%; aspect-ratio: 5 / 7; object-fit: cover; object-position: 50% 20%; border-radius: 8px; }
+    .kp-pc-lock { position: absolute; right: 4px; top: 4px; padding: 1px 4px; border-radius: 6px; font-size: 11px; background: rgba(0,0,0,.65); }
+    .kp-pc-name { font-weight: 700; line-height: 1.25; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .kp-pc-series { font-size: 11px; color: var(--fg2, #b7b2bd); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .kp-pc-meta { display: flex; justify-content: space-between; gap: 4px; font-size: 11px; }
+    .kp-pc-lack { color: ${COLORS.duplicate}; font-weight: 700; }
+    .kp-pc-empty { margin: 24px 0; text-align: center; color: var(--fg2, #b7b2bd); }
+    .kp-pc-more { display: block; margin: 12px auto 0; height: 32px; padding: 0 16px; border-radius: 999px; border: 1px solid var(--line2, #2e2b36); background: transparent; color: inherit; font: inherit; cursor: pointer; }
 
     /* ---- Offers the site does not display ---- */
     .kp-extra { display: flex; flex-direction: column; gap: 10px; margin-top: 18px; }
@@ -1786,7 +1863,221 @@
     retry() { setTimeout(scheduleRender, 300); },
   };
 
-  const FEATURES = [chatToggle, marketChatTab, offerCards, duplicateFilter, offersRefresh, hiddenOffers, collectionLocks, albumFilters, albumTabs, partnerDuplicates];
+  /** Sorts of a player's collection (cards from playerCollection.cards). */
+  const rarityRank = (c) => RARITIES.indexOf(c.rarity);
+  const PLAYER_SORTS = {
+    rarity: { label: 'Rareté', compare: (a, b) => rarityRank(b) - rarityRank(a) || (b.price ?? -1) - (a.price ?? -1) },
+    priceDesc: { label: 'Prix ↓', compare: (a, b) => (b.price ?? -1) - (a.price ?? -1) },
+    priceAsc: { label: 'Prix ↑', compare: (a, b) => (a.price ?? Infinity) - (b.price ?? Infinity) },
+    copies: { label: 'Exemplaires', compare: (a, b) => (b.n || 0) - (a.n || 0) || rarityRank(b) - rarityRank(a) },
+    name: { label: 'Nom', compare: (a, b) => a.name.localeCompare(b.name, 'fr') },
+  };
+
+  /**
+   * Profile page: « Voir sa collection » button next to « Proposer un échange ». Opens a panel with every card the
+   * player owns (/api/trades/owned/<id>, fetched when the profile opens): search by name or series, rarities,
+   * duplicates, cards I am missing, median price range, sort. Copy counts come from /api/trades/available/<id>,
+   * which only lists tradable cards: a locked card never shows as a duplicate. Filters in memory only.
+   */
+  const playerCollection = {
+    name: 'playerCollection',
+    userId: null,
+    open: false,
+    busy: false,
+    requested: new Set(), // players whose card lists were fetched on this page load
+    pricesFor: null, // player whose prices are being loaded
+    filters: null,
+    limit: PLAYER_PAGE,
+    tiles: new Map(), // Map<cardId, { li, price, lack }> reused between renders (keeps the images loaded)
+    onKey: null,
+
+    defaults() { return { query: '', rarities: [], dupes: false, missing: false, min: '', max: '', sort: 'rarity' }; },
+
+    run() {
+      const profile = SITE.profilePage.exec(location.pathname);
+      const userId = profile ? profile[1].toLowerCase() : null;
+      if (userId !== this.userId) {
+        this.close();
+        this.userId = userId;
+        this.filters = this.defaults();
+        this.tiles = new Map();
+      }
+      if (!userId) return;
+      this.load(userId);
+      this.renderButton(userId);
+      if (this.open) this.renderPanel(userId);
+    },
+
+    /** Both card lists of the player, once per page load (the site's own requests are read too). */
+    load(userId) {
+      if (this.requested.has(userId)) return;
+      this.requested.add(userId);
+      if (!state.tradeOwned.has(userId)) loadTradeOwned(userId).then((ok) => { if (!ok) warn('impossible de charger la collection du joueur'); });
+      if (!state.tradeAvailable.has(userId)) loadTradeAvailable(userId);
+    },
+
+    pseudo() {
+      const name = document.title.split(/\s[—–-]\s/)[0].trim();
+      return name && !/^kyara$/i.test(name) ? name : 'ce joueur';
+    },
+
+    renderButton(userId) {
+      let button = document.querySelector('[data-kp-collection]');
+      const siteButton = [...document.querySelectorAll(SITE.profileButtons)]
+        .find((b) => b !== button && !b.closest('[role="dialog"], .kp-pc-backdrop') && SITE.profileTradeButton.test(b.textContent));
+      if (!siteButton) { if (button) button.remove(); return; }
+      if (!button || button.previousElementSibling !== siteButton) {
+        if (button) button.remove();
+        button = el('button', { type: 'button', 'data-kp-collection': '', title: 'Voir toutes ses cartes, avec filtres', onClick: () => this.show() },
+          'Voir sa collection', el('span', { class: 'kp-n' }));
+        siteButton.after(button);
+      }
+      setAttr(button, 'class', siteButton.className);
+      const owned = state.tradeOwned.get(userId);
+      setText(button.querySelector('.kp-n'), owned ? String(owned.size) : '');
+    },
+
+    show() {
+      this.open = true;
+      this.limit = PLAYER_PAGE;
+      if (!this.busy && (!state.catalog.size || !state.collection)) {
+        this.busy = true;
+        Promise.all([loadCatalog(), state.collection ? true : loadCollection()]).then(([catalog, collection]) => {
+          if (!catalog) warn('impossible de charger le catalogue des cartes');
+          if (!collection) warn('impossible de charger ta collection');
+        }).finally(() => { this.busy = false; scheduleRender(); });
+      }
+      if (this.userId && !state.tradeOwned.has(this.userId)) { this.requested.delete(this.userId); this.load(this.userId); }
+      scheduleRender();
+    },
+
+    close() {
+      this.open = false;
+      document.getElementById('kp-player-collection')?.remove();
+      if (this.onKey) { document.removeEventListener('keydown', this.onKey, true); this.onKey = null; }
+    },
+
+    /** Owned cards of the player matching the filters, sorted. Null while the list is not loaded. */
+    cards(userId) {
+      const owned = state.tradeOwned.get(userId);
+      if (!owned) return null;
+      const available = state.tradeAvailable.get(userId) || null;
+      const f = this.filters;
+      const query = fold(f.query.trim());
+      const min = f.min === '' ? null : +f.min;
+      const max = f.max === '' ? null : +f.max;
+      const rarities = f.rarities.map(rarityFromCode);
+      return [...owned]
+        .map((id) => ({ id, ...cardInfo(id), n: available ? available.get(id) || 0 : null, price: state.prices.get(id), mine: ownedQty(id) }))
+        .filter((c) => !query || fold(c.name).includes(query) || fold(c.series).includes(query))
+        .filter((c) => !rarities.length || rarities.includes(c.rarity))
+        .filter((c) => !f.dupes || c.n > 1)
+        .filter((c) => !f.missing || !state.collection || !c.mine)
+        .filter((c) => (min === null && max === null) || (c.price !== undefined && (min === null || c.price >= min) && (max === null || c.price <= max)))
+        .sort(PLAYER_SORTS[f.sort].compare);
+    },
+
+    renderPanel(userId) {
+      let root = document.getElementById('kp-player-collection');
+      if (!root) root = this.buildPanel();
+      const owned = state.tradeOwned.get(userId);
+      if (owned && this.pricesFor !== userId) { this.pricesFor = userId; loadPricesInTurn([...owned]); }
+
+      const list = this.cards(userId);
+      const available = state.tradeAvailable.get(userId);
+      const priced = owned ? [...owned].filter((id) => state.prices.has(id)).length : 0;
+      setText(root.querySelector('.kp-pc-count'), !owned ? 'chargement…'
+        : `${list.length} / ${plural(owned.size, 'carte')}${priced < owned.size ? ` · prix ${priced}/${owned.size}` : ''}${this.busy ? ' · chargement…' : ''}`);
+
+      const note = root.querySelector('.kp-pc-note');
+      setAttr(note, 'data-kp-hidden', this.filters.dupes ? null : '');
+      setText(note, available
+        ? `⚠ Les cartes verrouillées par ${this.pseudo()} ne comptent pas : le site ne donne le nombre d’exemplaires que des cartes échangeables, une carte verrouillée en double n’apparaît donc pas ici.`
+        : 'Chargement des exemplaires…');
+
+      const grid = root.querySelector('.kp-pc-grid');
+      const more = root.querySelector('.kp-pc-more');
+      const shown = list ? list.slice(0, this.limit) : [];
+      const signature = [shown.map((c) => c.id).join(','), list ? list.length : -1, state.catalog.size, state.collectionVersion, !!available].join('@');
+      if (grid.dataset.kpSignature !== signature) {
+        grid.dataset.kpSignature = signature;
+        grid.replaceChildren(...(shown.length ? shown.map((c) => this.tile(c)) : [el('li', { class: 'kp-pc-empty', text: !list ? 'Chargement de sa collection…' : 'Aucune carte ne correspond à tes filtres.' })]));
+      }
+      for (const c of shown) setText(this.tiles.get(c.id).price, c.price !== undefined ? priceText(c.price) : '');
+      const rest = list ? list.length - shown.length : 0;
+      setAttr(more, 'data-kp-hidden', rest > 0 ? null : '');
+      setText(more, `Afficher plus · ${plural(rest, 'carte')}`);
+    },
+
+    /** One card (built once per card and player, then reused). */
+    tile(c) {
+      const known = this.tiles.get(c.id);
+      if (known && known.key === `${c.name}:${c.n}:${c.mine}`) return known.li;
+      const price = el('span', { class: 'mono' });
+      const locked = c.n === 0; // owned but not tradable: locked (or not tradable for another reason)
+      const li = el('li', { class: 'kp-pc-card', '--kp-rc': rarityColor(c.rarity) },
+        el('a', { href: `/wiki/${c.id}`, title: c.name + (c.rarity ? ` – ${c.rarity.name}` : '') },
+          el('img', { src: cardImage(c.id), alt: c.name, loading: 'lazy', referrerpolicy: 'no-referrer' }),
+          c.rarity && el('span', { class: 'kp-rar', text: RARITY_LETTERS[RARITIES.indexOf(c.rarity)] }),
+          locked && el('span', { class: 'kp-pc-lock', text: '🔒', title: 'Pas échangeable (verrouillée ?) : son nombre d’exemplaires est inconnu' }),
+          c.n > 1 && el('span', { class: 'kp-cnt kp-dup', text: `×${c.n}`, title: `${c.n} exemplaires échangeables` })),
+        el('div', { class: 'kp-pc-name', text: c.name, title: c.name }),
+        el('div', { class: 'kp-pc-series', text: c.series, title: c.series }),
+        el('div', { class: 'kp-pc-meta' },
+          price,
+          state.collection && !c.mine ? el('span', { class: 'kp-pc-lack', text: 'Il me manque' }) : null));
+      this.tiles.set(c.id, { li, price, key: `${c.name}:${c.n}:${c.mine}` });
+      return li;
+    },
+
+    buildPanel() {
+      const f = this.filters;
+      const update = (patch) => { Object.assign(this.filters, patch); this.limit = PLAYER_PAGE; scheduleRender(); };
+      const toggle = (key, label, title) => el('label', { class: 'kp-pc-toggle', title },
+        el('input', { type: 'checkbox', checked: f[key], onChange: (e) => update({ [key]: e.target.checked }) }), label);
+      const priceInput = (key, placeholder) => el('input', {
+        class: 'kp-af-input', type: 'number', min: '0', step: '1', placeholder, value: f[key],
+        onInput: (e) => update({ [key]: e.target.value.trim() }),
+      });
+      const rarityChips = RARITY_LETTERS.map((letter) => {
+        const rarity = rarityFromCode(letter);
+        return el('label', { class: 'kp-af-rar', '--kp-rc': rgbCss(rarity), title: rarity.name },
+          el('input', { type: 'checkbox', checked: f.rarities.includes(letter), onChange: (e) => update({
+            rarities: e.target.checked ? [...this.filters.rarities, letter] : this.filters.rarities.filter((l) => l !== letter),
+          }) }),
+          letter);
+      });
+      const sort = el('select', { class: 'kp-af-input', 'aria-label': 'Trier par', onChange: (e) => update({ sort: e.target.value }) },
+        Object.entries(PLAYER_SORTS).map(([key, s]) => el('option', { value: key, selected: key === f.sort, text: s.label })));
+
+      const root = el('div', { id: 'kp-player-collection', class: 'kp-pc-backdrop', onClick: (e) => { if (e.target === root) this.close(); } },
+        el('section', { class: 'kp-pc', role: 'dialog', 'aria-modal': 'true', 'aria-label': `Collection de ${this.pseudo()}` },
+          el('header', { class: 'kp-pc-head' },
+            el('h2', { text: `Collection de ${this.pseudo()}` }),
+            el('span', { class: 'kp-pc-count' }),
+            el('button', { type: 'button', class: 'kp-pc-close', 'aria-label': 'Fermer', text: '✕', onClick: () => this.close() })),
+          el('div', { class: 'kp-pc-filters' },
+            el('input', { class: 'kp-af-input', type: 'search', placeholder: 'Personnage ou série…', value: f.query, onInput: (e) => update({ query: e.target.value }) }),
+            el('span', { class: 'kp-af-group' }, rarityChips),
+            toggle('dupes', 'Doublons', 'N’afficher que les cartes qu’il peut échanger en au moins 2 exemplaires'),
+            toggle('missing', 'Il me manque', 'N’afficher que les cartes que tu n’as pas'),
+            el('span', { class: 'kp-af-group' },
+              el('span', { class: 'kp-af-label', text: 'Prix médian' }),
+              priceInput('min', 'min'), '–', priceInput('max', 'max'), '◆'),
+            sort),
+          el('p', { class: 'kp-pc-note', 'data-kp-hidden': '' }),
+          el('div', { class: 'kp-pc-body' },
+            el('ul', { class: 'kp-pc-grid' }),
+            el('button', { type: 'button', class: 'kp-pc-more', 'data-kp-hidden': '', onClick: () => { this.limit += PLAYER_PAGE; scheduleRender(); } }))));
+      document.body.appendChild(root);
+      this.onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); this.close(); } };
+      document.addEventListener('keydown', this.onKey, true);
+      root.querySelector('input[type="search"]').focus();
+      return root;
+    },
+  };
+
+  const FEATURES = [chatToggle, marketChatTab, offerCards, duplicateFilter, offersRefresh, hiddenOffers, collectionLocks, albumFilters, albumTabs, partnerDuplicates, playerCollection];
 
   /* ==========================================================================
    * 9. CORE — render loop driven by DOM changes (the site is a Svelte SPA)
