@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Plus
 // @namespace    https://github.com/Mxyuki/Kyara-Script
-// @version      1.4.0
+// @version      1.4.1
 // @description  Améliore kyara.games : rareté et exemplaires possédés sur les offres d’échange, bouton « Donner » sous chaque carte, wishlist en premier, offres cachées par le site, verrouillage depuis la collection, comptoir masquable.
 // @author       Myuki
 // @homepageURL  https://github.com/Mxyuki/Kyara-Script
@@ -114,6 +114,8 @@
     cardImageId: /\/(\d+)[^/]*\.webp(?:[?#]|$)/, // card id in a card image URL
     // Exchange offers: the site's « Donner <name> » buttons, and the thumb title of a card I own « <name> (tu l’as) »
     giveButton: /^\s*Donner\s+/,
+    giveButtonCount: '.own', // « Donner <name> <span.own>×2</span> »: my copy count, not part of the name
+    giveButtonCountText: /\s*×\s*\d+\s*$/, // same count, in case the span loses its class
     thumbOwnedTitle: /\s*\(tu l.as[^)]*\)\s*$/i,
     // Home page (boosters) › « Voir les N persos » dialog (« <booster> : les persos »): one section per rarity
     boosterSection: '[role="dialog"] section',
@@ -1293,7 +1295,11 @@
       // The site's "Donner <name>" buttons, matched to the thumbs by name (in order, for duplicates).
       // Names are compared loosely (case, accents, spaces, punctuation): an exact match missed some buttons.
       const giveButtons = [...offer.querySelectorAll(SITE.offerActionButtons)].filter((b) => SITE.giveButton.test(b.textContent));
-      const buttonKey = (b) => nameKey(b.textContent.replace(SITE.giveButton, ''));
+      // The site appends my copy count (« ×2 ») inside the button: leave it out of the name
+      const buttonKey = (b) => nameKey([...b.childNodes]
+        .filter((n) => !(n.nodeType === 1 && n.matches(SITE.giveButtonCount)))
+        .map((n) => n.textContent).join('')
+        .replace(SITE.giveButton, '').replace(SITE.giveButtonCountText, ''));
 
       const cards = links.map((a) => {
         const img = a.querySelector('img');
