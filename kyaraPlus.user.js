@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Plus
 // @namespace    https://github.com/Mxyuki/Kyara-Script
-// @version      1.4.1
+// @version      1.4.2
 // @description  Améliore kyara.games : rareté et exemplaires possédés sur les offres d’échange, bouton « Donner » sous chaque carte, wishlist en premier, offres cachées par le site, verrouillage depuis la collection, comptoir masquable.
 // @author       Myuki
 // @homepageURL  https://github.com/Mxyuki/Kyara-Script
@@ -102,6 +102,8 @@
     tradeChip: 'button.only', // aria-pressed. Mine: « Mes doubles », « Il lui manque »; partner's: « Je l’ai », « Il me manque »
     tradeChipOwned: /je l.ai/i, // partner's tab: only the cards I own
     tradeChipMissing: /il me manque/i, // partner's tab: only the cards I do not own
+    tradeChipMyDupes: /mes doubles/i, // my tab: only my duplicates
+    tradeChipTheyLack: /il lui manque/i, // my tab: only the cards the partner does not own
     tradeRarityChip: '.chips button:not(.only)', // « Toutes », M L E R U C; class « on » when selected
     tradeGrid: 'ul.grid:not([data-kp-grid])', // shows 60 cards at most: the search is needed to reach the others
     // img src …/<cardId>.webp, span.r (rarity letter), span.nm (name), span.lack « Il me manque » (only if I do not own it),
@@ -1650,6 +1652,11 @@
    * ours lists every card the player can trade in 2+ copies (n > 1 in /api/trades/available/<id>, read from the
    * site's own request, else fetched once). Clicking one of ours types its name in the site's search and clicks
    * the site's own tile, then restores the search. In memory only: off when the window closes.
+   *
+   * « Mes cartes » tab: the site's « Mes doubles » and « Il lui manque » chips are exclusive. Clicking the second one
+   * while the first is pressed turns both on (`combo`): the site keeps its own chip pressed, ours is only drawn pressed,
+   * and our grid lists my duplicates (qty > 1, copies free to give) that the partner does not own
+   * (/api/trades/owned/<id>). Clicking either chip again leaves only the other one on.
    */
   const partnerDuplicates = {
     name: 'partnerDuplicates',
@@ -1657,13 +1664,69 @@
     busy: false,
     adding: null, // card id being added through the site's search
     userId: null,
+    combo: null, // « Mes cartes » tab: site chip drawn as pressed by us while the other one is really pressed
+    passing: false, // our own programmatic click on a site chip, not intercepted
+
+    /** « Mes doubles » / « Il lui manque » chips of my tab (null if not both there). */
+    myChips(shelf) {
+      const chips = [...shelf.querySelectorAll(`${SITE.tradeChips} ${SITE.tradeChip}`)];
+      const dupes = chips.find((c) => SITE.tradeChipMyDupes.test(c.textContent));
+      const lacks = chips.find((c) => SITE.tradeChipTheyLack.test(c.textContent));
+      return dupes && lacks ? [dupes, lacks] : null;
+    },
+
+    /** Installed once (see start): lets both chips of my tab be pressed together. */
+    install() {
+      document.addEventListener('click', (e) => {
+        if (this.passing) return;
+        const chip = e.target.closest ? e.target.closest(SITE.tradeChip) : null;
+        const shelf = chip && chip.closest(SITE.tradeShelf);
+        const pair = shelf && this.myChips(shelf);
+        if (!pair || !pair.includes(chip)) return;
+        const other = pair.find((c) => c !== chip);
+        const pressed = (c) => c.getAttribute('aria-pressed') === 'true';
+        if (!this.combo) {
+          if (!pressed(other) || pressed(chip)) return; // the site's own behaviour
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          this.setCombo(chip);
+          return;
+        }
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        const fake = this.combo;
+        this.setCombo(null);
+        // Clicking the really pressed chip: keep only the other one, through the site's own button
+        if (chip !== fake) this.clickSite(fake);
+      }, true);
+    },
+
+    clickSite(chip) {
+      this.passing = true;
+      try { chip.click(); } finally { this.passing = false; }
+    },
+
+    /** Draw a site chip as pressed (or restore the previous one) and load what our grid needs. */
+    setCombo(chip) {
+      if (this.combo && this.combo !== chip && this.combo.isConnected) {
+        this.combo.classList.remove('on');
+        this.combo.setAttribute('aria-pressed', 'false');
+      }
+      this.combo = chip;
+      if (chip) {
+        chip.classList.add('on');
+        chip.setAttribute('aria-pressed', 'true');
+        this.load({ owned: true, collection: true });
+      }
+      scheduleRender();
+    },
 
     run() {
       const shelf = document.querySelector(SITE.tradeShelf);
       const profile = SITE.profilePage.exec(location.pathname);
-      if (!shelf || !profile) { this.on = false; this.userId = null; return; }
+      if (!shelf || !profile) { this.on = false; this.userId = null; this.combo = null; return; }
       const userId = profile[1].toLowerCase();
-      if (userId !== this.userId) { this.userId = userId; this.on = false; }
+      if (userId !== this.userId) { this.userId = userId; this.on = false; this.setCombo(null); }
 
       const partnerShown = [...shelf.querySelectorAll(SITE.tradeTab)]
         .some((t) => t.getAttribute('aria-selected') === 'true' && SITE.partnerTab.test(t.textContent));
@@ -1671,8 +1734,9 @@
       let chip = shelf.querySelector('[data-kp-dupes]');
       if (!partnerShown || !chips) {
         if (chip) chip.remove();
-        return this.renderGrid(shelf, null);
+        return this.runMine(shelf, userId);
       }
+      if (this.combo) this.setCombo(null);
 
       const siteChips = [...chips.querySelectorAll(SITE.tradeChip)].filter((c) => !c.hasAttribute('data-kp-dupes'));
       if (!chip) {
@@ -1693,7 +1757,58 @@
       const cards = state.tradeAvailable.get(userId);
       const count = cards ? [...cards.values()].filter((n) => n > 1).length : null;
       setText(chip.querySelector('.kp-n'), count === null ? '' : String(count));
-      this.renderGrid(shelf, this.on && cards ? cards : null);
+      if (!this.on || !cards) return this.renderGrid(shelf, null);
+
+      const filters = this.siteFilters(shelf);
+      const known = !!state.collection; // without my collection, « Je l’ai » / « Il me manque » cannot be applied
+      const entries = [...cards].filter(([, n]) => n > 1)
+        .map(([id, n]) => ({ id, n, lack: known && !(ownedQty(id) > 0) }))
+        .filter((c) => !known || ((!filters.owned || !c.lack) && (!filters.missing || c.lack)));
+      this.renderGrid(shelf, entries, {
+        lack: 'Il me manque',
+        filtered: filters.owned || filters.missing,
+        empty: 'Aucune carte en double à échanger.',
+        emptyFiltered: 'Aucun double ne correspond à tes filtres.',
+      });
+    },
+
+    /** « Mes cartes » tab: our grid while both « Mes doubles » and « Il lui manque » are on. */
+    runMine(shelf, userId) {
+      const pair = this.myChips(shelf);
+      // The chips were re-rendered, or the site turned its own chip off: back to the site's behaviour
+      if (this.combo && (!pair || !pair.includes(this.combo) || !this.combo.isConnected
+        || pair.find((c) => c !== this.combo).getAttribute('aria-pressed') !== 'true')) this.setCombo(null);
+      // Svelte may redraw its chip: keep ours drawn as pressed
+      if (this.combo) { setAttr(this.combo, 'aria-pressed', 'true'); if (!this.combo.classList.contains('on')) this.combo.classList.add('on'); }
+
+      const theirs = state.tradeOwned.get(userId);
+      if (!this.combo || !theirs || !state.collection) return this.renderGrid(shelf, null);
+      const entries = [...state.collection.keys()]
+        .filter((id) => ownedQty(id) > 1 && freeCopies(id) > 0 && !theirs.has(id))
+        .map((id) => ({ id, n: freeCopies(id), lack: true }));
+      this.renderGrid(shelf, entries, {
+        lack: 'Il lui manque',
+        filtered: false,
+        empty: 'Aucun de tes doubles ne lui manque.',
+        emptyFiltered: 'Aucun double ne correspond à tes filtres.',
+      });
+    },
+
+    /** Fetch what our grids need and this page did not load. */
+    load({ available = false, owned = false, collection = false }) {
+      const userId = this.userId;
+      if (this.busy || !userId) return;
+      const jobs = [
+        available && !state.tradeAvailable.has(userId) && loadTradeAvailable(userId)
+          .then((ok) => { if (!ok) warn('impossible de charger les cartes échangeables du joueur'); }),
+        owned && !state.tradeOwned.has(userId) && loadTradeOwned(userId)
+          .then((ok) => { if (!ok) warn('impossible de charger la collection du joueur'); }),
+        !state.catalog.size && loadCatalog().then((ok) => { if (!ok) warn('impossible de charger le catalogue des cartes'); }),
+        collection && !state.collection && loadCollection().then((ok) => { if (!ok) warn('impossible de charger ta collection'); }),
+      ].filter(Boolean);
+      if (!jobs.length) return;
+      this.busy = true;
+      Promise.all(jobs).finally(() => { this.busy = false; scheduleRender(); });
     },
 
     /** Card id of a site tile, from its image URL. */
@@ -1712,27 +1827,27 @@
       return { owned: pressed(SITE.tradeChipOwned), missing: pressed(SITE.tradeChipMissing), rarities };
     },
 
-    /** Our grid of duplicates in place of the site's one (cards = null: back to the site's grid). */
-    renderGrid(shelf, cards) {
+    /**
+     * Our grid in place of the site's one (entries = null: back to the site's grid).
+     * entries: [{ id, n, lack }]; the site's search and rarity chips are applied here.
+     */
+    renderGrid(shelf, entries, texts) {
       const siteGrid = shelf.querySelector(SITE.tradeGrid);
       let grid = shelf.querySelector('[data-kp-grid]');
-      if (siteGrid) setAttr(siteGrid, 'data-kp-hidden', cards ? '' : null);
-      if (!cards) { if (grid) grid.remove(); return; }
+      if (siteGrid) setAttr(siteGrid, 'data-kp-hidden', entries ? '' : null);
+      if (!entries) { if (grid) grid.remove(); return; }
 
       // While adding a card, the search holds its name: keep filtering with the user's own query
       const search = shelf.querySelector(SITE.tradeSearch);
       const query = this.adding ? (grid && grid.dataset.kpQuery) || '' : ((search && search.value) || '').trim().toLowerCase();
-      const filters = this.siteFilters(shelf);
-      const known = !!state.collection; // without my collection, « Je l’ai » / « Il me manque » cannot be applied
-      const dupes = [...cards].filter(([, n]) => n > 1);
-      loadPrices(dupes.map(([id]) => id)); // once per card, re-renders when they arrive
-      const list = dupes
-        .map(([id, n]) => ({ id, n, owned: ownedQty(id) > 0, price: state.prices.has(id) ? priceText(state.prices.get(id)) : null, ...cardInfo(id) }))
+      const { rarities } = this.siteFilters(shelf);
+      loadPrices(entries.map((c) => c.id)); // once per card, re-renders when they arrive
+      const list = entries
+        .map((c) => ({ ...c, price: state.prices.has(c.id) ? priceText(state.prices.get(c.id)) : null, ...cardInfo(c.id) }))
         .filter((c) => !query || c.name.toLowerCase().includes(query))
-        .filter((c) => !known || ((!filters.owned || c.owned) && (!filters.missing || !c.owned)))
-        .filter((c) => !filters.rarities.length || filters.rarities.includes(c.rarity))
+        .filter((c) => !rarities.length || rarities.includes(c.rarity))
         .sort((a, b) => RARITIES.indexOf(b.rarity) - RARITIES.indexOf(a.rarity) || a.name.localeCompare(b.name));
-      const filtered = !!(query || filters.owned || filters.missing || filters.rarities.length);
+      const filtered = !!(query || texts.filtered || rarities.length);
 
       if (!grid) {
         grid = el('ul', { 'data-kp-grid': '' });
@@ -1743,7 +1858,7 @@
       }
       setAttr(grid, 'class', siteGrid ? siteGrid.className : 'grid');
 
-      const signature = [list.map((c) => `${c.id}:${c.n}:${known && c.owned}:${c.price || ''}`).join(','), state.catalog.size, query, filtered, this.adding].join('@');
+      const signature = [list.map((c) => `${c.id}:${c.n}:${c.lack}:${c.price || ''}`).join(','), state.catalog.size, query, filtered, this.adding, texts.lack].join('@');
       if (grid.dataset.kpSignature === signature) return;
       grid.dataset.kpSignature = signature;
       grid.dataset.kpQuery = query;
@@ -1762,10 +1877,10 @@
         el('img', { alt: '', loading: 'lazy', referrerpolicy: 'no-referrer', class: cls('img', ''), src: cardImage(c.id) }),
         c.rarity && el('span', { class: cls('.r', 'r'), text: RARITY_LETTERS[RARITIES.indexOf(c.rarity)] }),
         el('span', { class: cls('.nm', 'nm'), text: c.name }),
-        known && !c.owned && el('span', { class: cls('.lack', 'lack'), text: 'Il me manque' }),
+        c.lack && el('span', { class: cls('.lack', 'lack'), text: texts.lack }),
         c.price && el('span', { class: cls(SITE.tradeTilePrice, 'pr mono'), text: c.price }),
         el('span', { class: cls('.have', 'have'), text: `×${c.n} dispo` }))))
-        : [el('li', { class: 'kp-trade-empty', text: filtered ? 'Aucun double ne correspond à tes filtres.' : 'Aucune carte en double à échanger.' })]));
+        : [el('li', { class: 'kp-trade-empty', text: filtered ? texts.emptyFiltered : texts.empty })]));
     },
 
     /** Add a card to « Tu reçois »: bring it into the site's grid with its search, then click the site's tile. */
@@ -1795,19 +1910,7 @@
 
     toggle() {
       this.on = !this.on;
-      if (this.on && !this.busy && this.userId && (!state.tradeAvailable.has(this.userId) || !state.catalog.size || !state.collection)) {
-        this.busy = true;
-        const userId = this.userId;
-        Promise.all([
-          state.tradeAvailable.has(userId) ? true : loadTradeAvailable(userId),
-          loadCatalog(),
-          state.collection ? true : loadCollection(), // for « Il me manque » / « Je l’ai »
-        ]).then(([cards, catalog, collection]) => {
-          if (!cards) warn('impossible de charger les cartes échangeables du joueur');
-          if (!catalog) warn('impossible de charger le catalogue des cartes');
-          if (!collection) warn('impossible de charger ta collection');
-        }).finally(() => { this.busy = false; scheduleRender(); });
-      }
+      if (this.on) this.load({ available: true, collection: true }); // collection: for « Il me manque » / « Je l’ai »
       scheduleRender();
     },
   };
@@ -2414,6 +2517,7 @@
     }
     window.addEventListener('popstate', scheduleRender);
     albumTabs.install();
+    partnerDuplicates.install();
     scheduleRender();
   }
 
