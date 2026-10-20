@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Plus
 // @namespace    https://github.com/Mxyuki/Kyara-Script
-// @version      1.4.2
+// @version      1.5.0
 // @description  Améliore kyara.games : rareté et exemplaires possédés sur les offres d’échange, bouton « Donner » sous chaque carte, wishlist en premier, offres cachées par le site, verrouillage depuis la collection, comptoir masquable.
 // @author       Myuki
 // @homepageURL  https://github.com/Mxyuki/Kyara-Script
@@ -38,6 +38,7 @@
     tradeAvailable: /\/api\/trades\/available\/([0-9a-f-]+)(?:\?|$)/i, // a player's tradable cards [{ characterId, n }]
     tradeOwned: /\/api\/trades\/owned\/([0-9a-f-]+)(?:\?|$)/i, // every card a player owns: [4, 353, …] (ids only, no count)
     prices: /\/api\/fair-play\/prices\?/, // ?ids=1,2,3 -> { "<cardId>": price }
+    myTrades: /\/api\/me\/trades(\?|$)/, // { incoming: [trade…], outgoing: [trade…] } (Mes échanges › Reçues / Envoyées)
     lock: /\/api\/(?:[^?]*\/)?pin(?:[/?]|$)/, // POST, sent by the 🔒 button of a wiki page
   };
 
@@ -135,6 +136,46 @@
     friendLink: 'a.who',
     friendName: '.wn b',
     friendActs: '.acts', // « Message » link, « Retirer » button.btn, « Bloquer » button.link (our pin goes first)
+    // Market › Mon activité › Mes échanges: .body[role=tabpanel] › p.sub, then one h2.h3 + ul.trades.scroll per list
+    // (« Offres du tableau », « Reçues », « Envoyées »)
+    myTradesPanel: '.body[role="tabpanel"]',
+    myTradesList: 'ul.trades',
+    myTradesHeading: 'h2',
+    // Our switch buttons, in this order (matched on the heading's text); a list matching none comes last
+    myTradesBoard: /tableau/i, // heading of « Offres du tableau »
+    myTradesOrder: [/re[çc]ues/i, /envoy[ée]es/i, /tableau/i],
+    // « Offres du tableau » list: li.trade › .th + .sides › .side (span.sk « Tu reçois » / « Tu donnes », .thumbs › a.thumb[href=/wiki/<id>][title=name])
+    boardTrade: ':scope > li.trade',
+    boardSide: '.sides > .side',
+    boardSideLabel: '.sk',
+    boardReceive: /re[çc]ois/i,
+    boardThumb: 'a.thumb',
+    marketSubtabs: '.subtabs[role="tablist"]', // « Mes ventes », « Mes enchères »…: our switch copies its look (class « on » = selected)
+    // Expanded trade (« Détails ▾ »): .trays › section.tray[.mine = « Tu donnes »] › ul.slots > li › a.slot[href=/wiki/<id>], span.nm, span.pr
+    // Reçues / Envoyées: li.trade › .th, .compact (.end › button.more « Détails ▾ ») or the details (direct button.more.less
+    // « Réduire ▴ »), .tact › button.talk « 💬 Discuter » (+ span.cnt unread count)
+    myTrade: ':scope > li.trade',
+    myTradeId: /^echange-(.+)$/, // li id « echange-<trade id> » (same id as in /api/me/trades)
+    myTradesIncoming: /re[çc]ues/i, // heading of the incoming list (the other one is outgoing)
+    tradeMessage: '.tmsg', // p.tmsg « … » the trade's message (only when there is one)
+    tradeMore: 'button.more', // the site's « Détails ▾ » / « Réduire ▴ » (aria-expanded)
+    tradeTalk: '.tact button.talk',
+    tradeTray: 'li.trade .trays .tray',
+    tradeTrayHead: ':scope > header', // h3 « Tu donnes » / « Tu reçois » + span.total « ≈ 25 ◆ »
+    tradeSlotItem: '.slots > li',
+    tradeSlotLink: 'a.slot',
+    tradeTrayMine: '.mine',
+    // Accepting an exchange offer: div.back > [role=dialog] « Confirmer l’échange » › .cf-d checkbox « Ne plus demander pendant cette session »,
+    // .cf-a buttons « Annuler » / « Confirmer l’échange » (.btn-acc)
+    tradeConfirmDialog: '[role="dialog"][aria-label="Confirmer l’échange"]',
+    tradeConfirmSkip: '.cf-d input[type="checkbox"]',
+    tradeConfirmButton: '.cf-a .btn-acc',
+    // Missions page: « Séries complètes » panel › header.c-head + ul.quests > li.q(.done.claimed) (.q-label series, .q-meta « 5 persos »)
+    missionsPage: /^\/missions/,
+    seriesPanel: 'section[aria-labelledby="albums-t"]',
+    seriesHead: 'header.c-head',
+    seriesItem: 'ul.quests > li.q',
+    seriesClaimed: '.claimed', // reward taken; a completed series not claimed yet keeps its site button visible
   };
 
   /** Trade API URL of a player's tradable cards. */
@@ -245,6 +286,14 @@
     else if (node.getAttribute(name) !== value) node.setAttribute(name, value);
   }
 
+  /** « il y a 3 h », « il y a 2 j » (empty for an invalid date). */
+  function agoText(iso) {
+    const ms = Date.now() - Date.parse(iso);
+    if (!(ms >= 0)) return '';
+    const m = Math.floor(ms / 6e4), h = Math.floor(ms / 36e5), d = Math.floor(ms / 864e5);
+    return d ? `il y a ${d} j` : h ? `il y a ${h} h` : m ? `il y a ${m} min` : 'à l’instant';
+  }
+
   function expiresText(iso) {
     const ms = Date.parse(iso) - Date.now();
     if (!(ms > 0)) return '';
@@ -273,6 +322,8 @@
     tradeOwned: new Map(),
     /** Map<cardId, price> from /api/fair-play/prices (the site's requests and ours). */
     prices: new Map(),
+    /** Map<tradeId, trade> from /api/me/trades (see parseMyTrades), or null until the site loads it. */
+    myTrades: null,
   };
 
   const ownedQty = (id) => (state.collection && state.collection.get(String(id))?.qty) || 0;
@@ -422,6 +473,52 @@
     return map;
   }
 
+  /** One side of a direct trade: { chakra, cards: [...] } -> { chakra, cards: [{ id, n, name, rarity }] } (same card merged). */
+  function parseTradeSide(side) {
+    const byId = new Map();
+    for (const c of (side && Array.isArray(side.cards) ? side.cards : [])) {
+      const id = entryId(c);
+      if (!id) continue;
+      const obj = c && typeof c === 'object' && !Array.isArray(c) ? c : {};
+      const inner = obj.character && typeof obj.character === 'object' ? obj.character : obj;
+      const prev = byId.get(id) || { id, n: 0, name: null, rarity: null };
+      prev.n += +(pick(obj, COUNT_KEYS) ?? obj.n) || 1;
+      if (typeof inner.name === 'string') prev.name = inner.name;
+      prev.rarity = prev.rarity || rarityFromCode(inner.rarity);
+      byId.set(id, prev);
+    }
+    return { chakra: +(side && side.chakra) || 0, cards: [...byId.values()] };
+  }
+
+  /**
+   * /api/me/trades -> Map<tradeId, trade>. Each raw trade: { id, from:{id,pseudo}, to, give:{chakra,cards}, want, message,
+   * status, createdAt, expiresAt, messages }, `give` being what `from` gives. Seen from my side:
+   * { id, incoming, other:{id,pseudo}, mine (what I give), theirs (what I receive), message, status, createdAt, expiresAt }.
+   */
+  function parseMyTrades(data) {
+    if (!data || (!Array.isArray(data.incoming) && !Array.isArray(data.outgoing))) return null;
+    const map = new Map();
+    for (const [list, incoming] of [[data.incoming, true], [data.outgoing, false]]) {
+      for (const t of list || []) {
+        if (!t || !t.id) continue;
+        const give = parseTradeSide(t.give), want = parseTradeSide(t.want);
+        map.set(String(t.id), {
+          id: String(t.id),
+          incoming,
+          other: (incoming ? t.from : t.to) || {},
+          mine: incoming ? want : give,
+          theirs: incoming ? give : want,
+          message: typeof t.message === 'string' && t.message.trim() ? t.message.trim() : null,
+          status: String(t.status || ''),
+          createdAt: t.createdAt,
+          expiresAt: t.expiresAt,
+          sig: JSON.stringify(t),
+        });
+      }
+    }
+    return map;
+  }
+
   /** /api/.../offers -> open exchange offers [{ id, user:{pseudo}, characterId, wantIds, expiresAt, ... }] */
   function parseOffers(data) {
     const list = findEntries(data);
@@ -492,6 +589,16 @@
         const prices = parsePrices(data);
         if (!prices) return warn('format des prix non reconnu', data);
         for (const [id, price] of prices) state.prices.set(id, price);
+      },
+    },
+    {
+      match: API.myTrades,
+      handle(data) {
+        const trades = parseMyTrades(data);
+        if (!trades) return warn('format des échanges non reconnu', data);
+        state.myTrades = trades;
+        const first = (data.incoming || []).concat(data.outgoing || []).map((t) => t && t.give && t.give.cards && t.give.cards[0]).find(Boolean);
+        log('échanges reçus / envoyés :', trades.size, first ? `exemple de carte : ${JSON.stringify(first).slice(0, 200)}` : '');
       },
     },
     {
@@ -785,6 +892,17 @@
     a[data-kp-rarity] { position: relative !important; display: inline-block; }
     a[data-kp-rarity] img { outline: 3px solid var(--kp-rc); outline-offset: -3px; }
     li.offer .give a.big img { width: 102px !important; height: auto !important; aspect-ratio: 5 / 7; }
+    /* Offered card as tall as the « Donner » tiles next to it (--kp-give-h measured on the first tile) */
+    li.offer[style*="--kp-give-h"] .give a.big img { height: var(--kp-give-h) !important; width: auto !important; object-fit: cover; }
+    .kp-give-price { font-size: 12px; font-weight: 700; color: var(--fg2, #b7b2bd); }
+    /* What accepting the offer with this card is worth: offered card's price − this card's price */
+    .kp-delta {
+      align-self: center; padding: 1px 8px; border-radius: 999px; border: 1px solid currentColor;
+      font: 700 11px/1.4 system-ui, sans-serif; white-space: nowrap;
+    }
+    .kp-delta.kp-gain { color: ${COLORS.duplicate}; }
+    .kp-delta.kp-loss { color: #ff6b5a; }
+    .kp-delta.kp-even { color: var(--fg2, #b7b2bd); }
     .kp-badge {
       position: absolute; left: 50%; bottom: 3px; transform: translateX(-50%);
       padding: 1px 6px; border-radius: 6px; white-space: nowrap; pointer-events: none; z-index: 5;
@@ -1001,6 +1119,180 @@
     .kp-af-count { margin-left: auto; color: var(--fg2, #b7b2bd); }
     .kp-af-reset { height: 28px; padding: 0 10px; border-radius: 999px; border: 1px solid var(--line2, #2e2b36); background: transparent; color: var(--fg3, #c9c5ce); font: inherit; cursor: pointer; }
 
+    /* ---- Mes échanges: one list at a time, full size, switched by our buttons ---- */
+    [data-kp-trades] .trades.scroll { max-height: none; overflow: visible; }
+    .kp-trades-switch { display: flex; flex-wrap: wrap; gap: 6px; }
+    .kp-trades-switch button .kp-n { margin-left: 6px; opacity: .7; }
+    .kp-trades-switch:not(.subtabs) button {
+      height: 32px; padding: 0 14px; border-radius: 999px; border: 1px solid var(--line2, #2e2b36); background: transparent;
+      color: var(--fg3, #c9c5ce); font: 700 13px/1 inherit; cursor: pointer;
+    }
+    .kp-trades-switch:not(.subtabs) button.on { border-color: ${COLORS.wishlist}; color: var(--fg, #edeae4); }
+    /* Trade cards: one header row (who, status, buttons), then the summary or the details (CSS order, nodes never moved) */
+    [data-kp-trades] li.trade { flex-flow: row wrap !important; align-items: center; gap: 10px !important; padding: 12px 14px !important; }
+    [data-kp-trades] li.trade > * { flex: 1 1 100%; min-width: 0; order: 2; }
+    [data-kp-trades] li.trade > .th { flex: 1 1 auto; order: 0; justify-content: flex-start !important; align-items: center; }
+    [data-kp-trades] li.trade > .tact, [data-kp-trades] li.trade > .kp-more { flex: 0 0 auto; order: 1; margin: 0 !important; }
+    /* The site's « Détails » / « Réduire » move between the summary and the bottom: ours stays in the header */
+    [data-kp-trades] li.trade:has(> .kp-more) .more:not(.kp-more) { display: none !important; }
+    .kp-more { display: inline-flex !important; align-items: center; gap: 6px; cursor: pointer; }
+    .kp-more .kp-fa { font-size: 10px; transition: transform .15s; }
+    .kp-more[aria-expanded="true"] .kp-fa { transform: rotate(180deg); }
+    /* « Discuter »: icon only (the site's text stays for screen readers) */
+    [data-kp-trades] li.trade .talk:has(> .kp-fa) {
+      position: relative; display: inline-grid !important; place-items: center; width: 32px; height: 32px; padding: 0 !important;
+      font-size: 0 !important; gap: 0;
+    }
+    [data-kp-trades] li.trade .talk > .kp-fa { width: 14px; height: 14px; }
+    [data-kp-trades] li.trade .talk .cnt { position: absolute; top: -6px; right: -6px; margin: 0 !important; font-size: 10px; }
+    [data-kp-trades] li.trade .compact {
+      display: grid !important; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto; align-items: center; gap: 8px 16px;
+    }
+    [data-kp-trades] li.trade .half {
+      display: grid !important; grid-template-columns: auto 1fr; grid-template-areas: "k v" "mini mini"; align-items: center; gap: 6px 10px;
+    }
+    [data-kp-trades] li.trade .half > .k { grid-area: k; }
+    [data-kp-trades] li.trade .half > .v { grid-area: v; justify-self: end; }
+    [data-kp-trades] li.trade .half > .mini { grid-area: mini; flex-wrap: wrap; min-height: 42px; }
+    [data-kp-trades] li.trade .compact > .end { flex-direction: column; align-items: flex-end; gap: 6px; margin: 0; text-align: right; }
+    @media (max-width: 720px) {
+      [data-kp-trades] li.trade .compact { grid-template-columns: minmax(0, 1fr); }
+      [data-kp-trades] li.trade .compact > .sw { justify-self: center; transform: rotate(90deg); }
+      [data-kp-trades] li.trade .compact > .end { flex-direction: row; justify-content: space-between; }
+    }
+    /* ---- Reçues / Envoyées: our card (from /api/me/trades) inside the site's li, its own buttons kept below ---- */
+    [data-kp-trades] ul.trades > li[data-kp-pending] { order: -1; }
+    [data-kp-trades] li.trade[data-kp-trade] { flex-flow: row wrap !important; align-items: center; gap: 10px 8px !important; padding: 14px 16px !important; }
+    [data-kp-trades] li.trade[data-kp-pending] { border-color: color-mix(in srgb, var(--cyan, #4dd0e1) 55%, var(--line, #25232c)) !important; }
+    [data-kp-trades] li.trade[data-kp-trade] > * { order: 3; flex: 1 1 100%; min-width: 0; }
+    [data-kp-trades] li.trade[data-kp-trade] > :is(.th, .tmsg, .compact, .trays, .verdict, .more, .kp-more) { display: none !important; }
+    [data-kp-trades] li.trade[data-kp-trade] > .kp-tr { order: 0; }
+    [data-kp-trades] li.trade[data-kp-trade] > .kp-tr-foot { order: 1; flex: 1 1 auto; }
+    [data-kp-trades] li.trade[data-kp-trade] > .tact { order: 2; flex: 0 0 auto; margin: 0 !important; }
+    .kp-tr { display: flex; flex-direction: column; gap: 12px; }
+    .kp-tr-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; }
+    .kp-tr-av {
+      display: grid; place-items: center; width: 30px; height: 30px; flex: none; border-radius: 999px;
+      background: var(--panel2, #17161d); border: 1px solid var(--line2, #2e2b36); font-weight: 800; font-size: 13px; text-transform: uppercase;
+    }
+    .kp-tr-who { display: flex; flex-direction: column; min-width: 0; line-height: 1.2; }
+    .kp-tr-who small { font-size: 11px; color: var(--mut, #8a8592); }
+    .kp-tr-who a { color: var(--fg, #edeae4); font-weight: 800; text-decoration: none; }
+    .kp-tr-who a:hover { text-decoration: underline; }
+    .kp-tr-pills { margin-left: auto; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+    .kp-tr-pill { padding: 3px 10px; border-radius: 999px; border: 1px solid currentColor; font-size: 12px; font-weight: 700; white-space: nowrap; }
+    .kp-tr-pill.kp-gain { color: ${COLORS.duplicate}; }
+    .kp-tr-pill.kp-loss { color: #ff6b5a; }
+    .kp-tr-pill.kp-even { color: var(--fg2, #b7b2bd); }
+    .kp-st-pending { color: var(--cyan, #4dd0e1); }
+    .kp-st-accepted { color: var(--U, ${COLORS.duplicate}); }
+    .kp-st-declined { color: #ff6b5a; }
+    .kp-st-other { color: var(--mut, #8a8592); }
+    .kp-tr-body { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 10px; align-items: stretch; }
+    .kp-tr-swap { align-self: center; color: var(--acc, ${COLORS.wishlist}); font-size: 14px; }
+    .kp-tr-side {
+      display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 10px 12px; border-radius: 12px;
+      background: var(--bg2, #121117); border: 1px solid var(--line, #25232c);
+    }
+    .kp-tr-side-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+    .kp-tr-side-head b { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--mut, #8a8592); }
+    .kp-tr-value { font-size: 12px; font-weight: 700; color: var(--fg2, #b7b2bd); }
+    .kp-tr-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(66px, 1fr)); gap: 8px; }
+    .kp-tr-tile { display: flex; flex-direction: column; align-items: center; gap: 3px; min-width: 0; }
+    .kp-tr-card { position: relative; display: block; width: 100%; max-width: 76px; }
+    .kp-tr-card img {
+      display: block; width: 100%; aspect-ratio: 5 / 7; object-fit: cover; object-position: 50% 20%; border-radius: 8px;
+      background: #1c1a23; outline: 2px solid var(--kp-rc); outline-offset: -2px;
+    }
+    .kp-tr-tile.kp-had img { opacity: .45; }
+    .kp-tr-price { font-size: 11px; font-weight: 700; color: var(--fg2, #b7b2bd); white-space: nowrap; }
+    .kp-tr-card .kp-cnt { right: 2px; bottom: 2px; padding: 0 4px; font-size: 9px; }
+    .kp-tr-card .kp-tag-new { left: 2px; top: 2px; padding: 0 3px; font-size: 8px; }
+    .kp-tr-n {
+      position: absolute; right: 2px; top: 2px; padding: 0 4px; border-radius: 5px; font: 700 9px/1.4 system-ui, sans-serif;
+      color: #fff; background: rgba(0,0,0,.7);
+    }
+    .kp-tr-chakra { font-size: 12px; font-weight: 700; color: ${COLORS.wishlist}; }
+    .kp-tr-nothing { font-size: 12px; color: var(--mut, #8a8592); font-style: italic; }
+    .kp-tr-note { display: flex; flex-wrap: wrap; gap: 2px 10px; font-size: 11px; font-weight: 700; }
+    .kp-tr-note .kp-dup, .kp-tr-note .kp-new { color: ${COLORS.duplicate}; }
+    .kp-tr-note .kp-single { color: ${COLORS.single}; }
+    .kp-tr-note .kp-had { color: var(--fg2, #b7b2bd); }
+    .kp-tr-msg { margin: 0; padding: 6px 12px; border-left: 3px solid var(--line2, #2e2b36); color: var(--fg2, #b7b2bd); font-size: 13px; font-style: italic; }
+    .kp-tr-foot { font-size: 12px; color: var(--mut, #8a8592); }
+    .kp-tr-foot .kp-soon { color: ${COLORS.single}; font-weight: 700; }
+    @media (max-width: 720px) {
+      .kp-tr-body { grid-template-columns: minmax(0, 1fr); }
+      .kp-tr-swap { justify-self: center; transform: rotate(90deg); }
+    }
+    .kp-trades-switch .kp-pend {
+      margin-left: 6px; padding: 0 6px; border-radius: 999px; font-size: 11px; font-weight: 800;
+      color: #111; background: var(--cyan, #4dd0e1);
+    }
+    /* Details: compact trays, small tiles, long lists scroll inside their tray */
+    [data-kp-trades] li.trade .trays { gap: 10px; }
+    [data-kp-trades] li.trade .tray { gap: 8px; padding: 10px 12px; border-radius: 14px; }
+    [data-kp-trades] li.trade .tray > header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 2px 10px; }
+    [data-kp-trades] li.trade .tray > header h3 { margin: 0; font-size: 14px; }
+    [data-kp-trades] li.trade .slots {
+      grid-template-columns: repeat(auto-fill, minmax(68px, 1fr)) !important; gap: 8px !important;
+      max-height: 330px; overflow-y: auto; padding: 6px 4px 2px 0 !important; scrollbar-width: thin;
+    }
+    [data-kp-trades] li.trade .slots .nm { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    [data-kp-trades] li.trade .slots .pr { font-size: 10px; }
+    [data-kp-trades] li.trade .verdict { margin: 0 !important; padding: 8px 12px !important; }
+    [data-kp-trades] li.trade .verdict .v-h { font-size: 13px; }
+    /* « Offres du tableau »: small squares (2 cards, their price, the gain or loss), several per row */
+    [data-kp-trades] ul[data-kp-board]:not([data-kp-hidden]) { display: grid !important; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px !important; align-items: start; }
+    [data-kp-trades] ul[data-kp-board] > li.trade { flex-flow: column nowrap !important; gap: 8px !important; padding: 10px !important; }
+    [data-kp-trades] ul[data-kp-board] > li.trade > * { flex: none; order: 0; }
+    [data-kp-board] li.trade > .th { font-size: 12px; flex-wrap: nowrap !important; justify-content: space-between !important; gap: 6px; }
+    [data-kp-board] li.trade > .th > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    [data-kp-board] li.trade > .th .st { padding: 2px 8px; font-size: 11px; }
+    [data-kp-board] li.trade .sides { position: relative; grid-template-columns: 1fr 1fr !important; gap: 28px !important; }
+    .kp-board-swap {
+      position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); pointer-events: none;
+      display: grid; place-items: center; width: 24px; height: 24px; border-radius: 999px;
+      background: var(--panel2, #17161d); border: 1px solid var(--line2, #2e2b36); color: var(--acc, ${COLORS.wishlist}); font-size: 11px;
+    }
+    [data-kp-board] li.trade .side { align-items: center; gap: 4px !important; padding: 8px !important; text-align: center; }
+    [data-kp-board] li.trade .side .sk { font-size: 11px; color: var(--mut, #8a8592); font-weight: 700; }
+    [data-kp-board] li.trade .thumbs { justify-content: center; }
+    [data-kp-board] li.trade .thumb img {
+      width: 68px !important; height: 95px !important; border-radius: 8px !important;
+      outline: 3px solid var(--kp-rc, transparent); outline-offset: -3px;
+    }
+    .kp-side-name { max-width: 100%; font-size: 11px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .kp-side-price { font-size: 11px; color: var(--fg2, #b7b2bd); }
+    .kp-board-diff { padding: 5px 8px; border-radius: 10px; background: var(--bg2, #121117); text-align: center; font-size: 13px; font-weight: 800; }
+    .kp-board-diff.kp-gain { color: ${COLORS.duplicate}; }
+    .kp-board-diff.kp-loss { color: #ff6b5a; }
+    .kp-board-diff.kp-even { color: var(--fg2, #b7b2bd); }
+    /* Details: my copies of each card */
+    li.trade .slots a.slot { position: relative; }
+    li.trade .slots li[data-kp-own-state="owned"] img { opacity: .55; }
+    .kp-cnt.kp-had { background: var(--fg2, #b7b2bd); }
+    .kp-tag-new {
+      position: absolute; left: 3px; top: 3px; padding: 1px 5px; border-radius: 6px; pointer-events: none;
+      font: 700 9px/1.3 system-ui, sans-serif; color: #111; background: ${COLORS.duplicate}; box-shadow: 0 1px 3px rgba(0,0,0,.6);
+    }
+    .kp-tray-sum { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 2px 10px; font-size: 11px; font-weight: 700; }
+    .kp-tray-sum .kp-dup, .kp-tray-sum .kp-new { color: ${COLORS.duplicate}; }
+    .kp-tray-sum .kp-single { color: ${COLORS.single}; }
+    .kp-tray-sum .kp-had { color: var(--fg2, #b7b2bd); }
+
+    /* ---- Missions: « Séries complètes » rolled up ---- */
+    [data-kp-series-head] { cursor: pointer; user-select: none; }
+    .kp-series-toggle {
+      display: inline-flex; align-items: center; gap: 8px; height: 30px; padding: 0 12px; flex: none; cursor: pointer;
+      border-radius: 999px; border: 1px solid var(--line2, #2e2b36); background: transparent;
+      color: var(--fg, #edeae4); font: 700 12px/1 inherit; transition: border-color .15s;
+    }
+    .kp-series-toggle:hover, [data-kp-series-head]:hover .kp-series-toggle { border-color: ${COLORS.wishlist}; }
+    .kp-series-toggle:focus-visible { outline: 2px solid ${COLORS.wishlist}; outline-offset: 2px; }
+    .kp-series-toggle .kp-fa { font-size: 11px; transition: transform .15s; }
+    .kp-series-toggle[aria-expanded="true"] .kp-fa { transform: rotate(180deg); }
+
     /* ---- Comptoir (market chat): hidden unless toggled ---- */
     html:not(.kp-show-chat):not(.kp-chat-page) .chat-side, html:not(.kp-show-chat):not(.kp-chat-page) .chat-fab { display: none !important; }
     html:not(.kp-show-chat):not(.kp-chat-page) .layout:has(.chat-side) { grid-template-columns: minmax(0, 1fr) !important; }
@@ -1042,7 +1334,7 @@
    * One proposed card: image, rarity, owned count, name, and an action (button or state text).
    * `onOpen` replaces the link's default navigation (used to go through the site's router).
    */
-  function cardTile({ id, name, src, rarity, available, qty, onOpen, action }) {
+  function cardTile({ id, name, src, rarity, available, qty, onOpen, action, delta }) {
     const link = el('a', {
       href: `/wiki/${id}`,
       title: name + (rarity ? ` – ${rarity.name}` : ''),
@@ -1059,7 +1351,27 @@
     return el('div', { class: 'kp-tile' + (available ? '' : ' kp-missing'), '--kp-rc': rarityColor(rarity) },
       link,
       el('div', { class: 'kp-name', text: name }),
+      delta !== undefined && deltaPill(delta),
       action);
+  }
+
+  /**
+   * « +120 ◆ » / « −40 ◆ »: what giving this card for the offered one is worth (median prices).
+   * null = prices still loading.
+   */
+  function deltaPill(delta) {
+    if (delta === null) return el('span', { class: 'kp-delta kp-even mono', text: '… ◆' });
+    return el('span', {
+      class: `kp-delta mono ${delta > 0 ? 'kp-gain' : delta < 0 ? 'kp-loss' : 'kp-even'}`,
+      title: 'Ce que tu gagnes (ou perds) si tu donnes cette carte : prix médian de la carte offerte − prix médian de celle-ci',
+      text: delta > 0 ? `+${priceText(delta)}` : delta < 0 ? `−${priceText(-delta)}` : '= 0 ◆',
+    });
+  }
+
+  /** Offered card's price − given card's price, rounded; null while one of them is unknown. */
+  function tradeDelta(offeredId, givenId) {
+    const a = state.prices.get(String(offeredId)), b = state.prices.get(String(givenId));
+    return a === undefined || b === undefined ? null : Math.round(a - b);
   }
 
   const stateText = (text) => el('div', { class: 'kp-state', text });
@@ -1081,6 +1393,9 @@
   const FA_ICONS = {
     thumbtack: ['0 0 384 512', 'M32 32C32 14.3 46.3 0 64 0H320c17.7 0 32 14.3 32 32s-14.3 32-32 32H290.5l11.4 148.2c36.7 19.9 65.7 53.2 79.5 94.7l1 3c3.3 9.8 1.6 20.5-4.4 28.8s-15.7 13.3-26 13.3H32c-10.3 0-19.9-4.9-26-13.3s-7.7-19.1-4.4-28.8l1-3c13.8-41.5 42.8-74.8 79.5-94.7L93.5 64H64C46.3 64 32 49.7 32 32zM160 384h64v96c0 17.7-14.3 32-32 32s-32-14.3-32-32V384z'],
     eyeSlash: ['0 0 640 512', 'M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c8.4-19.3 10.6-41.4 4.8-63.3c-11.1-41.5-47.8-69.4-88.6-71.1c-5.8-.2-9.2 6.1-7.4 11.7c2.1 6.4 3.3 13.2 3.3 20.3c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zM373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5L373 389.9z'],
+    arrowRightArrowLeft: ['0 0 448 512', 'M438.6 150.6c12.5-12.5 12.5-32.8 0-45.3l-96-96c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3L338.7 96 32 96C14.3 96 0 110.3 0 128s14.3 32 32 32l306.7 0-41.4 41.4c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0l96-96zm-333.3 352c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 416 416 416c17.7 0 32-14.3 32-32s-14.3-32-32-32l-306.7 0 41.4-41.4c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-96 96c-12.5 12.5-12.5 32.8 0 45.3l96 96z'],
+    comment: ['0 0 512 512', 'M512 240c0 114.9-114.6 208-256 208c-37.1 0-72.3-6.4-104.1-17.9c-11.9 8.7-31.3 20.6-54.3 30.6C73.6 471.1 44.7 480 16 480c-6.5 0-12.3-3.9-14.8-9.9c-2.5-6-1.1-12.8 3.4-17.4l.3-.3c.3-.3 .7-.7 1.3-1.4c1.1-1.2 2.8-3.1 4.9-5.7c4.1-5 9.6-12.4 15.2-21.6c10-16.6 19.5-38.4 21.4-62.9C17.7 326.8 0 285.1 0 240C0 125.1 114.6 32 256 32s256 93.1 256 208z'],
+    chevronDown: ['0 0 448 512', 'M201.4 374.6c12.5 12.5 32.8 12.5 45.3 0l160-160c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L224 306.7 86.6 169.4c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3l160 160z'],
     search: ['0 0 512 512', 'M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352a144 144 0 1 0 0-288 144 144 0 1 0 0 288z'],
   };
 
@@ -1168,6 +1483,23 @@
   function offerOrder(wish, rarity) {
     const rank = rarity ? RARITIES.indexOf(rarity) + 1 : 0; // 0 unknown … 6 Mythique
     return -(wish * 10 + rank);
+  }
+
+  /**
+   * Full sort key of an offer (lower first): offerOrder, then inside the same group the most profitable first.
+   * best = best gain among the cards I can give (offered price − given price), null while prices load,
+   * undefined when I can give none (last of the group).
+   */
+  function offerSortKey(wish, rarity, best) {
+    const tail = best === undefined ? 4.9e6 : best === null ? 4.5e6 : Math.max(-4e6, Math.min(4e6, -best));
+    return offerOrder(wish, rarity) * 1e7 + Math.round(tail);
+  }
+
+  /** Best gain among the given deltas (undefined when none, null when one is still loading and none is known). */
+  function bestDelta(deltas) {
+    const known = deltas.filter((d) => typeof d === 'number');
+    if (known.length) return Math.max(...known);
+    return deltas.length ? null : undefined;
   }
 
   /** A filter pill's label without its counter (« Mes offres 1 » -> « Mes offres »). */
@@ -1262,6 +1594,7 @@
         this.decorateGivenCard(offer);
         this.renderGrid(offer);
         this.markWishlist(offer);
+        this.matchGivenHeight(offer);
       });
     },
 
@@ -1279,13 +1612,29 @@
         setText(link.querySelector('.kp-badge'), rarity.name);
       }
 
+      const id = wikiId(link.getAttribute('href'));
       if (info && state.collection) {
-        const { text, color } = ownedLabel(ownedQty(wikiId(link.getAttribute('href'))));
+        const { text, color } = ownedLabel(ownedQty(id));
         let owned = info.querySelector(':scope > .kp-owned');
         if (!owned) info.appendChild(owned = el('span', { class: 'kp-owned' }));
         setText(owned, text);
         if (owned.style.color !== color) owned.style.color = color;
       }
+      if (info && id) {
+        let price = info.querySelector(':scope > .kp-give-price');
+        if (!price) info.appendChild(price = el('span', { class: 'kp-give-price mono', title: 'Prix médian de la carte offerte' }));
+        setText(price, state.prices.has(id) ? `≈ ${priceText(state.prices.get(id))}` : '… ◆');
+      }
+    },
+
+    /** The offered card takes the height of the first « Donner » tile (re-measured on every render and on resize). */
+    matchGivenHeight(offer) {
+      const tile = offer.querySelector(`${SITE.offerWant} .kp-grid > .kp-tile`);
+      const h = tile ? tile.offsetHeight : 0;
+      const value = h ? `${h}px` : '';
+      if (offer.style.getPropertyValue('--kp-give-h') === value) return;
+      if (value) offer.style.setProperty('--kp-give-h', value);
+      else offer.style.removeProperty('--kp-give-h');
     },
 
     renderGrid(offer) {
@@ -1318,15 +1667,20 @@
       if (giveButtons.length === 1 && orphans.length === 1) orphans[0].button = giveButtons.pop();
       if (giveButtons.length) this.warnUnmatched(offer, giveButtons);
 
+      const offeredId = wikiId(offer.querySelector(SITE.offerGiveLink)?.getAttribute('href'));
+      if (offeredId) loadPrices([offeredId, ...cards.map((c) => c.id).filter(Boolean)]); // once per card
       for (const c of cards) {
         // The site shows a « Donner » button: I own it, even if our collection is stale
         c.have = c.siteHave || !!c.button;
         c.qty = c.have ? ownedQty(c.id) || null : null;
         if (c.have && state.collection && !ownedQty(c.id)) this.collectionStale();
+        c.delta = c.have && offeredId ? tradeDelta(offeredId, c.id) : undefined;
       }
+      // Most profitable card I can give (a « Donner » button), for the order of the offers
+      this.best.set(offer, bestDelta(cards.filter((c) => c.button && c.delta !== undefined).map((c) => c.delta)));
 
       const signature = state.collectionVersion + '@' + cards.map((c) =>
-        [c.id, c.img && c.img.src, c.have, c.button ? (c.button.disabled ? 'd' : 'b') : '', c.rarity && c.rarity.name, c.qty].join('|')).join('#');
+        [c.id, c.img && c.img.src, c.have, c.button ? (c.button.disabled ? 'd' : 'b') : '', c.rarity && c.rarity.name, c.qty, c.delta].join('|')).join('#');
 
       let grid = want.querySelector(':scope > .kp-grid');
       if (grid && grid.dataset.signature === signature) return;
@@ -1339,6 +1693,7 @@
         rarity: c.rarity,
         available: c.have,
         qty: c.qty,
+        delta: c.delta,
         onOpen: () => c.a.click(), // let the site's router navigate
         action: c.button ? this.giveButton(c) : stateText(c.have ? 'Tu l’as (pas libre)' : 'Tu ne l’as pas'),
       })));
@@ -1381,7 +1736,13 @@
       });
     },
 
-    /** data-kp-wish "2" = in wishlist and you can accept it now, "1" = in wishlist. Also sets the display order. */
+    /** WeakMap<offer li, best gain> filled by renderGrid (see bestDelta). */
+    best: new WeakMap(),
+
+    /**
+     * data-kp-wish "2" = in wishlist and you can accept it now, "1" = in wishlist. Also sets the display order:
+     * wishlist, rarity, then the most profitable offer first (offerSortKey).
+     */
     markWishlist(offer) {
       const link = offer.querySelector(SITE.offerGiveLink);
       const info = offer.querySelector(SITE.offerGiveInfo);
@@ -1390,7 +1751,7 @@
       const wish = wished ? (offer.querySelector('.kp-give') ? 2 : 1) : 0;
       setAttr(offer, 'data-kp-wish', wish ? String(wish) : null);
       const img = link.querySelector('img');
-      const order = String(offerOrder(wish, img && rarityFromImg(img)));
+      const order = String(offerSortKey(wish, img && rarityFromImg(img), this.best.get(offer)));
       if (offer.style.getPropertyValue('--kp-order') !== order) offer.style.setProperty('--kp-order', order);
       const tag = info.querySelector(':scope > .kp-wish-tag');
       if (wished && !tag) info.appendChild(el('span', { class: 'kp-wish-tag', text: '♥ Dans ta wishlist' }));
@@ -1455,12 +1816,15 @@
       if (!shown.size) return this.clear();
 
       const canGive = (o) => (o.wantIds || []).some((w) => freeCopies(w) > 0);
-      const rank = (o) => offerOrder(inWishlist(o.characterId) ? (canGive(o) ? 2 : 1) : 0, cardInfo(o.characterId).rarity) * 2 + (canGive(o) ? 0 : 1);
-      const missing = state.serverOffers
-        .filter((o) => !shown.has(o.id) && !blockedOffers.ids.has(o.id))
-        .sort((a, b) => rank(a) - rank(b));
-
-      const signature = [missing.map((o) => o.id).join(','), state.collectionVersion, state.wishlist.size, state.catalog.size, blockedOffers.ids.size].join('@');
+      const missing = state.serverOffers.filter((o) => !shown.has(o.id) && !blockedOffers.ids.has(o.id));
+      const ids = missing.flatMap((o) => [o.characterId, ...(o.wantIds || [])]).map(String);
+      loadPrices(ids); // for the gain / loss of each card I can give (once per card)
+      // Same order as the site's list: wishlist, rarity, then the most profitable first
+      const rank = (o) => offerSortKey(inWishlist(o.characterId) ? (canGive(o) ? 2 : 1) : 0, cardInfo(o.characterId).rarity,
+        bestDelta((o.wantIds || []).filter((w) => freeCopies(w) > 0).map((w) => tradeDelta(o.characterId, w))));
+      missing.sort((a, b) => rank(a) - rank(b));
+      const priced = ids.filter((id) => state.prices.has(id)).length;
+      const signature = [missing.map((o) => o.id).join(','), state.collectionVersion, state.wishlist.size, state.catalog.size, blockedOffers.ids.size, priced].join('@');
       const bottom = document.getElementById('kp-extra');
       if (bottom && bottom.dataset.signature === signature) return;
       this.clear();
@@ -1522,6 +1886,7 @@
           rarity: card.rarity,
           available: free > 0,
           qty: qty || null,
+          delta: free > 0 ? tradeDelta(o.characterId, wid) : undefined,
           action: stateText(!state.collection ? 'Collection en chargement…' : free > 0 ? 'Tu peux la donner' : qty ? 'Tu l’as (pas libre)' : 'Tu ne l’as pas'),
         });
       })));
@@ -2483,7 +2848,415 @@
     },
   };
 
-  const FEATURES = [chatToggle, marketChatTab, offerCards, blockedOffers, offersRefresh, hiddenOffers, collectionLocks, albumFilters, albumTabs, partnerDuplicates, playerCollection, boosterPrices, friendsList];
+  /**
+   * Market › Mon activité › Mes échanges: instead of the lists stacked (« Offres du tableau », « Reçues », « Envoyées »),
+   * one list at a time, full size, with switch buttons « Reçues » / « Envoyées » / « Offres du tableau » above them
+   * (copying the look of the site's sub-tabs). The other lists and the site's headings get data-kp-hidden (never moved).
+   * Selected list in memory (« Reçues » on load). Expanded trades (« Détails ▾ »): my copy count on each card,
+   * duplicates highlighted, and whether I already own the cards I would receive.
+   */
+  const myTrades = {
+    name: 'myTrades',
+    collectionAsked: false,
+    selected: 0, // index in the switch's order
+
+    run() {
+      const onMarket = SITE.marketPage.test(location.pathname);
+      document.querySelectorAll('[data-kp-trades]').forEach((panel) => { if (!onMarket || !this.isTradesPanel(panel)) this.reset(panel); });
+      if (!onMarket) return;
+      for (const panel of document.querySelectorAll(SITE.myTradesPanel)) {
+        if (!this.isTradesPanel(panel)) continue;
+        this.layout(panel);
+        for (const list of panel.querySelectorAll(`:scope > ${SITE.myTradesList}`)) {
+          this.board(list);
+          for (const li of list.querySelectorAll(SITE.myTrade)) {
+            const id = (SITE.myTradeId.exec(li.id) || [])[1];
+            const trade = id && state.myTrades && state.myTrades.get(id);
+            if (trade) this.renderTrade(li, trade);
+            else this.clearTrade(li);
+            this.tradeButtons(li);
+          }
+        }
+      }
+      this.details();
+    },
+
+    catalogAsked: false,
+
+    /**
+     * Reçues / Envoyées: our own card for a trade, from /api/me/trades, appended inside the site's li (whose own content is
+     * hidden by CSS). The site's buttons (Accepter, Refuser, Annuler, Discuter) and its chat stay below, untouched.
+     * Header: who, balance (received − given, median prices + chakra), status. Body: « Tu donnes » / « Tu reçois » with
+     * every card (rarity outline, my copies), then the message and the dates.
+     */
+    renderTrade(li, t) {
+      setAttr(li, 'data-kp-trade', '');
+      setAttr(li, 'data-kp-pending', t.status === 'pending' ? '' : null);
+      if (!state.collection && !this.collectionAsked) { this.collectionAsked = true; loadCollection(); }
+      const all = [...t.mine.cards, ...t.theirs.cards];
+      if (!state.catalog.size && all.some((c) => !c.name) && !this.catalogAsked) { this.catalogAsked = true; loadCatalog(); }
+      loadPrices(all.map((c) => c.id));
+
+      const priced = all.filter((c) => state.prices.has(c.id)).length;
+      const signature = [t.sig, state.collectionVersion, state.catalog.size, priced].join('@');
+      let card = li.querySelector(':scope > .kp-tr');
+      if (card && card.dataset.kpSignature === signature) return;
+      if (!card) li.appendChild(card = el('div', { class: 'kp-tr' }));
+      card.dataset.kpSignature = signature;
+
+      const value = (part) => part.cards.reduce((sum, c) => sum + (state.prices.get(c.id) || 0) * c.n, part.chakra);
+      const known = priced === all.length;
+      const gain = Math.round(value(t.theirs) - value(t.mine));
+      const status = { pending: ['En attente', 'kp-st-pending'], accepted: ['Acceptée', 'kp-st-accepted'], declined: ['Refusée', 'kp-st-declined'],
+        cancelled: ['Annulée', 'kp-st-other'], expired: ['Expirée', 'kp-st-other'] }[t.status] || [t.status || '?', 'kp-st-other'];
+      const pseudo = t.other.pseudo || 'Joueur';
+
+      // (replaceChildren writes null as « null »: filter the optional parts)
+      card.replaceChildren(...[
+        el('div', { class: 'kp-tr-head' },
+          el('span', { class: 'kp-tr-av', 'aria-hidden': 'true', text: pseudo.slice(0, 1) }),
+          el('span', { class: 'kp-tr-who' },
+            el('small', { text: t.incoming ? 'Proposé par' : 'Proposé à' }),
+            t.other.id ? el('a', { href: `/profil/${t.other.id}`, text: pseudo }) : el('b', { text: pseudo })),
+          el('span', { class: 'kp-tr-pills' },
+            el('span', {
+              class: `kp-tr-pill mono ${!known ? 'kp-even' : gain > 0 ? 'kp-gain' : gain < 0 ? 'kp-loss' : 'kp-even'}`,
+              title: 'Ce que tu reçois moins ce que tu donnes (prix médians actuels + chakra)',
+              text: !known ? '… ◆' : gain > 0 ? `+${priceText(gain)} pour toi` : gain < 0 ? `−${priceText(-gain)} pour toi` : 'Équilibré',
+            }),
+            el('span', { class: `kp-tr-pill ${status[1]}`, text: status[0] }))),
+        el('div', { class: 'kp-tr-body' },
+          this.side('Tu donnes', t.mine, true),
+          el('span', { class: 'kp-tr-swap', 'aria-hidden': 'true' }, faIcon('arrowRightArrowLeft')),
+          this.side('Tu reçois', t.theirs, false)),
+        t.message && el('p', { class: 'kp-tr-msg', text: `« ${t.message} »` }),
+      ].filter(Boolean));
+
+      let foot = li.querySelector(':scope > .kp-tr-foot');
+      if (!foot) li.appendChild(foot = el('div', { class: 'kp-tr-foot' }));
+      const expires = t.status === 'pending' ? expiresText(t.expiresAt) : '';
+      const soon = expires && Date.parse(t.expiresAt) - Date.now() < 6 * 36e5;
+      foot.replaceChildren(...[agoText(t.createdAt), expires && ' · ', expires && el('span', { class: soon ? 'kp-soon' : '', text: expires })].filter(Boolean));
+    },
+
+    /** One side: title + value, every card (20 at most) with its median price, chakra, and a summary of my copies. */
+    side(title, part, mine) {
+      const counts = { dup: 0, single: 0, new: 0, had: 0 };
+      const tiles = part.cards.map((c) => {
+        const info = cardInfo(c.id);
+        const name = c.name || info.name, rarity = c.rarity || info.rarity;
+        const qty = ownedQty(c.id), price = state.prices.get(c.id);
+        const kind = !state.collection ? null : mine ? (qty >= 2 ? 'dup' : qty === 1 ? 'single' : null) : (qty ? 'had' : 'new');
+        if (kind) counts[kind]++;
+        const own = kind === 'new' ? 'Tu ne l’as pas encore' : kind === 'had' ? `Tu l’as déjà (×${qty})`
+          : kind === 'dup' ? `Tu en as ${qty}` : kind === 'single' ? 'C’est ta dernière copie' : '';
+        return el('div', { class: 'kp-tr-tile' + (kind === 'had' ? ' kp-had' : '') },
+          el('a', {
+            class: 'kp-tr-card',
+            href: `/wiki/${c.id}`,
+            '--kp-rc': rarityColor(rarity),
+            title: [name + (c.n > 1 ? ` ×${c.n}` : ''), rarity && rarity.name, price !== undefined && priceText(price), own].filter(Boolean).join(' · '),
+          },
+          el('img', { src: cardImage(c.id), alt: name, loading: 'lazy', referrerpolicy: 'no-referrer' }),
+          c.n > 1 && el('span', { class: 'kp-tr-n', text: `×${c.n}` }),
+          kind === 'new' && el('span', { class: 'kp-tag-new', text: 'Nouv.' }),
+          kind === 'had' && el('span', { class: 'kp-cnt kp-had', text: `×${qty}` }),
+          (kind === 'dup' || kind === 'single') && countBadge(c.id, qty)),
+          el('span', { class: 'kp-tr-price mono', title: 'Prix médian', text: price !== undefined ? priceText(price) : '… ◆' }));
+      });
+
+      const total = part.cards.reduce((sum, c) => sum + (state.prices.get(c.id) || 0) * c.n, part.chakra);
+      const allPriced = part.cards.every((c) => state.prices.has(c.id));
+      const notes = (mine
+        ? [['dup', counts.dup, (s) => `doublon${s}`], ['single', counts.single, (s) => `dernier${s} exemplaire${s}`]]
+        : [['new', counts.new, (s) => `nouvelle${s}`], ['had', counts.had, (s) => `déjà possédée${s}`]]).filter(([, n]) => n);
+      const nCards = part.cards.reduce((sum, c) => sum + c.n, 0);
+
+      return el('section', { class: 'kp-tr-side' },
+        el('div', { class: 'kp-tr-side-head' },
+          el('b', { text: `${title}${nCards ? ` · ${nCards}` : ''}` }),
+          el('span', { class: 'kp-tr-value mono', text: allPriced ? `≈ ${priceText(total)}` : '… ◆' })),
+        part.cards.length ? el('div', { class: 'kp-tr-cards' }, tiles) : null,
+        part.chakra ? el('span', { class: 'kp-tr-chakra mono', text: `+ ${priceText(part.chakra)} de chakra` }) : null,
+        !part.cards.length && !part.chakra ? el('span', { class: 'kp-tr-nothing', text: 'Rien' }) : null,
+        notes.length ? el('div', { class: 'kp-tr-note' }, notes.map(([cls, n, word]) => el('span', { class: `kp-${cls}`, text: `${n} ${word(n > 1 ? 's' : '')}` }))) : null);
+    },
+
+    /** No data for this li (trades not loaded yet): the site's own content. */
+    clearTrade(li) {
+      if (!li.hasAttribute('data-kp-trade')) return;
+      li.removeAttribute('data-kp-trade');
+      li.removeAttribute('data-kp-pending');
+      li.querySelector(':scope > .kp-tr')?.remove();
+      li.querySelector(':scope > .kp-tr-foot')?.remove();
+    },
+
+    /**
+     * Reçues / Envoyées: one « Détails » / « Réduire » button that stays in the header (it clicks the site's own button,
+     * which is hidden: the site puts it in the summary when closed and at the bottom when open), and « Discuter » as an icon.
+     */
+    tradeButtons(li) {
+      const siteMore = li.querySelector(`${SITE.tradeMore}:not(.kp-more)`);
+      let more = li.querySelector(':scope > .kp-more');
+      if (!siteMore || li.hasAttribute('data-kp-trade')) { if (more) more.remove(); } // our card shows every card: no details needed
+      else {
+        if (!more) {
+          more = el('button', { type: 'button', onClick: () => li.querySelector(`${SITE.tradeMore}:not(.kp-more)`)?.click() },
+            el('span', { class: 'kp-label' }), faIcon('chevronDown'));
+          li.appendChild(more);
+        }
+        const open = siteMore.getAttribute('aria-expanded') === 'true';
+        setAttr(more, 'class', `${siteMore.className.replace(/\bless\b/g, '').replace(/\s+/g, ' ').trim()} kp-more`);
+        setAttr(more, 'aria-expanded', String(open));
+        setText(more.querySelector('.kp-label'), open ? 'Réduire' : 'Détails');
+      }
+      const talk = li.querySelector(SITE.tradeTalk);
+      if (talk && !talk.querySelector(':scope > .kp-fa')) {
+        talk.prepend(faIcon('comment'));
+        setAttr(talk, 'title', 'Discuter');
+      }
+    },
+
+    /**
+     * « Offres du tableau » (lists whose trades have .sides): grid of small squares. Under each card its name and
+     * median price, and under both what the trade is worth for me: received price − given price.
+     */
+    board(list) {
+      const trades = [...list.querySelectorAll(SITE.boardTrade)].filter((li) => li.querySelector(SITE.boardSide));
+      setAttr(list, 'data-kp-board', trades.length ? '' : null);
+      if (!trades.length) return;
+      const sides = (li) => [...li.querySelectorAll(SITE.boardSide)].map((side) => ({
+        side,
+        receive: SITE.boardReceive.test(side.querySelector(SITE.boardSideLabel)?.textContent || ''),
+        cards: [...side.querySelectorAll(SITE.boardThumb)].map((a) => {
+          // The site's inset box-shadow does not show over the image: draw the rarity as an outline
+          const img = a.querySelector('img');
+          const rarity = img && rarityFromImg(img);
+          if (rarity && a.style.getPropertyValue('--kp-rc') !== rgbCss(rarity)) a.style.setProperty('--kp-rc', rgbCss(rarity));
+          return { id: wikiId(a.getAttribute('href')), name: (a.title || '').trim() };
+        }).filter((c) => c.id),
+      }));
+      loadPrices(trades.flatMap((li) => sides(li).flatMap((s) => s.cards.map((c) => c.id)))); // once per card
+
+      for (const li of trades) {
+        const sidesBox = li.querySelector(SITE.boardSide).parentElement;
+        if (!sidesBox.querySelector(':scope > .kp-board-swap')) sidesBox.appendChild(el('span', { class: 'kp-board-swap', 'aria-hidden': 'true' }, faIcon('arrowRightArrowLeft')));
+        let gain = 0, known = true;
+        for (const { side, receive, cards } of sides(li)) {
+          const price = cards.reduce((sum, c) => (state.prices.has(c.id) ? sum + state.prices.get(c.id) : (known = false, sum)), 0);
+          const allKnown = cards.every((c) => state.prices.has(c.id));
+          gain += receive ? price : -price;
+          let name = side.querySelector(':scope > .kp-side-name');
+          if (!name) side.append(name = el('span', { class: 'kp-side-name' }), el('span', { class: 'kp-side-price mono' }));
+          setText(name, cards.map((c) => c.name).join(', '));
+          setAttr(name, 'title', name.textContent);
+          setText(side.querySelector(':scope > .kp-side-price'), allKnown ? priceText(price) : '… ◆');
+        }
+        let diff = li.querySelector(':scope > .kp-board-diff');
+        if (!diff) li.appendChild(diff = el('div', { class: 'kp-board-diff mono', title: 'Prix médian reçu − prix médian donné (prix actuels)' }));
+        const rounded = Math.round(gain);
+        setAttr(diff, 'class', `kp-board-diff mono ${!known ? 'kp-even' : rounded > 0 ? 'kp-gain' : rounded < 0 ? 'kp-loss' : 'kp-even'}`);
+        setText(diff, !known ? 'Prix en chargement…'
+          : rounded > 0 ? `+${priceText(rounded)} gagnés`
+          : rounded < 0 ? `−${priceText(-rounded)} perdus`
+          : 'Échange équilibré');
+      }
+    },
+
+    isTradesPanel(panel) {
+      return panel.querySelectorAll(`:scope > ${SITE.myTradesHeading}`).length >= 2 && !!panel.querySelector(`:scope > ${SITE.myTradesList}`);
+    },
+
+    /** Lists of the panel: { heading, nodes (heading + what follows it), title, count }, in the switch's order. */
+    sections(panel) {
+      const sections = [];
+      for (const child of panel.children) {
+        if (child.hasAttribute('data-kp-trades-switch')) continue;
+        if (child.matches(SITE.myTradesHeading)) sections.push({ heading: child, nodes: [child] });
+        else if (sections.length) sections[sections.length - 1].nodes.push(child);
+      }
+      const rank = (s) => { const i = SITE.myTradesOrder.findIndex((re) => re.test(s.heading.textContent)); return i < 0 ? SITE.myTradesOrder.length : i; };
+      return sections
+        .map((s, i) => ({ ...s, i, title: s.heading.textContent.trim(),
+          count: s.nodes.reduce((n, node) => n + (node.matches(SITE.myTradesList) ? node.children.length : 0), 0) }))
+        .sort((a, b) => rank(a) - rank(b) || a.i - b.i);
+    },
+
+    layout(panel) {
+      setAttr(panel, 'data-kp-trades', '');
+      const sections = this.sections(panel);
+      if (this.selected >= sections.length) this.selected = 0;
+      sections.forEach((s, i) => s.nodes.forEach((node) =>
+        setAttr(node, 'data-kp-hidden', i === this.selected && node !== s.heading ? null : '')));
+
+      // Switch right before the first list (rebuilt if the site re-rendered around it)
+      const first = panel.querySelector(`:scope > ${SITE.myTradesHeading}`);
+      let bar = panel.querySelector(':scope > [data-kp-trades-switch]');
+      if (bar && bar.nextElementSibling !== first) { bar.remove(); bar = null; }
+      if (!bar) first.before(bar = el('div', { 'data-kp-trades-switch': '', role: 'tablist', 'aria-label': 'Mes échanges' }));
+
+      const subtabs = document.querySelector(SITE.marketSubtabs);
+      const siteTab = subtabs && subtabs.querySelector('button');
+      setAttr(bar, 'class', `${subtabs ? subtabs.className : ''} kp-trades-switch`.trim());
+      const base = siteTab ? siteTab.className.replace(/\bon\b/g, '').replace(/\s+/g, ' ').trim() : '';
+
+      const signature = sections.map((s) => s.title).join('|');
+      if (bar.dataset.kpSignature !== signature) {
+        bar.dataset.kpSignature = signature;
+        bar.replaceChildren(...sections.map((_, i) => el('button', {
+          type: 'button', role: 'tab', onClick: () => { this.selected = i; scheduleRender(); },
+        }, el('span', { class: 'kp-label' }), el('span', { class: 'kp-n mono' }), el('span', { class: 'kp-pend mono', 'data-kp-hidden': '' }))));
+      }
+      const trades = state.myTrades ? [...state.myTrades.values()] : [];
+      sections.forEach((s, i) => {
+        const button = bar.children[i];
+        const on = i === this.selected;
+        setAttr(button, 'class', on ? `${base} on`.trim() : base);
+        setAttr(button, 'aria-selected', String(on));
+        setText(button.querySelector('.kp-label'), s.title);
+        setText(button.querySelector('.kp-n'), String(s.count));
+        // Trades waiting for an answer (Reçues: mine to give, Envoyées: theirs)
+        const incoming = SITE.myTradesIncoming.test(s.title);
+        const pending = SITE.myTradesBoard.test(s.title) ? 0 : trades.filter((t) => t.incoming === incoming && t.status === 'pending').length;
+        const pend = button.querySelector('.kp-pend');
+        setAttr(pend, 'data-kp-hidden', pending ? null : '');
+        setText(pend, pending ? `${pending} en attente` : '');
+      });
+    },
+
+    /**
+     * Expanded trades. « Tu donnes »: ×N badge (green: duplicate, orange: my last copy). « Tu reçois »: « Nouvelle » tag
+     * on the cards I do not own, the others dimmed with a grey ×N. Each tray's header sums it up.
+     */
+    details() {
+      const trays = document.querySelectorAll(SITE.tradeTray);
+      if (!trays.length) return;
+      if (!state.collection) {
+        if (!this.collectionAsked) { this.collectionAsked = true; loadCollection(); }
+        return;
+      }
+      for (const tray of trays) {
+        const mine = tray.matches(SITE.tradeTrayMine);
+        const counts = { dup: 0, single: 0, new: 0, had: 0 };
+        for (const li of tray.querySelectorAll(SITE.tradeSlotItem)) {
+          const link = li.querySelector(SITE.tradeSlotLink);
+          const id = link && wikiId(link.getAttribute('href'));
+          if (!id) continue;
+          const qty = ownedQty(id);
+          const kind = mine ? (qty >= 2 ? 'dup' : qty === 1 ? 'single' : null) : (qty ? 'had' : 'new');
+          if (kind) counts[kind]++;
+          this.renderSlot(li, link, id, qty, kind);
+        }
+        this.renderSummary(tray, mine
+          ? [['dup', counts.dup, (s) => `doublon${s}`], ['single', counts.single, (s) => `dernier${s} exemplaire${s}`]]
+          : [['new', counts.new, (s) => `nouvelle${s}`], ['had', counts.had, (s) => `déjà possédée${s}`]]);
+      }
+    },
+
+    renderSlot(li, link, id, qty, kind) {
+      const signature = `${id}:${qty}:${kind}`;
+      const marked = !!link.querySelector(':scope > .kp-cnt, :scope > .kp-tag-new');
+      if (li.dataset.kpOwn === signature && marked === !!kind) return;
+      li.dataset.kpOwn = signature;
+      setAttr(li, 'data-kp-own-state', kind === 'had' ? 'owned' : null);
+      link.querySelectorAll(':scope > .kp-cnt, :scope > .kp-tag-new').forEach((n) => n.remove());
+      if (kind === 'new') link.appendChild(el('span', { class: 'kp-tag-new', text: 'Nouvelle', title: 'Tu ne l’as pas encore' }));
+      else if (kind === 'had') link.appendChild(el('span', { class: 'kp-cnt kp-had', text: `×${qty}`, title: `Tu l’as déjà (${plural(qty, 'exemplaire')})` }));
+      else if (kind) link.appendChild(countBadge(id, qty));
+    },
+
+    /** « 3 doublons · 1 dernier exemplaire » under the tray's title (only the non-zero counts). */
+    renderSummary(tray, parts) {
+      const head = tray.querySelector(SITE.tradeTrayHead);
+      if (!head) return;
+      const shown = parts.filter(([, n]) => n > 0);
+      const signature = shown.map(([cls, n]) => `${cls}${n}`).join(',');
+      let sum = head.querySelector(':scope > .kp-tray-sum');
+      if (sum && sum.dataset.kpSignature === signature) return;
+      if (!shown.length) { if (sum) sum.remove(); return; }
+      if (!sum) head.appendChild(sum = el('span', { class: 'kp-tray-sum' }));
+      sum.dataset.kpSignature = signature;
+      sum.replaceChildren(...shown.map(([cls, n, word]) => el('span', { class: `kp-${cls}`, text: `${n} ${word(n > 1 ? 's' : '')}` })));
+    },
+
+    /** Another tab or page: give the panel back as the site renders it. */
+    reset(panel) {
+      panel.removeAttribute('data-kp-trades');
+      panel.querySelector(':scope > [data-kp-trades-switch]')?.remove();
+      for (const child of panel.children) { child.removeAttribute('data-kp-hidden'); child.removeAttribute('data-kp-board'); }
+    },
+  };
+
+  /**
+   * Market: the site's « Confirmer l’échange » window never shows. As soon as it opens (after a click on « Donner »),
+   * it is hidden, its « Ne plus demander pendant cette session » box is ticked and its own confirm button is clicked.
+   * If it is still open a few seconds later (error, server refusal…), it is shown again so the site's message is seen.
+   */
+  const skipTradeConfirm = {
+    name: 'skipTradeConfirm',
+    handled: new WeakSet(),
+
+    run() {
+      if (!SITE.marketPage.test(location.pathname)) return;
+      for (const dialog of document.querySelectorAll(SITE.tradeConfirmDialog)) {
+        if (this.handled.has(dialog)) continue;
+        const confirm = dialog.querySelector(SITE.tradeConfirmButton);
+        if (!confirm || confirm.disabled) continue; // not ready yet: the next DOM change runs this again
+        this.handled.add(dialog);
+        const box = dialog.parentElement && dialog.parentElement.children.length === 1 && dialog.parentElement !== document.body
+          ? dialog.parentElement : dialog; // the backdrop
+        setAttr(box, 'data-kp-hidden', '');
+        const skip = dialog.querySelector(SITE.tradeConfirmSkip);
+        if (skip && !skip.checked) skip.click();
+        confirm.click();
+        log('échange confirmé sans la fenêtre de confirmation');
+        setTimeout(() => {
+          if (!dialog.isConnected) return;
+          box.removeAttribute('data-kp-hidden');
+          warn('la fenêtre de confirmation est restée ouverte : elle est réaffichée');
+        }, 4000);
+      }
+    },
+  };
+
+  /**
+   * Missions page: the « Séries complètes » list is rolled up (claimed series hidden), with a button giving how many series
+   * are complete. A click on it or on the panel's header unrolls / rolls it up. Rolled up again on every page load.
+   * A completed series whose reward is not claimed yet always stays visible.
+   */
+  const completedSeries = {
+    name: 'completedSeries',
+    open: false,
+
+    run() {
+      const panel = SITE.missionsPage.test(location.pathname) && document.querySelector(SITE.seriesPanel);
+      const head = panel && panel.querySelector(SITE.seriesHead);
+      if (!head) return;
+      const items = [...panel.querySelectorAll(SITE.seriesItem)];
+
+      if (!head.hasAttribute('data-kp-series-head')) {
+        head.setAttribute('data-kp-series-head', '');
+        head.addEventListener('click', (e) => {
+          if (e.target.closest('a, button:not([data-kp-series])')) return;
+          this.open = !this.open;
+          scheduleRender();
+        });
+      }
+      let toggle = head.querySelector(':scope > [data-kp-series]');
+      if (!toggle) {
+        toggle = el('button', { type: 'button', class: 'kp-series-toggle', 'data-kp-series': '' },
+          el('span', { class: 'kp-series-n' }), faIcon('chevronDown'));
+        head.appendChild(toggle);
+      }
+      const n = items.length, s = n > 1 ? 's' : '';
+      setText(toggle.querySelector('.kp-series-n'), `${n} série${s} complétée${s}`);
+      setAttr(toggle, 'aria-expanded', String(this.open));
+      setAttr(toggle, 'title', this.open ? 'Enrouler la liste' : 'Dérouler la liste');
+      for (const li of items) setAttr(li, 'data-kp-hidden', this.open || !li.matches(SITE.seriesClaimed) ? null : '');
+    },
+  };
+
+  const FEATURES = [chatToggle, marketChatTab, offerCards, blockedOffers, offersRefresh, hiddenOffers, myTrades, skipTradeConfirm, collectionLocks, albumFilters, albumTabs, partnerDuplicates, playerCollection, boosterPrices, friendsList, completedSeries];
 
   /* ==========================================================================
    * 9. CORE — render loop driven by DOM changes (the site is a Svelte SPA)
@@ -2516,6 +3289,7 @@
       history[method] = function () { const result = original.apply(this, arguments); scheduleRender(); return result; };
     }
     window.addEventListener('popstate', scheduleRender);
+    window.addEventListener('resize', scheduleRender); // sizes measured on our tiles (offered card height)
     albumTabs.install();
     partnerDuplicates.install();
     scheduleRender();
