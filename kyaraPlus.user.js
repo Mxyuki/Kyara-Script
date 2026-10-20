@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Plus
 // @namespace    https://github.com/Mxyuki/Kyara-Script
-// @version      1.5.0
+// @version      1.6.0
 // @description  Améliore kyara.games : rareté et exemplaires possédés sur les offres d’échange, bouton « Donner » sous chaque carte, wishlist en premier, offres cachées par le site, verrouillage depuis la collection, comptoir masquable.
 // @author       Myuki
 // @homepageURL  https://github.com/Mxyuki/Kyara-Script
@@ -33,6 +33,7 @@
   const API = {
     collection: /\/api\/me\/collection(\?|$)/,
     offers: /\/api\/[^?]*offers(\?|$)/,
+    myOffers: /\/api\/trades\/offers\/mine(\?|$)/, // my own exchange offers, same format as the board
     characters: /\/api\/[^?]*characters(\?|$)/,
     wishlist: /\/api\/[^?]*wish/i,
     tradeAvailable: /\/api\/trades\/available\/([0-9a-f-]+)(?:\?|$)/i, // a player's tradable cards [{ characterId, n }]
@@ -55,6 +56,7 @@
     lockRequest: 'kp-lock-request', // { url: '…{id}…', stateKey, idKey } learned from the site
     catalogUrl: 'kp-catalog-url', // path of the site's card catalogue request, to load it on pages that do not
     pinnedFriends: 'kp-pinned-friends', // [userId, …] friends pinned at the top of the friends list
+    bangerMin: 'kp-banger-min', // Exchanges › « Offres Bangers »: minimum gain (◆), kept on reload as the user asked
   };
   // Filters (albums, player collection) are NOT stored: they reset on every page load.
 
@@ -69,6 +71,9 @@
     offerThumb: 'a.thumb',
     offerActionButtons: '.acts button',
     offerActs: '.acts', // the offer's buttons (our « Masquer » goes last)
+    myOffer: 'li.offer.mine',
+    board: 'section.board', // Échanges tab
+    marketLayout: '.layout', // market grid: .col (tabs + panel) and aside.chat-side; our « Offres Bangers » column goes last
     search: '.filters input[type="search"]',
     activeFilter: '.filters [aria-pressed="true"]', // the site's own filter pills
     offerFilters: '.filters', // search + pills « Que je n’ai pas », « Que je peux accepter », « Mes offres »
@@ -189,6 +194,14 @@
   const PRICES_BATCH = 60;
   /** Rarities whose booster drops get their price, sorted from the most to the least expensive. */
   const BOOSTER_PRICED = ['M'];
+  /** Exchanges › « Offres Bangers »: an offered card of this rarity or rarer, against a less rare card, is a banger. */
+  const BANGER_RARITY = 'L';
+  /** … and so is any offer worth at least this gain (◆, offered price − given price), changed by the user (STORAGE.bangerMin). */
+  const BANGER_MIN_GAIN = 500;
+  /** Max width of the site's centred content (.wrap, site CSS --wrap): the « Offres Bangers » column sits in the empty space on its right. */
+  const SITE_WRAP_PX = 1280;
+  /** Narrowest the column may be in that space; below, it becomes a column of the market's grid instead. */
+  const BANGER_SIDE_MIN_PX = 240;
   /** My collection, as the site requests it (used when this page did not load it). */
   const COLLECTION_URL = '/api/me/collection?lean=1';
 
@@ -316,6 +329,8 @@
     /** Open exchange offers as sent by the server (the site only displays 120 of them). */
     serverOffers: [],
     offersVersion: 0,
+    /** Set<offerId> of my own exchange offers (/api/trades/offers/mine). */
+    myOfferIds: new Set(),
     /** Map<userId, Map<cardId, n>>: tradable copies of other players (trade window). */
     tradeAvailable: new Map(),
     /** Map<userId, Set<cardId>>: every card of other players (profile › « Voir sa collection »). */
@@ -550,6 +565,14 @@
         state.serverOffers = offers;
         state.offersVersion++;
         log('offres d’échange reçues :', offers.length, 'ouvertes');
+      },
+    },
+    {
+      match: API.myOffers,
+      handle(data) {
+        const list = findEntries(data);
+        if (!list) return;
+        state.myOfferIds = new Set(list.map((o) => o && o.id).filter(Boolean).map(String));
       },
     },
     {
@@ -1293,6 +1316,80 @@
     .kp-series-toggle .kp-fa { font-size: 11px; transition: transform .15s; }
     .kp-series-toggle[aria-expanded="true"] .kp-fa { transform: rotate(180deg); }
 
+    /* ---- Exchanges › « Offres Bangers » column (#kp-bangers, last child of the market's .layout grid) ---- */
+    /* Wide screens: fixed in the empty space right of the site's centred content (.wrap) */
+    @media (width >= ${SITE_WRAP_PX + 2 * (BANGER_SIDE_MIN_PX + 32)}px) {
+      .kp-bangers {
+        position: fixed; z-index: 20; top: 84px; right: 16px; max-height: calc(100vh - 104px);
+        width: min(420px, calc((100% - ${SITE_WRAP_PX}px) / 2 - 32px));
+      }
+    }
+    /* Narrower: one more column in the market's grid */
+    @media (1100px <= width < ${SITE_WRAP_PX + 2 * (BANGER_SIDE_MIN_PX + 32)}px) {
+      .layout:has(> #kp-bangers) { grid-template-columns: minmax(0, 1fr) 340px !important; }
+      html.kp-show-chat .layout:has(> #kp-bangers) { grid-template-columns: minmax(0, 1fr) 320px 320px !important; }
+      .kp-bangers { position: sticky; top: 84px; max-height: calc(100vh - 104px); margin-bottom: 40px; }
+    }
+    @media (1400px <= width < ${SITE_WRAP_PX + 2 * (BANGER_SIDE_MIN_PX + 32)}px) {
+      html.kp-show-chat .layout:has(> #kp-bangers) { grid-template-columns: minmax(0, 1fr) 360px 360px !important; }
+    }
+    /* Phones / small windows: above the market, scrolling inside */
+    @media (width < 1100px) { .kp-bangers { order: -1; max-height: 440px; } }
+    .kp-bangers {
+      min-width: 0; box-sizing: border-box;
+      display: flex; flex-direction: column; gap: 10px; padding: 14px;
+      border: 1px solid var(--line, #25232c); background: var(--panel, #15141a); border-radius: 14px; color: var(--fg, #edeae4);
+    }
+    .kp-bangers-head { display: flex; align-items: center; gap: 8px; }
+    .kp-bangers-head h3 { margin: 0; font-size: 16px; }
+    .kp-bangers-n {
+      margin-left: auto; padding: 1px 9px; border-radius: 999px; font-size: 12px; font-weight: 700;
+      background: var(--panel2, #17161d); color: ${COLORS.wishlist}; border: 1px solid var(--line2, #2e2b36);
+    }
+    .kp-bangers-help { margin: 0; font-size: 12px; color: var(--mut, #8b8794); }
+    .kp-bangers-field { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--fg2, #b7b2bd); }
+    .kp-bangers-min {
+      width: 110px; height: 34px; padding: 0 10px; border-radius: 10px; box-sizing: border-box;
+      border: 1px solid var(--line2, #2e2b36); background: var(--panel2, #17161d); color: var(--fg, #edeae4); font: inherit;
+    }
+    .kp-bangers-min:focus { outline: none; border-color: ${COLORS.wishlist}; }
+    .kp-bangers-empty { margin: 0; font-size: 13px; color: var(--mut, #8b8794); }
+    .kp-bangers-empty:empty { display: none; }
+    .kp-bangers-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; overflow-y: auto; min-height: 0; }
+    .kp-banger {
+      position: relative; display: flex; flex-direction: column; gap: 8px; padding: 10px; border-radius: 12px;
+      border: 1px solid var(--line, #25232c); background: var(--panel2, #17161d);
+    }
+    .kp-banger-cards { display: flex; align-items: center; gap: 8px; min-width: 0; padding-right: 30px; }
+    /* « Voir »: eye icon in the trade's top right corner */
+    .kp-banger-see {
+      position: absolute; top: 8px; right: 8px; display: grid; place-items: center; width: 28px; height: 28px; padding: 0;
+      border-radius: 999px; border: 1px solid var(--line2, #2e2b36); background: transparent; color: var(--fg2, #b7b2bd);
+      font-size: 13px; cursor: pointer; transition: color .15s, border-color .15s;
+    }
+    .kp-banger-see:hover { color: ${COLORS.wishlist}; border-color: ${COLORS.wishlist}; }
+    .kp-banger-see:focus-visible { outline: 2px solid ${COLORS.wishlist}; outline-offset: 2px; }
+    .kp-banger-cards > .kp-fa { color: var(--mut, #8b8794); font-size: 12px; }
+    .kp-bthumb { position: relative; flex: none; display: block; }
+    .kp-bthumb img {
+      display: block; width: 64px; height: 90px; object-fit: cover; object-position: 50% 20%;
+      border-radius: 7px; outline: 3px solid var(--kp-rc); outline-offset: -3px;
+    }
+    .kp-bthumb .kp-fa { position: absolute; top: -5px; right: -5px; font-size: 10px; padding: 4px; border-radius: 999px; background: #111; color: ${COLORS.single}; }
+    .kp-banger-info { display: flex; flex-direction: column; gap: 1px; min-width: 0; margin-left: 4px; font-size: 12px; color: var(--fg2, #b7b2bd); }
+    .kp-banger-info > * { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .kp-banger-info b { font-size: 13px; color: var(--fg, #edeae4); }
+    .kp-banger-info .kp-sub { color: var(--mut, #8b8794); font-size: 11px; }
+    .kp-banger-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+    .kp-banger-tags .kp-cnt { position: static; transform: none; }
+    .kp-banger-up { padding: 1px 8px; border-radius: 999px; font: 700 11px/1.4 system-ui, sans-serif; color: #111; background: var(--kp-rc); }
+    .kp-banger-lock { display: inline-flex; align-items: center; gap: 4px; font: 700 11px/1.4 system-ui, sans-serif; color: ${COLORS.single}; }
+    .kp-banger-acts { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+    .kp-banger .kp-give { width: 100%; height: 28px; min-height: 0; padding: 0 14px; font-size: 12px; }
+    .kp-banger-sec { background: transparent; border: 1px solid var(--line2, #2e2b36); color: var(--fg, #edeae4); }
+    .kp-banger-msg { flex-basis: 100%; font-size: 12px; color: var(--fg2, #b7b2bd); }
+    .kp-banger-msg.kp-err { color: #ff6b5a; }
+
     /* ---- Comptoir (market chat): hidden unless toggled ---- */
     html:not(.kp-show-chat):not(.kp-chat-page) .chat-side, html:not(.kp-show-chat):not(.kp-chat-page) .chat-fab { display: none !important; }
     html:not(.kp-show-chat):not(.kp-chat-page) .layout:has(.chat-side) { grid-template-columns: minmax(0, 1fr) !important; }
@@ -1374,6 +1471,16 @@
     return a === undefined || b === undefined ? null : Math.round(a - b);
   }
 
+  /**
+   * Sort of an offer's wanted cards, most valuable to give first: the cheapest one is the one whose
+   * gain (offered price − its price) is the highest. Unknown prices last, in the site's order.
+   */
+  function cheapestFirst(a, b) {
+    const price = (id) => (state.prices.has(String(id)) ? state.prices.get(String(id)) : Infinity);
+    const pa = price(a), pb = price(b);
+    return pa === pb ? 0 : pa - pb;
+  }
+
   const stateText = (text) => el('div', { class: 'kp-state', text });
 
   /** Refresh icon (circular arrow, like fa-refresh), drawn inline: the site has no icon font. */
@@ -1392,10 +1499,12 @@
   /** Font Awesome 6 Free solid icons (CC BY 4.0, fontawesome.com), drawn inline: the site has no icon font. */
   const FA_ICONS = {
     thumbtack: ['0 0 384 512', 'M32 32C32 14.3 46.3 0 64 0H320c17.7 0 32 14.3 32 32s-14.3 32-32 32H290.5l11.4 148.2c36.7 19.9 65.7 53.2 79.5 94.7l1 3c3.3 9.8 1.6 20.5-4.4 28.8s-15.7 13.3-26 13.3H32c-10.3 0-19.9-4.9-26-13.3s-7.7-19.1-4.4-28.8l1-3c13.8-41.5 42.8-74.8 79.5-94.7L93.5 64H64C46.3 64 32 49.7 32 32zM160 384h64v96c0 17.7-14.3 32-32 32s-32-14.3-32-32V384z'],
+    eye: ['0 0 576 512', 'M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM144 256a144 144 0 1 1 288 0 144 144 0 1 1 -288 0zm144-64c0 35.3-28.7 64-64 64c-7.1 0-13.9-1.2-20.3-3.3c-5.5-1.8-11.9 1.6-11.7 7.4c.3 6.9 1.3 13.8 3.2 20.7c13.7 51.2 66.4 81.6 117.6 67.9s81.6-66.4 67.9-117.6c-11.1-41.5-47.8-69.4-88.6-71.1c-5.8-.2-9.2 6.1-7.4 11.7c2.1 6.4 3.3 13.2 3.3 20.3z'],
     eyeSlash: ['0 0 640 512', 'M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c8.4-19.3 10.6-41.4 4.8-63.3c-11.1-41.5-47.8-69.4-88.6-71.1c-5.8-.2-9.2 6.1-7.4 11.7c2.1 6.4 3.3 13.2 3.3 20.3c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zM373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5L373 389.9z'],
     arrowRightArrowLeft: ['0 0 448 512', 'M438.6 150.6c12.5-12.5 12.5-32.8 0-45.3l-96-96c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3L338.7 96 32 96C14.3 96 0 110.3 0 128s14.3 32 32 32l306.7 0-41.4 41.4c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0l96-96zm-333.3 352c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 416 416 416c17.7 0 32-14.3 32-32s-14.3-32-32-32l-306.7 0 41.4-41.4c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-96 96c-12.5 12.5-12.5 32.8 0 45.3l96 96z'],
     comment: ['0 0 512 512', 'M512 240c0 114.9-114.6 208-256 208c-37.1 0-72.3-6.4-104.1-17.9c-11.9 8.7-31.3 20.6-54.3 30.6C73.6 471.1 44.7 480 16 480c-6.5 0-12.3-3.9-14.8-9.9c-2.5-6-1.1-12.8 3.4-17.4l.3-.3c.3-.3 .7-.7 1.3-1.4c1.1-1.2 2.8-3.1 4.9-5.7c4.1-5 9.6-12.4 15.2-21.6c10-16.6 19.5-38.4 21.4-62.9C17.7 326.8 0 285.1 0 240C0 125.1 114.6 32 256 32s256 93.1 256 208z'],
     chevronDown: ['0 0 448 512', 'M201.4 374.6c12.5 12.5 32.8 12.5 45.3 0l160-160c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L224 306.7 86.6 169.4c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3l160 160z'],
+    lock: ['0 0 448 512', 'M144 144v48H304V144c0-44.2-35.8-80-80-80s-80 35.8-80 80zM80 192V144C80 64.5 144.5 0 224 0s144 64.5 144 144v48h16c35.3 0 64 28.7 64 64V448c0 35.3-28.7 64-64 64H64c-35.3 0-64-28.7-64-64V256c0-35.3 28.7-64 64-64H80z'],
     search: ['0 0 512 512', 'M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352a144 144 0 1 0 0-288 144 144 0 1 0 0 288z'],
   };
 
@@ -1586,6 +1695,17 @@
     },
   };
 
+  /** The site's « Donner <name> » buttons of an offer. */
+  const siteGiveButtons = (offer) => [...offer.querySelectorAll(SITE.offerActionButtons)].filter((b) => SITE.giveButton.test(b.textContent));
+
+  /** Name in a « Donner <name> » button, as a nameKey. The site appends my copy count (« ×2 ») inside it: left out. */
+  function giveButtonKey(button) {
+    return nameKey([...button.childNodes]
+      .filter((n) => !(n.nodeType === 1 && n.matches(SITE.giveButtonCount)))
+      .map((n) => n.textContent).join('')
+      .replace(SITE.giveButton, '').replace(SITE.giveButtonCountText, ''));
+  }
+
   /** Exchange offers rendered by the site: rarity, owned counts, tile grid with one "Donner" per card, wishlist. */
   const offerCards = {
     name: 'offerCards',
@@ -1645,12 +1765,8 @@
 
       // The site's "Donner <name>" buttons, matched to the thumbs by name (in order, for duplicates).
       // Names are compared loosely (case, accents, spaces, punctuation): an exact match missed some buttons.
-      const giveButtons = [...offer.querySelectorAll(SITE.offerActionButtons)].filter((b) => SITE.giveButton.test(b.textContent));
-      // The site appends my copy count (« ×2 ») inside the button: leave it out of the name
-      const buttonKey = (b) => nameKey([...b.childNodes]
-        .filter((n) => !(n.nodeType === 1 && n.matches(SITE.giveButtonCount)))
-        .map((n) => n.textContent).join('')
-        .replace(SITE.giveButton, '').replace(SITE.giveButtonCountText, ''));
+      const giveButtons = siteGiveButtons(offer);
+      const buttonKey = giveButtonKey;
 
       const cards = links.map((a) => {
         const img = a.querySelector('img');
@@ -1676,6 +1792,7 @@
         if (c.have && state.collection && !ownedQty(c.id)) this.collectionStale();
         c.delta = c.have && offeredId ? tradeDelta(offeredId, c.id) : undefined;
       }
+      cards.sort((a, b) => cheapestFirst(a.id, b.id)); // the card that brings the most on the left
       // Most profitable card I can give (a « Donner » button), for the order of the offers
       this.best.set(offer, bestDelta(cards.filter((c) => c.button && c.delta !== undefined).map((c) => c.delta)));
 
@@ -1875,7 +1992,7 @@
           owned && el('span', { class: 'kp-owned', text: owned.text, style: `color:${owned.color}` }),
           wished && el('span', { class: 'kp-wish-tag', text: '♥ Dans ta wishlist' })));
 
-      const wanted = el('div', { class: 'kp-want' }, el('div', { class: 'kp-grid' }, (o.wantIds || []).map((wid) => {
+      const wanted = el('div', { class: 'kp-want' }, el('div', { class: 'kp-grid' }, [...(o.wantIds || [])].sort(cheapestFirst).map((wid) => {
         const card = cardInfo(wid);
         const qty = ownedQty(wid);
         const free = freeCopies(wid);
@@ -1924,6 +2041,220 @@
         else search.scrollIntoView({ behavior: 'smooth', block: 'center' });
       };
       setTimeout(reveal, 150);
+    },
+  };
+
+  /**
+   * Exchanges: « Offres Bangers » column on the right of the market. Every open offer the server sent (not only the
+   * site's 120) where I own one of the wanted cards and it is worth it: a card of BANGER_RARITY or rarer offered against
+   * a less rare one, or a gain (offered price − given price) of at least the chosen minimum (STORAGE.bangerMin).
+   * Cards I locked count too: « Donner » first asks to unlock them. Actions click the site's own buttons.
+   */
+  const bangerOffers = {
+    name: 'bangerOffers',
+    /** Map<"offerId:cardId", { stage: 'confirm' | 'busy' | 'error', text }> of the offers being acted on. */
+    pending: new Map(),
+    asked: false,
+
+    run() {
+      const board = document.querySelector(SITE.board);
+      const layout = board && board.closest(SITE.marketLayout);
+      let panel = document.getElementById('kp-bangers');
+      if (!layout) { if (panel) panel.remove(); return; }
+      if (!this.asked) { this.asked = true; if (!state.collection) loadCollection(); loadCatalog(); }
+      if (!panel || panel.parentElement !== layout) {
+        if (panel) panel.remove();
+        layout.appendChild(panel = this.build());
+      }
+
+      const min = this.minGain();
+      const bangers = this.find(min);
+      setText(panel.querySelector('.kp-bangers-n'), String(bangers.length));
+      setText(panel.querySelector('.kp-bangers-empty'), !state.collection ? 'Collection en chargement…'
+        : !state.serverOffers.length ? 'Offres en chargement…'
+        : bangers.length ? '' : 'Aucune offre banger pour le moment.');
+      const list = panel.querySelector('.kp-bangers-list');
+      const signature = [state.catalog.size, bangers.map((b) =>
+        [b.key, b.gain, b.locked, b.upgrade, JSON.stringify(this.pending.get(b.key) || null)].join('|')).join('#')].join('@');
+      if (list.dataset.signature === signature) return;
+      list.dataset.signature = signature;
+      list.replaceChildren(...bangers.map((b) => this.item(b)));
+    },
+
+    minGain() {
+      const n = Number(storage.get(STORAGE.bangerMin, BANGER_MIN_GAIN));
+      return Number.isFinite(n) ? n : BANGER_MIN_GAIN;
+    },
+
+    setMin(value) {
+      if (value.trim() === '' || !Number.isFinite(Number(value))) return;
+      storage.set(STORAGE.bangerMin, Number(value));
+      scheduleRender();
+    },
+
+    build() {
+      const rank = RARITY_CODES[BANGER_RARITY.toLowerCase()];
+      const rare = RARITIES.slice(rank).map((r) => r.name).reverse().join(' ou ');
+      return el('aside', { id: 'kp-bangers', class: 'kp-bangers', 'aria-label': 'Offres Bangers' },
+        el('header', { class: 'kp-bangers-head' }, el('h3', { text: 'Offres Bangers' }), el('span', { class: 'kp-bangers-n mono' })),
+        el('p', { class: 'kp-bangers-help', text: `Les offres que tu peux accepter : une ${rare} contre une carte moins rare, ou un gain d’au moins :` }),
+        el('label', { class: 'kp-bangers-field' },
+          el('input', {
+            type: 'number', class: 'kp-bangers-min mono', min: '0', step: '50', inputmode: 'numeric',
+            value: String(this.minGain()), 'aria-label': 'Gain minimum en chakra',
+            onInput: (e) => this.setMin(e.target.value),
+          }),
+          el('span', { text: '◆ de gain' })),
+        el('p', { class: 'kp-bangers-empty' }),
+        el('ul', { class: 'kp-bangers-list' }));
+    },
+
+    /** My own offers: from /api/trades/offers/mine, and the ones the site marks as mine. */
+    myOfferIds() {
+      const ids = new Set(state.myOfferIds);
+      for (const li of document.querySelectorAll(`${SITE.myOffer}[id^="offre-"]`)) ids.add(li.id.slice('offre-'.length));
+      return ids;
+    },
+
+    /** 'free' if I can give a copy of this card, 'locked' if I own it but it is locked, else null. */
+    usable(id) {
+      const c = state.collection && state.collection.get(String(id));
+      if (!c || !c.qty) return null;
+      const locked = collectionLocks.confirmed.has(String(id)) ? collectionLocks.confirmed.get(String(id)) : c.locked;
+      if (locked) return 'locked';
+      return c.qty - (c.resaleLocked || 0) > 0 ? 'free' : null;
+    },
+
+    /** One banger per offer (its best card to give), the biggest gain first. */
+    find(min) {
+      if (!state.collection) return [];
+      const mine = this.myOfferIds();
+      const rarityRank = (id) => { const r = cardInfo(id).rarity; return r ? RARITIES.indexOf(r) : -1; };
+      const minRank = RARITY_CODES[BANGER_RARITY.toLowerCase()];
+      const gainOf = (b) => (b.gain === null ? -Infinity : b.gain);
+      const better = (a, b) => (a.locked !== b.locked ? !a.locked : gainOf(a) > gainOf(b));
+      const ids = [], out = [];
+      for (const o of state.serverOffers) {
+        if (mine.has(String(o.id)) || blockedOffers.ids.has(o.id)) continue;
+        const offeredRank = rarityRank(o.characterId);
+        let best = null;
+        for (const w of o.wantIds || []) {
+          const use = this.usable(w);
+          if (!use) continue;
+          ids.push(String(o.characterId), String(w));
+          const wantRank = rarityRank(w);
+          const upgrade = offeredRank >= minRank && wantRank >= 0 && wantRank < offeredRank;
+          const gain = tradeDelta(o.characterId, w);
+          if (!upgrade && !(gain !== null && gain >= min)) continue;
+          const b = { key: `${o.id}:${w}`, offer: o, cardId: String(w), upgrade, gain, locked: use === 'locked' };
+          if (!best || better(b, best)) best = b;
+        }
+        if (best) out.push(best);
+      }
+      loadPrices(ids); // once per card
+      return out.sort((a, b) => gainOf(b) - gainOf(a) || b.upgrade - a.upgrade);
+    },
+
+    setPending(key, value) {
+      if (value) this.pending.set(key, value); else this.pending.delete(key);
+      scheduleRender();
+    },
+
+    item(b) {
+      const o = b.offer, offered = cardInfo(o.characterId), given = cardInfo(b.cardId);
+      const p = this.pending.get(b.key);
+      const thumb = (id, card, locked) => el('a', {
+        class: 'kp-bthumb', href: `/wiki/${id}`, title: card.name + (card.rarity ? ` – ${card.rarity.name}` : ''), '--kp-rc': rarityColor(card.rarity),
+      }, el('img', { src: cardImage(id), alt: card.name, referrerpolicy: 'no-referrer' }), locked && faIcon('lock'));
+
+      const button = (text, cls, onClick, title) => el('button', { type: 'button', class: `btn btn-sm ${cls}`, text, title, onClick });
+      let acts;
+      if (p && p.stage === 'confirm') {
+        acts = [
+          el('span', { class: 'kp-banger-msg', text: `« ${given.name} » est verrouillée. La déverrouiller pour l’échanger ?` }),
+          button('Déverrouiller et donner', 'btn-acc', () => this.give(b, true)),
+          button('Annuler', 'kp-banger-sec', () => this.setPending(b.key, null)),
+        ];
+      } else if (p && p.stage === 'busy') {
+        acts = [el('span', { class: 'kp-banger-msg', text: p.text })];
+      } else {
+        acts = [
+          p && p.stage === 'error' && el('span', { class: 'kp-banger-msg kp-err', text: p.text }),
+          button('Donner', 'btn-acc kp-give' + (ownedQty(b.cardId) === 1 ? ' kp-warn' : ''), () => this.give(b, false),
+            `Donner ${given.name} contre ${offered.name}` + (b.locked ? ' (carte verrouillée : elle sera déverrouillée)' : '')),
+        ];
+      }
+
+      return el('li', { class: 'kp-banger' },
+        el('button', {
+          type: 'button', class: 'kp-banger-see', title: 'Afficher cette offre dans la liste du site',
+          'aria-label': 'Afficher cette offre dans la liste du site', onClick: () => this.reveal(o),
+        }, faIcon('eye')),
+        el('div', { class: 'kp-banger-cards' },
+          thumb(o.characterId, offered, false),
+          faIcon('arrowRightArrowLeft'),
+          thumb(b.cardId, given, b.locked),
+          el('div', { class: 'kp-banger-info' },
+            el('b', { text: offered.name }),
+            el('span', { text: `contre ${given.name}` }),
+            el('span', { class: 'kp-sub', text: [o.user && `par ${o.user.pseudo}`, expiresText(o.expiresAt)].filter(Boolean).join(' · ') }))),
+        el('div', { class: 'kp-banger-tags' },
+          deltaPill(b.gain),
+          countBadge(b.cardId, ownedQty(b.cardId)),
+          b.upgrade && el('span', { class: 'kp-banger-up', '--kp-rc': rarityColor(offered.rarity), text: `${offered.rarity.name} contre ${given.rarity.name}` }),
+          b.locked && el('span', { class: 'kp-banger-lock' }, faIcon('lock'), 'Verrouillée')),
+        el('div', { class: 'kp-banger-acts' }, acts));
+    },
+
+    /**
+     * Bring the offer into the site's list: the site's pills off (they can hide it, and « Contre mes doublons » hides
+     * some « Donner » buttons), then its card typed in the site's search (see hiddenOffers.openWithSearch).
+     */
+    reveal(o) {
+      for (const pill of offersRefresh.sitePills()) if (pill.getAttribute('aria-pressed') === 'true') pill.click();
+      hiddenOffers.openWithSearch(o);
+    },
+
+    /** The site's « Donner » button for this card in the offer, once the offer is in the site's list (or null). */
+    async siteButton(b) {
+      const key = nameKey(cardInfo(b.cardId).name);
+      const find = () => {
+        const li = document.getElementById('offre-' + b.offer.id);
+        return li && (siteGiveButtons(li).find((btn) => !btn.disabled && giveButtonKey(btn) === key) || null);
+      };
+      if (find()) return find();
+      this.reveal(b.offer);
+      try { return await waitFor(find, 4000); } catch { return null; }
+    },
+
+    /** Unlock the card first if needed (asked before), then click the site's own « Donner » button. */
+    async give(b, unlock) {
+      if (b.locked && !unlock) return this.setPending(b.key, { stage: 'confirm' });
+      const step = (text) => this.setPending(b.key, { stage: 'busy', text });
+      try {
+        if (b.locked) {
+          step('Déverrouillage…');
+          await setCardLock(b.cardId, false);
+          collectionLocks.confirmed.set(b.cardId, false);
+          await loadCollection();
+        }
+        step('Recherche de l’offre…');
+        let button = await this.siteButton(b);
+        if (!button && b.locked) {
+          // The site's list still sees the card as locked: let it reload its data, then look again
+          step('Actualisation des échanges…');
+          await offersRefresh.remountExchanges();
+          button = await this.siteButton(b);
+        }
+        if (!button) throw new Error('bouton « Donner » du site introuvable, essaie depuis l’offre');
+        button.click();
+        step('Échange envoyé');
+        setTimeout(() => reloadCollection(), 3000);
+        setTimeout(() => { reloadCollection(); this.setPending(b.key, null); }, 10000);
+      } catch (err) {
+        warn('échange banger impossible', err);
+        this.setPending(b.key, { stage: 'error', text: `Échec : ${err.message}` });
+      }
     },
   };
 
@@ -3256,7 +3587,7 @@
     },
   };
 
-  const FEATURES = [chatToggle, marketChatTab, offerCards, blockedOffers, offersRefresh, hiddenOffers, myTrades, skipTradeConfirm, collectionLocks, albumFilters, albumTabs, partnerDuplicates, playerCollection, boosterPrices, friendsList, completedSeries];
+  const FEATURES = [chatToggle, marketChatTab, offerCards, blockedOffers, offersRefresh, hiddenOffers, bangerOffers, myTrades, skipTradeConfirm, collectionLocks, albumFilters, albumTabs, partnerDuplicates, playerCollection, boosterPrices, friendsList, completedSeries];
 
   /* ==========================================================================
    * 9. CORE — render loop driven by DOM changes (the site is a Svelte SPA)
