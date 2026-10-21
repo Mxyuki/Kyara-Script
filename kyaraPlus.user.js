@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Plus
 // @namespace    https://github.com/Mxyuki/Kyara-Script
-// @version      1.6.2
+// @version      1.6.3
 // @description  Améliore kyara.games : rareté et exemplaires possédés sur les offres d’échange, bouton « Donner » sous chaque carte, wishlist en premier, offres cachées par le site, verrouillage depuis la collection, comptoir masquable.
 // @author       Myuki
 // @homepageURL  https://github.com/Mxyuki/Kyara-Script
@@ -209,6 +209,8 @@
 
   /** Hash used to open an album in a new tab: /collection#kp-album=<name>. */
   const ALBUM_HASH = 'kp-album=';
+  /** « Afficher plus » (albums) is clicked again as soon as the previous page rendered, or after this delay if nothing came. */
+  const ALBUM_MORE_TIMEOUT_MS = 1500;
 
   /** Card image URL by card id. */
   const cardImage = (id) => `/cards/sm/${id}.webp`;
@@ -2705,13 +2707,30 @@
   }
 
   /**
+   * Load the next page of albums: clicks the site's « Afficher plus » as soon as the previous click rendered its albums
+   * (more albums than at that click), else again after ALBUM_MORE_TIMEOUT_MS. `pager` keeps { count, at } between calls.
+   * Returns true while there is a « Afficher plus » button.
+   */
+  function loadMoreAlbums(pager, loaded) {
+    const more = [...document.querySelectorAll(SITE.albumMore)].find((b) => /afficher plus/i.test(b.textContent));
+    if (!more) return false;
+    if (loaded > pager.count || Date.now() - pager.at > ALBUM_MORE_TIMEOUT_MS) {
+      pager.count = loaded;
+      pager.at = Date.now();
+      more.click();
+    }
+    setTimeout(scheduleRender, ALBUM_MORE_TIMEOUT_MS + 50); // in case the page does not change in between
+    return true;
+  }
+
+  /**
    * Collection › Albums: filters (minimum album size, « il ne me manque que » rarities).
    * The site shows 120 albums per page: while a filter is active, « Afficher plus » is clicked until all are loaded.
    * Kept in memory only: no filter on every page load.
    */
   const albumFilters = {
     name: 'albumFilters',
-    lastMoreClick: 0,
+    pager: { count: 0, at: 0 },
     current: { min: 0, miss: [] },
 
     settings() { return this.current; },
@@ -2750,15 +2769,7 @@
       }
 
       // Load every page while filtering, else the filter only sees the first 120 albums
-      const more = [...document.querySelectorAll(SITE.albumMore)].find((b) => /afficher plus/i.test(b.textContent));
-      const loading = this.isActive(s) && !!more;
-      if (loading) {
-        if (Date.now() - this.lastMoreClick > 400) {
-          this.lastMoreClick = Date.now();
-          more.click();
-        }
-        setTimeout(scheduleRender, 450); // keep going even if the page does not change in between
-      }
+      const loading = this.isActive(s) && loadMoreAlbums(this.pager, loaded);
       if (panel) {
         setText(panel.querySelector('.kp-af-count'), this.isActive(s)
           ? `${plural(shown, 'album')} sur ${loaded}${loading ? ' · chargement…' : ''}`
@@ -2815,7 +2826,7 @@
   const albumTabs = {
     name: 'albumTabs',
     pending: null, // { name, since }
-    lastMoreClick: 0,
+    pager: { count: 0, at: 0 },
 
     /** Installed once (see start): open the clicked album in a new tab. */
     install() {
@@ -2855,16 +2866,15 @@
         if (albumsView && albumsView.getAttribute('aria-pressed') !== 'true') albumsView.click();
         return this.retry();
       }
-      const target = [...list.querySelectorAll(SITE.album)].find((b) => readAlbum(b).name === this.pending.name);
+      const albums = [...list.querySelectorAll(SITE.album)];
+      const target = albums.find((b) => readAlbum(b).name === this.pending.name);
       if (target) {
         this.pending = null;
         history.replaceState(history.state, '', location.pathname + location.search); // drop the hash
         target.click();
         return;
       }
-      const more = [...document.querySelectorAll(SITE.albumMore)].find((b) => /afficher plus/i.test(b.textContent));
-      if (more && Date.now() - this.lastMoreClick > 400) { this.lastMoreClick = Date.now(); more.click(); }
-      this.retry();
+      if (!loadMoreAlbums(this.pager, albums.length)) this.retry(); // no more pages yet: the list may still be loading
     },
 
     /** The page may not change while we wait: try again a bit later. */
