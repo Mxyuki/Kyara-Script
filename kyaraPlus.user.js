@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Plus
 // @namespace    https://github.com/Mxyuki/Kyara-Script
-// @version      1.6.5
+// @version      1.6.6
 // @description  Améliore kyara.games : rareté et exemplaires possédés sur les offres d’échange, bouton « Donner » sous chaque carte, wishlist en premier, offres cachées par le site, verrouillage depuis la collection, comptoir masquable.
 // @author       Myuki
 // @homepageURL  https://github.com/Mxyuki/Kyara-Script
@@ -32,7 +32,7 @@
   /** API requests the site makes. GETs are read; the lock POST is learned from the site (see learnLockRequest). */
   const API = {
     collection: /\/api\/me\/collection(\?|$)/,
-    offers: /\/api\/[^?]*offers(\?|$)/,
+    offers: /\/api\/[^?]*offers(?:\/search)?(\?|$)/, // exchange board: /api/trades/offers/search?page=1&pageSize=20 ({ items })
     myOffers: /\/api\/trades\/offers\/mine(\?|$)/, // my own exchange offers, same format as the board
     characters: /\/api\/[^?]*characters(\?|$)/,
     wishlist: /\/api\/[^?]*wish/i,
@@ -41,6 +41,7 @@
     prices: /\/api\/fair-play\/prices\?/, // ?ids=1,2,3 -> { "<cardId>": price }
     myTrades: /\/api\/me\/trades(\?|$)/, // { incoming: [trade…], outgoing: [trade…] } (Mes échanges › Reçues / Envoyées)
     lock: /\/api\/(?:[^?]*\/)?pin(?:[/?]|$)/, // POST, sent by the 🔒 button of a wiki page
+    acceptOffer: /\/api\/trades\/offers\/([^/?]+)\/accept(?:\?|$)/, // POST by the site's « Donner » (only watched)
   };
 
   /**
@@ -204,6 +205,17 @@
   const SITE_WRAP_PX = 1280;
   /** Narrowest the column may be in that space; below, it becomes a column of the market's grid instead. */
   const BANGER_SIDE_MIN_PX = 240;
+  /** One page of the exchange board (server-paginated, 60 offers per page at most). */
+  const offersPageUrl = (page) => `/api/trades/offers/search?page=${page}&pageSize=60`;
+  /** « Offres Bangers »: pages of the board loaded by us (the site only loads 20 offers, then « Voir plus d’offres »). */
+  const OFFERS_SCAN_PAGES = 5;
+  /** Pause between two of those pages, and minimum time between two scans. */
+  const OFFERS_SCAN_GAP_MS = 800;
+  const OFFERS_SCAN_MIN_MS = 30000;
+  /** Refresh: the site counts as done once none of its offers / collection GETs ran for this long. */
+  const SITE_IDLE_MS = 300;
+  /** … and a click on one of its filters counts as sending nothing if no GET started within this delay. */
+  const SITE_CLICK_MS = 600;
   /** My collection, as the site requests it (used when this page did not load it). */
   const COLLECTION_URL = '/api/me/collection?lean=1';
 
@@ -277,6 +289,14 @@
   };
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  /** « : <message> » from an error response body ({ message } / { error }), empty if there is none. */
+  function serverMessage(text) {
+    let data = null;
+    try { data = JSON.parse(text); } catch { /* not JSON */ }
+    const message = data && typeof data === 'object' ? data.message || data.error : null;
+    return typeof message === 'string' && message ? ` : ${message}` : '';
+  }
 
   /**
    * Small element builder.
@@ -560,12 +580,42 @@
     return map;
   }
 
-  /** /api/.../offers -> open exchange offers [{ id, user:{pseudo}, characterId, wantIds, expiresAt, ... }] */
+  const WANT_KEYS = ['wantIds', 'wants', 'want', 'wanted', 'wantCards'];
+  const looksLikeOffer = (o) => !!(o && typeof o === 'object' && o.id !== undefined && WANT_KEYS.some((k) => Array.isArray(o[k])));
+
+  /** The offer list in a response, whatever its wrapping ({ offers, total, next… }, nested { data: { items } }…). */
+  function findOfferList(data, depth = 0) {
+    if (Array.isArray(data)) return data.length && !data.some(looksLikeOffer) ? null : data;
+    if (!data || typeof data !== 'object' || depth > 2) return null;
+    if (Array.isArray(data.offers) && (!data.offers.length || data.offers.some(looksLikeOffer))) return data.offers;
+    for (const v of Object.values(data)) {
+      if (Array.isArray(v) ? v.some(looksLikeOffer) : v && typeof v === 'object') {
+        const found = findOfferList(v, depth + 1);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  /** One offer in the shape the features use: { id, user:{id,pseudo}, characterId, wantIds:[…], counterOk, expiresAt }. */
+  function normalizeOffer(o) {
+    const wants = pick(o, WANT_KEYS) || [];
+    const given = o.characterId ?? o.character ?? o.card ?? o.giveId ?? (o.give && (o.give.characterId ?? o.give.id ?? o.give));
+    return {
+      ...o,
+      id: String(o.id),
+      characterId: entryId({ id: given }),
+      wantIds: wants.map((w) => entryId(w && typeof w === 'object' ? w : { id: w })).filter(Boolean),
+    };
+  }
+
+  /** /api/trades/offers -> open exchange offers [{ id, user:{pseudo}, characterId, wantIds, expiresAt, ... }], or null. */
   function parseOffers(data) {
-    const list = findEntries(data);
-    if (!list || !list.length || !list[0] || !('wantIds' in list[0])) return null; // not the exchange list
+    const list = findOfferList(data);
+    if (!list) return null; // not the exchange list
     const now = Date.now();
-    return list.filter((o) => o.status === 'open' && !o.closedAt && (!o.expiresAt || Date.parse(o.expiresAt) > now));
+    return list.filter(looksLikeOffer).map(normalizeOffer).filter((o) => o.characterId
+      && (!o.status || o.status === 'open') && !o.closedAt && (!o.expiresAt || Date.parse(o.expiresAt) > now));
   }
 
   /* ==========================================================================
@@ -585,12 +635,22 @@
     },
     {
       match: API.offers,
-      handle(data) {
+      handle(data, url) {
+        // Other "offers" APIs exist (market…): an empty list or an unknown format only counts for the exchange board's
+        const board = /\/trades\/offers(?:\/search)?(\?|$)/.test(url || '');
         const offers = parseOffers(data);
-        if (!offers) return;
-        state.serverOffers = offers;
+        if (!offers || (!offers.length && !board)) {
+          if (board) warn('format des offres d’échange non reconnu', JSON.stringify(data).slice(0, 400));
+          return;
+        }
+        // The board is paginated by the server (pages, search, filters): every answer adds to the offers already known.
+        // Offers not seen again are dropped at the end of a scan (scanOffers).
+        const byId = new Map(state.serverOffers.map((o) => [o.id, o]));
+        const now = Date.now();
+        for (const o of offers) byId.set(o.id, { ...o, seenAt: now });
+        state.serverOffers = [...byId.values()];
         state.offersVersion++;
-        log('offres d’échange reçues :', offers.length, 'ouvertes');
+        log('offres d’échange reçues :', offers.length, 'ouvertes,', byId.size, 'en tout');
       },
     },
     {
@@ -665,8 +725,29 @@
   const nativeFetch = window.fetch;
   let lastCollectionRequest = null; // kept in memory only, to reload the collection after a trade
   let lastOffersRequest = null; // idem, to reload the exchange offers (refresh button)
+  /** Answers to the site's offer accept requests: Map<offerId, { ok, status, response, at }> (the request is never replayed). */
+  const acceptResults = new Map();
 
   const isRequest = (x) => typeof Request !== 'undefined' && x instanceof Request;
+
+  /** The site's own offers / collection GETs in flight (ours are not counted), and when the last one started or ended. */
+  const siteLoads = { pending: 0, last: 0 };
+  function trackSiteLoad(promise) {
+    siteLoads.pending++;
+    siteLoads.last = Date.now();
+    const done = () => { siteLoads.pending--; siteLoads.last = Date.now(); };
+    promise.then(done, done);
+  }
+
+  /**
+   * Resolves once the site has nothing loading: a click done at `since` first gets SITE_CLICK_MS to start its GET,
+   * then every offers / collection GET must have been handled, with SITE_IDLE_MS of quiet. Never rejects.
+   */
+  async function waitSiteIdle(since = 0, timeout = 8000) {
+    if (since) await waitFor(() => siteLoads.last > since, SITE_CLICK_MS).catch(() => null);
+    await waitFor(() => siteLoads.pending === 0 && Date.now() - siteLoads.last >= SITE_IDLE_MS, timeout)
+      .catch(() => warn('le site charge encore ses échanges'));
+  }
 
   /** Feed a response to its handler. Resolves true once fresh data was handled (never rejects). */
   function readResponse(promise, handler, url) {
@@ -688,15 +769,27 @@
           const request = { input: isRequest(input) ? input.clone() : input, init };
           if (handler.match === API.collection) lastCollectionRequest = request;
           const offersBefore = state.offersVersion;
-          readResponse(promise, handler, url).then(() => {
+          const read = readResponse(promise, handler, url).then(() => {
             // Other "offers" APIs exist: only keep the one that returned the exchange list
             if (handler.match === API.offers && state.offersVersion > offersBefore) lastOffersRequest = request;
           });
+          if (handler.match === API.offers || handler.match === API.collection) trackSiteLoad(read);
         }
       } else {
         const body = isRequest(input) ? input.clone().text() : Promise.resolve(init && init.body);
         if (DEBUG_REQUESTS && /\/api\//.test(url)) {
           body.then((b) => log(`requête ${method}`, new URL(url, location.origin).pathname, typeof b === 'string' ? b.slice(0, 200) : `(${typeof b})`)).catch(() => {});
+        }
+        const accept = method === 'POST' && API.acceptOffer.exec(url);
+        if (accept) {
+          // Clone in the first callback, before the site reads the body
+          promise.then((res) => {
+            const copy = res.clone();
+            copy.text().catch(() => '').then((response) => {
+              acceptResults.set(decodeURIComponent(accept[1]), { ok: res.ok, status: res.status, response, at: Date.now() });
+              log('acceptation d’offre :', `HTTP ${res.status}`, response.slice(0, 200));
+            });
+          }).catch(() => {});
         }
         if (method === 'POST' && API.lock.test(url)) {
           const cardId = wikiId(location.pathname);
@@ -751,6 +844,31 @@
     return readResponse(nativeFetch(COLLECTION_URL, { credentials: 'same-origin', cache: 'no-store' }), handler, COLLECTION_URL);
   }
   const reloadOffers = () => replayRequest(lastOffersRequest, API.offers);
+
+  /**
+   * Load the first OFFERS_SCAN_PAGES pages of the board (60 offers each, read only, one at a time), with the headers of
+   * the site's own offers request. Offers not seen since the scan started (taken, withdrawn) are then dropped.
+   */
+  async function scanOffers() {
+    const start = Date.now();
+    const handler = HANDLERS.find((h) => h.match === API.offers);
+    let complete = true;
+    for (let page = 1; page <= OFFERS_SCAN_PAGES; page++) {
+      if (page > 1) await sleep(OFFERS_SCAN_GAP_MS);
+      const url = offersPageUrl(page);
+      const before = state.serverOffers.length;
+      const headers = siteHeaders(lastOffersRequest) || siteHeaders() || undefined;
+      const ok = await readResponse(nativeFetch(url, { headers, credentials: 'same-origin', cache: 'no-store' }), handler, url);
+      if (!ok) { complete = false; warn('page d’offres non chargée :', url); break; }
+      if (page > 1 && state.serverOffers.length === before) break; // nothing new: last page reached
+    }
+    if (complete) {
+      state.serverOffers = state.serverOffers.filter((o) => o.seenAt >= start);
+      state.offersVersion++;
+      scheduleRender();
+    }
+    return complete;
+  }
 
   /** GET one of a player's card lists (read only), when the site did not load it itself. */
   function loadPlayerCards(url, api) {
@@ -1421,6 +1539,7 @@
     .kp-banger-up { padding: 1px 8px; border-radius: 999px; font: 700 11px/1.4 system-ui, sans-serif; color: #111; background: var(--kp-rc); }
     .kp-banger-lock { display: inline-flex; align-items: center; gap: 4px; font: 700 11px/1.4 system-ui, sans-serif; color: ${COLORS.single}; }
     .kp-banger-acts { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+    .kp-banger-acts .kp-unlock { display: inline-flex; align-items: center; gap: 6px; text-decoration: none; color: ${COLORS.single}; }
     .kp-banger .kp-give { width: 100%; height: 28px; min-height: 0; padding: 0 14px; font-size: 12px; }
     .kp-banger-msg { flex-basis: 100%; font-size: 12px; color: var(--fg2, #b7b2bd); }
     .kp-banger-msg.kp-err { color: #ff6b5a; }
@@ -1651,9 +1770,13 @@
   const pillLabel = (pill) => pill.textContent.replace(/\d+/g, '').replace(/\s+/g, ' ').trim();
 
   /**
-   * Exchanges: refresh button right after « Mes offres ». The site's list only reloads when its exchanges
-   * view is mounted again, so we switch to another site tab and back (its own buttons): the site then sends
-   * its own offers request. If it does not, we replay that request ourselves (hidden offers stay fresh).
+   * Exchanges: refresh button right after « Mes offres ». Always through the site's own buttons, so that its list,
+   * its filters and our data stay in step, with as few requests as possible:
+   * - a filter is on: that filter is clicked off then on again, the site sends its own request with its filters (2 GETs);
+   * - else (or if that sent nothing): the Échanges tab is remounted (1 GET), then its filters pressed again one at a time,
+   *   each one only once the site has finished loading (waitSiteIdle): clicking while its first, unfiltered list or its
+   *   collection was still loading let that late answer replace the filtered list.
+   * The « Offres Bangers » pages are loaded again too, at most every OFFERS_SCAN_MIN_MS.
    */
   const offersRefresh = {
     name: 'offersRefresh',
@@ -1686,20 +1809,38 @@
       this.busy = true;
       scheduleRender();
       const before = state.offersVersion;
-      const pressed = this.sitePills().filter((p) => p.getAttribute('aria-pressed') === 'true').map(pillLabel);
+      const pressed = this.sitePills().filter((p) => p.getAttribute('aria-pressed') === 'true');
       try {
-        await this.remountExchanges();
-        await waitFor(() => state.offersVersion > before, 5000);
-        log('échanges actualisés par le site');
+        await waitSiteIdle();
+        if (pressed.length && await this.repress(pressed[pressed.length - 1]) && state.offersVersion > before) {
+          log('échanges actualisés par le site (filtre rappuyé)');
+        } else {
+          const labels = pressed.map(pillLabel);
+          await this.remountExchanges();
+          await waitFor(() => state.offersVersion > before, 5000);
+          await this.restorePills(labels);
+          log('échanges actualisés par le site');
+        }
       } catch {
-        // The site did not reload its list: at least get fresh data for the hidden offers
+        // The site did not reload its list: at least get fresh data for our own lists
         if (await reloadOffers()) log('échanges actualisés (requête rejouée)');
         else warn('impossible d’actualiser les échanges');
       } finally {
-        await this.restorePills(pressed);
         this.busy = false;
+        bangerOffers.scan();
         scheduleRender();
       }
+    },
+
+    /** Click a pressed site filter off, then on again, each time once the site is done. True if it is pressed again. */
+    async repress(pill) {
+      for (const want of ['false', 'true']) {
+        const at = Date.now();
+        pill.click();
+        await waitSiteIdle(at);
+        if (!pill.isConnected || pill.getAttribute('aria-pressed') !== want) return false;
+      }
+      return true;
     },
 
     /** The site's own filter pills (« Que je n’ai pas », « Que je peux accepter », « Mes offres »). */
@@ -1707,14 +1848,20 @@
       return [...document.querySelectorAll(SITE.offerPill)].filter((p) => !p.hasAttribute('data-kp-refresh'));
     },
 
-    /** Remounting resets the site's pills: press again (site's own buttons) the ones that were on. */
+    /**
+     * Remounting resets the site's pills: press again (site's own buttons) the ones that were on, one at a time,
+     * each one once the site has finished loading (its first list, its collection, the previous filter).
+     */
     async restorePills(labels) {
       if (!labels.length) return;
       try { await waitFor(() => this.sitePills().length, 3000); } catch { return warn('filtres du site introuvables après l’actualisation'); }
+      await waitSiteIdle();
       for (const label of labels) {
         const pill = this.sitePills().find((p) => pillLabel(p) === label);
-        if (pill && pill.getAttribute('aria-pressed') !== 'true') pill.click();
-        await sleep(50); // let the site re-render before looking for the next pill
+        if (!pill || pill.getAttribute('aria-pressed') === 'true') continue;
+        const at = Date.now();
+        pill.click();
+        await waitSiteIdle(at);
       }
     },
 
@@ -2088,20 +2235,30 @@
    * Exchanges: « Offres Bangers » column on the right of the market. Every open offer the server sent (not only the
    * site's 120) where I own one of the wanted cards and it is worth it: a card of BANGER_RARITY or rarer offered against
    * a less rare one, or a gain (offered price − given price) of at least the chosen minimum (STORAGE.bangerMin).
-   * Cards I locked count too: « Donner » unlocks them first (setCardLock), then gives. Actions click the site's own buttons.
+   * Cards I locked count too, but are not given: their item links to the card's wiki page to unlock it there.
+   * Actions click the site's own buttons.
    */
   const bangerOffers = {
     name: 'bangerOffers',
     /** Map<"offerId:cardId", { stage: 'busy' | 'error', text }> of the offers being acted on. */
     pending: new Map(),
     asked: false,
+    scanning: false,
+    scanned: false, // pages loaded since the board was shown
+    lastScan: 0,
 
     run() {
       const board = document.querySelector(SITE.board);
       const layout = board && board.closest(SITE.marketLayout);
       let panel = document.getElementById('kp-bangers');
-      if (!layout) { if (panel) panel.remove(); return; }
+      if (!layout) {
+        if (offersRefresh.busy) return; // tab remounted by our refresh: the column stays, the scan is not redone
+        this.scanned = false;
+        if (panel) panel.remove();
+        return;
+      }
       if (!this.asked) { this.asked = true; if (!state.collection) loadCollection(); loadCatalog(); }
+      if (!this.scanned) this.scan();
       if (!panel || panel.parentElement !== layout) {
         if (panel) panel.remove();
         layout.appendChild(panel = this.build());
@@ -2111,7 +2268,7 @@
       const bangers = this.find(min);
       setText(panel.querySelector('.kp-bangers-n'), String(bangers.length));
       setText(panel.querySelector('.kp-bangers-empty'), !state.collection ? 'Collection en chargement…'
-        : !state.serverOffers.length ? 'Offres en chargement…'
+        : !state.serverOffers.length || (this.scanning && !bangers.length) ? 'Offres en chargement…'
         : bangers.length ? '' : 'Aucune offre banger pour le moment.');
       const list = panel.querySelector('.kp-bangers-list');
       const signature = [state.catalog.size, bangers.map((b) =>
@@ -2119,6 +2276,15 @@
       if (list.dataset.signature === signature) return;
       list.dataset.signature = signature;
       list.replaceChildren(...bangers.map((b) => this.item(b)));
+    },
+
+    /** Load the first pages of the board (the site only shows 20 offers), at most every OFFERS_SCAN_MIN_MS. */
+    scan() {
+      if (this.scanning || Date.now() - this.lastScan < OFFERS_SCAN_MIN_MS) return;
+      this.scanned = true;
+      this.scanning = true;
+      this.lastScan = Date.now();
+      scanOffers().finally(() => { this.scanning = false; scheduleRender(); });
     },
 
     minGain() {
@@ -2208,11 +2374,17 @@
       let acts;
       if (p && p.stage === 'busy') {
         acts = [el('span', { class: 'kp-banger-msg', text: p.text })];
+      } else if (b.locked) {
+        // Unlocking automatically was not reliable: the card's wiki page (with the site's lock button) opens instead
+        acts = [el('a', {
+          class: 'btn btn-sm btn-ghost kp-unlock', href: `/wiki/${b.cardId}`, target: '_blank', rel: 'noopener',
+          title: `${given.name} est verrouillée : déverrouille-la sur sa page, puis reviens cliquer « Donner »`,
+        }, faIcon('lock'), 'Déverrouille pour donner')];
       } else {
         acts = [
           p && p.stage === 'error' && el('span', { class: 'kp-banger-msg kp-err', text: p.text }),
           button('Donner', 'btn-acc kp-give' + (ownedQty(b.cardId) === 1 ? ' kp-warn' : ''), () => this.give(b),
-            `Donner ${given.name} contre ${offered.name}` + (b.locked ? ' (carte verrouillée : elle sera déverrouillée)' : '')),
+            `Donner ${given.name} contre ${offered.name}`),
         ];
       }
 
@@ -2258,29 +2430,29 @@
       try { return await waitFor(find, 4000); } catch { return null; }
     },
 
-    /** A locked card is unlocked first (setCardLock), then the site's own « Donner » button is clicked. */
+    /**
+     * Click the site's own « Donner » button (locked cards have none: their item links to the wiki page instead).
+     * Success is the server's answer to the site's accept request (acceptResults), not the click.
+     */
     async give(b) {
       const step = (text) => this.setPending(b.key, { stage: 'busy', text });
+      const offerId = String(b.offer.id);
       try {
-        if (b.locked) {
-          step('Déverrouillage…');
-          await setCardLock(b.cardId, false);
-          collectionLocks.confirmed.set(b.cardId, false);
-          await loadCollection();
-        }
         step('Recherche de l’offre…');
-        let button = await this.siteButton(b);
-        if (!button && b.locked) {
-          // The site's list still sees the card as locked: let it reload its data, then look again
-          step('Actualisation des échanges…');
-          await offersRefresh.remountExchanges();
-          button = await this.siteButton(b);
-        }
+        const button = await this.siteButton(b);
         if (!button) throw new Error('bouton « Donner » du site introuvable, essaie depuis l’offre');
+        const clickedAt = Date.now();
         button.click();
-        step('Échange envoyé');
-        setTimeout(() => reloadCollection(), 3000);
-        setTimeout(() => { reloadCollection(); this.setPending(b.key, null); }, 10000);
+        step('Échange en cours…');
+        const answer = () => { const r = acceptResults.get(offerId); return r && r.at >= clickedAt ? r : null; };
+        // The site may retry (anti-bot pass): wait for a success, else report its last answer
+        await waitFor(() => { const r = answer(); return r && r.ok; }, 15000).catch(() => null);
+        const result = answer();
+        if (!result) throw new Error('le site n’a pas envoyé l’échange (regarde son message au-dessus des offres)');
+        if (!result.ok) throw new Error(`refusé par le serveur (HTTP ${result.status}${serverMessage(result.response)})`);
+        step('Échange fait');
+        reloadCollection();
+        setTimeout(() => { reloadCollection(); this.setPending(b.key, null); }, 5000);
       } catch (err) {
         warn('échange banger impossible', err);
         this.setPending(b.key, { stage: 'error', text: `Échec : ${err.message}` });
