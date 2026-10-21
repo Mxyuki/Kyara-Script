@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Plus
 // @namespace    https://github.com/Mxyuki/Kyara-Script
-// @version      1.6.3
+// @version      1.6.4
 // @description  Améliore kyara.games : rareté et exemplaires possédés sur les offres d’échange, bouton « Donner » sous chaque carte, wishlist en premier, offres cachées par le site, verrouillage depuis la collection, comptoir masquable.
 // @author       Myuki
 // @homepageURL  https://github.com/Mxyuki/Kyara-Script
@@ -1401,7 +1401,6 @@
     .kp-banger-lock { display: inline-flex; align-items: center; gap: 4px; font: 700 11px/1.4 system-ui, sans-serif; color: ${COLORS.single}; }
     .kp-banger-acts { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
     .kp-banger .kp-give { width: 100%; height: 28px; min-height: 0; padding: 0 14px; font-size: 12px; }
-    .kp-banger-sec { background: transparent; border: 1px solid var(--line2, #2e2b36); color: var(--fg, #edeae4); }
     .kp-banger-msg { flex-basis: 100%; font-size: 12px; color: var(--fg2, #b7b2bd); }
     .kp-banger-msg.kp-err { color: #ff6b5a; }
 
@@ -2063,11 +2062,11 @@
    * Exchanges: « Offres Bangers » column on the right of the market. Every open offer the server sent (not only the
    * site's 120) where I own one of the wanted cards and it is worth it: a card of BANGER_RARITY or rarer offered against
    * a less rare one, or a gain (offered price − given price) of at least the chosen minimum (STORAGE.bangerMin).
-   * Cards I locked count too: « Donner » first asks to unlock them. Actions click the site's own buttons.
+   * Cards I locked count too: « Donner » unlocks them first (setCardLock), then gives. Actions click the site's own buttons.
    */
   const bangerOffers = {
     name: 'bangerOffers',
-    /** Map<"offerId:cardId", { stage: 'confirm' | 'busy' | 'error', text }> of the offers being acted on. */
+    /** Map<"offerId:cardId", { stage: 'busy' | 'error', text }> of the offers being acted on. */
     pending: new Map(),
     asked: false,
 
@@ -2184,18 +2183,12 @@
 
       const button = (text, cls, onClick, title) => el('button', { type: 'button', class: `btn btn-sm ${cls}`, text, title, onClick });
       let acts;
-      if (p && p.stage === 'confirm') {
-        acts = [
-          el('span', { class: 'kp-banger-msg', text: `« ${given.name} » est verrouillée. La déverrouiller pour l’échanger ?` }),
-          button('Déverrouiller et donner', 'btn-acc', () => this.give(b, true)),
-          button('Annuler', 'kp-banger-sec', () => this.setPending(b.key, null)),
-        ];
-      } else if (p && p.stage === 'busy') {
+      if (p && p.stage === 'busy') {
         acts = [el('span', { class: 'kp-banger-msg', text: p.text })];
       } else {
         acts = [
           p && p.stage === 'error' && el('span', { class: 'kp-banger-msg kp-err', text: p.text }),
-          button('Donner', 'btn-acc kp-give' + (ownedQty(b.cardId) === 1 ? ' kp-warn' : ''), () => this.give(b, false),
+          button('Donner', 'btn-acc kp-give' + (ownedQty(b.cardId) === 1 ? ' kp-warn' : ''), () => this.give(b),
             `Donner ${given.name} contre ${offered.name}` + (b.locked ? ' (carte verrouillée : elle sera déverrouillée)' : '')),
         ];
       }
@@ -2242,9 +2235,8 @@
       try { return await waitFor(find, 4000); } catch { return null; }
     },
 
-    /** Unlock the card first if needed (asked before), then click the site's own « Donner » button. */
-    async give(b, unlock) {
-      if (b.locked && !unlock) return this.setPending(b.key, { stage: 'confirm' });
+    /** A locked card is unlocked first (setCardLock), then the site's own « Donner » button is clicked. */
+    async give(b) {
       const step = (text) => this.setPending(b.key, { stage: 'busy', text });
       try {
         if (b.locked) {
