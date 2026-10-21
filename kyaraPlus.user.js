@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Plus
 // @namespace    https://github.com/Mxyuki/Kyara-Script
-// @version      1.6.0
+// @version      1.6.1
 // @description  Améliore kyara.games : rareté et exemplaires possédés sur les offres d’échange, bouton « Donner » sous chaque carte, wishlist en premier, offres cachées par le site, verrouillage depuis la collection, comptoir masquable.
 // @author       Myuki
 // @homepageURL  https://github.com/Mxyuki/Kyara-Script
@@ -999,6 +999,7 @@
     .kp-pc-head { display: flex; align-items: center; gap: 12px; }
     .kp-pc-head h2 { margin: 0; font-size: 18px; }
     .kp-pc-count { color: var(--fg2, #b7b2bd); }
+    .kp-pc-value { padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line2, #2e2b36); font-weight: 700; white-space: nowrap; }
     .kp-pc-close { margin-left: auto; width: 32px; height: 32px; border-radius: 999px; border: 1px solid var(--line2, #2e2b36); background: transparent; color: inherit; font-size: 16px; cursor: pointer; }
     .kp-pc-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
     .kp-pc-filters input[type="search"] { flex: 1 1 220px; min-width: 0; }
@@ -2826,6 +2827,7 @@
     busy: false,
     requested: new Set(), // players whose card lists were fetched on this page load
     pricesFor: null, // player whose prices are being loaded
+    pricesDone: null, // player whose prices have all been asked and answered
     filters: null,
     limit: PLAYER_PAGE,
     tiles: new Map(), // Map<cardId, { li, price, lack }> reused between renders (keeps the images loaded)
@@ -2921,13 +2923,23 @@
       let root = document.getElementById('kp-player-collection');
       if (!root) root = this.buildPanel();
       const owned = state.tradeOwned.get(userId);
-      if (owned && this.pricesFor !== userId) { this.pricesFor = userId; loadPricesInTurn([...owned]); }
+      if (owned && this.pricesFor !== userId) {
+        this.pricesFor = userId;
+        loadPricesInTurn([...owned]).finally(() => { if (this.pricesFor === userId) { this.pricesDone = userId; scheduleRender(); } });
+      }
 
       const list = this.cards(userId);
       const available = state.tradeAvailable.get(userId);
       const priced = owned ? [...owned].filter((id) => state.prices.has(id)).length : 0;
       setText(root.querySelector('.kp-pc-count'), !owned ? 'chargement…'
         : `${list.length} / ${plural(owned.size, 'carte')}${priced < owned.size ? ` · prix ${priced}/${owned.size}` : ''}${this.busy ? ' · chargement…' : ''}`);
+      // Total value once every price was asked: median price × known tradable copies (at least 1: locked cards count once).
+      const value = root.querySelector('.kp-pc-value');
+      const total = owned && this.pricesDone === userId
+        ? [...owned].reduce((sum, id) => sum + (state.prices.get(id) || 0) * Math.max(1, available?.get(id) || 0), 0)
+        : null;
+      setAttr(value, 'data-kp-hidden', total === null ? '' : null);
+      setText(value, total === null ? '' : `Valeur totale : ${priceText(total)}`);
 
       const note = root.querySelector('.kp-pc-note');
       setAttr(note, 'data-kp-hidden', this.filters.dupes ? null : '');
@@ -2995,6 +3007,7 @@
           el('header', { class: 'kp-pc-head' },
             el('h2', { text: `Collection de ${this.pseudo()}` }),
             el('span', { class: 'kp-pc-count' }),
+            el('span', { class: 'kp-pc-value mono', 'data-kp-hidden': '', title: 'Somme des prix médians de ses cartes, multipliés par ses exemplaires échangeables (une carte verrouillée compte pour 1 exemplaire)' }),
             el('button', { type: 'button', class: 'kp-pc-close', 'aria-label': 'Fermer', text: '✕', onClick: () => this.close() })),
           el('div', { class: 'kp-pc-filters' },
             el('input', { class: 'kp-af-input', type: 'search', placeholder: 'Personnage ou série…', value: f.query, onInput: (e) => update({ query: e.target.value }) }),
