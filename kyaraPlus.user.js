@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Plus
 // @namespace    https://github.com/Mxyuki/Kyara-Script
-// @version      1.6.4
+// @version      1.6.5
 // @description  Améliore kyara.games : rareté et exemplaires possédés sur les offres d’échange, bouton « Donner » sous chaque carte, wishlist en premier, offres cachées par le site, verrouillage depuis la collection, comptoir masquable.
 // @author       Myuki
 // @homepageURL  https://github.com/Mxyuki/Kyara-Script
@@ -346,13 +346,29 @@
   };
 
   const ownedQty = (id) => (state.collection && state.collection.get(String(id))?.qty) || 0;
-  /** Copies that can actually be given: a locked card cannot be traded at all. */
+  /**
+   * Copies that can actually be given: the collection's `listable` (the site shows « Donner » when > 0).
+   * `locked` / `resaleLocked` are only a fallback for a response without `listable`.
+   */
   function freeCopies(id) {
     const c = state.collection && state.collection.get(String(id));
-    if (!c || c.locked) return 0;
+    if (!c) return 0;
+    if (c.listable !== null) return Math.max(0, Math.min(c.listable, c.qty));
+    if (c.locked) return 0;
     return Math.max(0, c.qty - (c.resaleLocked || 0));
   }
-  const isLocked = (id) => !!(state.collection && state.collection.get(String(id))?.locked);
+  /**
+   * Owned but locked by the user: the confirmed state after our last lock click, else no tradable copy although
+   * some copies are not held by the resale delay (the `locked` field does not follow the lock: fallback only).
+   */
+  function isLocked(id) {
+    const c = state.collection && state.collection.get(String(id));
+    if (!c || !c.qty || freeCopies(id) > 0) return false;
+    const confirmed = collectionLocks.confirmed.get(String(id));
+    if (confirmed !== undefined) return confirmed;
+    if (c.listable === null) return c.locked;
+    return c.qty - (c.resaleLocked || 0) > 0;
+  }
   const inWishlist = (id) => state.wishlist.has(String(id));
 
   function cardInfo(id) {
@@ -417,11 +433,12 @@
       const id = entryId(e);
       if (!id) continue;
       const qty = (e && typeof e === 'object' && !Array.isArray(e)) ? pick(e, COUNT_KEYS) : Array.isArray(e) ? e[1] : 1;
-      const prev = map.get(id) || { qty: 0, locked: false, resaleLocked: 0 };
+      const prev = map.get(id) || { qty: 0, locked: false, resaleLocked: 0, listable: null };
       prev.qty += typeof qty === 'number' ? qty : 1;
       if (e && typeof e === 'object') {
         prev.locked = prev.locked || !!+e.locked;
         prev.resaleLocked += +e.resaleLocked || 0;
+        if (e.listable !== undefined && e.listable !== null) prev.listable = (prev.listable || 0) + (+e.listable || 0);
       }
       map.set(id, prev);
     }
@@ -970,6 +987,10 @@
     }
     .kp-rar { left: 4px; top: 4px; background: var(--kp-rc); }
     .kp-cnt { right: 4px; bottom: 4px; }
+    .kp-tile-lock {
+      position: absolute; right: 4px; top: 4px; display: grid; place-items: center; padding: 4px; border-radius: 999px;
+      font-size: 10px; background: #111; color: ${COLORS.single}; box-shadow: 0 1px 3px rgba(0,0,0,.6);
+    }
     .kp-cnt.kp-dup { background: ${COLORS.duplicate}; }
     .kp-cnt.kp-single { background: ${COLORS.single}; }
     .kp-name {
@@ -1445,7 +1466,7 @@
    * One proposed card: image, rarity, owned count, name, and an action (button or state text).
    * `onOpen` replaces the link's default navigation (used to go through the site's router).
    */
-  function cardTile({ id, name, src, rarity, available, qty, onOpen, action, delta }) {
+  function cardTile({ id, name, src, rarity, available, qty, locked, onOpen, action, delta }) {
     const link = el('a', {
       href: `/wiki/${id}`,
       title: name + (rarity ? ` – ${rarity.name}` : ''),
@@ -1457,6 +1478,7 @@
     },
     el('img', { src, alt: name, referrerpolicy: 'no-referrer' }),
     rarity && el('span', { class: 'kp-rar', text: rarity.name }),
+    locked && el('span', { class: 'kp-tile-lock', title: 'Carte verrouillée' }, faIcon('lock')),
     countBadge(id, qty));
 
     return el('div', { class: 'kp-tile' + (available ? '' : ' kp-missing'), '--kp-rc': rarityColor(rarity) },
@@ -1803,6 +1825,7 @@
         // The site shows a « Donner » button: I own it, even if our collection is stale
         c.have = c.siteHave || !!c.button;
         c.qty = c.have ? ownedQty(c.id) || null : null;
+        c.locked = c.have && !c.button && isLocked(c.id);
         if (c.have && state.collection && !ownedQty(c.id)) this.collectionStale();
         c.delta = c.have && offeredId ? tradeDelta(offeredId, c.id) : undefined;
       }
@@ -1811,7 +1834,7 @@
       this.best.set(offer, bestDelta(cards.filter((c) => c.button && c.delta !== undefined).map((c) => c.delta)));
 
       const signature = state.collectionVersion + '@' + cards.map((c) =>
-        [c.id, c.img && c.img.src, c.have, c.button ? (c.button.disabled ? 'd' : 'b') : '', c.rarity && c.rarity.name, c.qty, c.delta].join('|')).join('#');
+        [c.id, c.img && c.img.src, c.have, c.button ? (c.button.disabled ? 'd' : 'b') : '', c.rarity && c.rarity.name, c.qty, c.locked, c.delta].join('|')).join('#');
 
       let grid = want.querySelector(':scope > .kp-grid');
       if (grid && grid.dataset.signature === signature) return;
@@ -1824,9 +1847,10 @@
         rarity: c.rarity,
         available: c.have,
         qty: c.qty,
+        locked: c.locked,
         delta: c.delta,
         onOpen: () => c.a.click(), // let the site's router navigate
-        action: c.button ? this.giveButton(c) : stateText(c.have ? 'Tu l’as (pas libre)' : 'Tu ne l’as pas'),
+        action: c.button ? this.giveButton(c) : stateText(c.locked ? 'Verrouillée' : c.have ? 'Tu l’as (pas libre)' : 'Tu ne l’as pas'),
       })));
       thumbs.setAttribute('data-kp-hidden', '');
     },
@@ -2010,6 +2034,7 @@
         const card = cardInfo(wid);
         const qty = ownedQty(wid);
         const free = freeCopies(wid);
+        const locked = isLocked(wid);
         return cardTile({
           id: String(wid),
           name: card.name,
@@ -2017,8 +2042,9 @@
           rarity: card.rarity,
           available: free > 0,
           qty: qty || null,
+          locked,
           delta: free > 0 ? tradeDelta(o.characterId, wid) : undefined,
-          action: stateText(!state.collection ? 'Collection en chargement…' : free > 0 ? 'Tu peux la donner' : qty ? 'Tu l’as (pas libre)' : 'Tu ne l’as pas'),
+          action: stateText(!state.collection ? 'Collection en chargement…' : free > 0 ? 'Tu peux la donner' : locked ? 'Verrouillée' : qty ? 'Tu l’as (pas libre)' : 'Tu ne l’as pas'),
         });
       })));
 
@@ -2132,11 +2158,8 @@
 
     /** 'free' if I can give a copy of this card, 'locked' if I own it but it is locked, else null. */
     usable(id) {
-      const c = state.collection && state.collection.get(String(id));
-      if (!c || !c.qty) return null;
-      const locked = collectionLocks.confirmed.has(String(id)) ? collectionLocks.confirmed.get(String(id)) : c.locked;
-      if (locked) return 'locked';
-      return c.qty - (c.resaleLocked || 0) > 0 ? 'free' : null;
+      if (isLocked(id)) return 'locked';
+      return freeCopies(id) > 0 ? 'free' : null;
     },
 
     /** One banger per offer (its best card to give), the biggest gain first. */
