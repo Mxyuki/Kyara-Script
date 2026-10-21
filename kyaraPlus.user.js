@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Plus
 // @namespace    https://github.com/Mxyuki/Kyara-Script
-// @version      1.6.1
+// @version      1.6.2
 // @description  Améliore kyara.games : rareté et exemplaires possédés sur les offres d’échange, bouton « Donner » sous chaque carte, wishlist en premier, offres cachées par le site, verrouillage depuis la collection, comptoir masquable.
 // @author       Myuki
 // @homepageURL  https://github.com/Mxyuki/Kyara-Script
@@ -88,6 +88,8 @@
     collectionSlot: '.cell > a.slot',
     collectionBar: '.mk',
     collectionLockIcon: '.pin',
+    collectionMissing: '.miss', // missing card: « ? », number, rarity (instead of the card)
+    collectionCard: '.tcg', // owned card: .tcg.r-<code> › .tcg-top (.tcg-name, .gem), .art (img, .art-k, .art-n), .tcg-type, .tcg-stats
     wikiLockButton: 'button[aria-pressed]', // text « 🔒 Verrouiller » / « 🔓 Déverrouiller », aria-pressed="true" when locked
     // Collection › Albums view (same URL /collection, toggled by the « Albums » button)
     albumList: 'ul.albums',
@@ -441,7 +443,7 @@
     if (!entries || !entries.length) return null;
     const map = new Map();
     for (const e of entries) {
-      let id, name, rarity, series;
+      let id, name, rarity, series, native, num, pow, aura;
       if (Array.isArray(e)) {
         id = e.find((x) => typeof x === 'number');
         rarity = e.find((x) => typeof x === 'string' && rarityFromCode(x));
@@ -452,9 +454,14 @@
         rarity = e.rarity ?? e.rarete ?? e.rar ?? e.r;
         series = e.series ?? e.serie;
         if (series && typeof series === 'object') series = series.name ?? series.title;
+        ({ native, num, pow, aura } = e);
       }
       if (id === undefined || id === null) continue;
-      map.set(String(id), { name: typeof name === 'string' ? name : null, rarity: rarityFromCode(rarity), series: typeof series === 'string' ? series : null });
+      const str = (v) => (typeof v === 'string' && v ? v : null);
+      map.set(String(id), {
+        name: str(name), rarity: rarityFromCode(rarity), series: str(series),
+        native: str(native), num: str(num), pow: pow ?? null, aura: aura ?? null,
+      });
     }
     return map.size ? { map, sample: entries[0] } : null;
   }
@@ -1115,6 +1122,11 @@
     .kp-lock-mini:hover { border-color: ${COLORS.wishlist}; opacity: 1; }
     .kp-lock-mini[aria-pressed="true"] { border-color: ${COLORS.wishlist}; background: rgba(0,0,0,.35); opacity: 1; }
     [data-kp-control][data-kp-busy] { opacity: .6; cursor: wait; }
+    /* Missing cards drawn like owned ones: frame (rarity colour) slightly dimmed, content greyed out */
+    .tcg.kp-ghost { filter: saturate(.6) brightness(.8); transition: filter .15s; }
+    .tcg.kp-ghost > * { filter: grayscale(1) brightness(.75); opacity: .55; transition: opacity .15s, filter .15s; }
+    a.slot:hover > .tcg.kp-ghost { filter: none; }
+    a.slot:hover > .tcg.kp-ghost > * { filter: grayscale(.6) brightness(.8); opacity: .85; }
     .kp-hidden-frame {
       position: fixed; left: -10000px; top: 0; width: 1200px; height: 800px; /* desktop size so the site renders its button */
       border: 0; opacity: 0; pointer-events: none;
@@ -2340,6 +2352,61 @@
         this.busy.delete(id);
         scheduleRender();
       }
+    },
+  };
+
+
+  /**
+   * Collection page: missing cards (the site's « ? ») drawn like owned ones (name, rarity, picture, series, stats, from
+   * the catalogue) but greyed out. Built with the site's global card classes (.tcg, .r-<code>, .art…); the site's
+   * « ? » block is hidden, never removed. Our card is dropped as soon as the slot no longer shows a missing card.
+   */
+  const missingCards = {
+    name: 'missingCards',
+    catalogAsked: false,
+
+    run() {
+      if (!SITE.collectionPage.test(location.pathname)) return;
+      const slots = [...document.querySelectorAll(SITE.collectionSlot)];
+      if (!slots.length) return;
+      if (!state.catalog.size && !this.catalogAsked) { this.catalogAsked = true; loadCatalog(); }
+      const owned = slots.map((s) => s.querySelector(`:scope > ${SITE.collectionCard}:not(.kp-ghost) .art img`)).find(Boolean);
+      for (const slot of slots) {
+        const miss = slot.querySelector(`:scope > ${SITE.collectionMissing}`);
+        let ghost = slot.querySelector(':scope > .kp-ghost');
+        const id = wikiId(slot.getAttribute('href'));
+        const card = id && state.catalog.get(id);
+        if (!miss || !card || !card.name) {
+          if (ghost) ghost.remove();
+          if (miss) setAttr(miss, 'data-kp-hidden', null);
+          continue;
+        }
+        const signature = `${id}@${state.catalog.size}`;
+        if (!ghost || ghost.dataset.kpSignature !== signature) {
+          if (ghost) ghost.remove();
+          slot.appendChild(ghost = this.build(id, card, owned));
+          ghost.dataset.kpSignature = signature;
+        }
+        setAttr(miss, 'data-kp-hidden', '');
+      }
+    },
+
+    /** Same markup as the site's owned card; the picture URL is copied from an owned card when one is on screen. */
+    build(id, card, ownedImg) {
+      const code = card.rarity ? RARITY_LETTERS[RARITIES.indexOf(card.rarity)] : 'C';
+      const src = ownedImg && SITE.cardImageId.test(ownedImg.getAttribute('src') || '')
+        ? ownedImg.getAttribute('src').replace(/\/\d+([^/]*\.webp)/, `/${id}$1`)
+        : cardImage(id);
+      const stats = [card.pow !== null && `POW ${card.pow}`, card.aura !== null && `AURA ${card.aura}`].filter(Boolean);
+      return el('div', { class: `tcg r-${code} calm${'LM'.includes(code) ? ' foil' : ''} kp-ghost`, 'aria-hidden': 'true', title: 'Tu ne l’as pas encore' },
+        el('div', { class: 'tcg-top' }, el('span', { class: 'tcg-name', text: card.name }), el('span', { class: 'gem', text: code })),
+        el('div', { class: 'art' },
+          el('img', { alt: '', decoding: 'async', referrerpolicy: 'no-referrer', draggable: 'false', loading: 'lazy', src }),
+          card.native && el('span', { class: 'art-k', 'aria-hidden': 'true', text: card.native }),
+          card.num && el('span', { class: 'art-n', text: card.num })),
+        el('div', { class: 'tcg-type', text: card.series || '' }),
+        stats.length ? el('div', { class: 'tcg-stats' }, stats.map((t) => el('span', { text: t }))) : null,
+        el('div', { class: 'holo', 'aria-hidden': 'true' }));
     },
   };
 
@@ -3600,7 +3667,7 @@
     },
   };
 
-  const FEATURES = [chatToggle, marketChatTab, offerCards, blockedOffers, offersRefresh, hiddenOffers, bangerOffers, myTrades, skipTradeConfirm, collectionLocks, albumFilters, albumTabs, partnerDuplicates, playerCollection, boosterPrices, friendsList, completedSeries];
+  const FEATURES = [chatToggle, marketChatTab, offerCards, blockedOffers, offersRefresh, hiddenOffers, bangerOffers, myTrades, skipTradeConfirm, collectionLocks, missingCards, albumFilters, albumTabs, partnerDuplicates, playerCollection, boosterPrices, friendsList, completedSeries];
 
   /* ==========================================================================
    * 9. CORE — render loop driven by DOM changes (the site is a Svelte SPA)
