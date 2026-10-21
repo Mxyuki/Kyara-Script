@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Kyara Plus
 // @namespace    https://github.com/Mxyuki/Kyara-Script
-// @version      2.18.0
+// @version      2.18.1
 // @description  Améliore kyara.games : rareté et exemplaires possédés sur les offres d’échange, bouton « Donner » sous chaque carte, wishlist en premier, offres cachées par le site, verrouillage depuis la collection, comptoir masquable.
 // @author       Myuki
 // @homepageURL  https://github.com/Mxyuki/Kyara-Script
 // @supportURL   https://github.com/Mxyuki/Kyara-Script/issues
-// @updateURL    https://raw.githubusercontent.com/Mxyuki/Kyara-Script/main/kyaraPlus.user.js
-// @downloadURL  https://raw.githubusercontent.com/Mxyuki/Kyara-Script/main/kyaraPlus.user.js
+// @updateURL    https://github.com/Mxyuki/Kyara-Script/raw/refs/heads/main/kyaraPlus.user.js
+// @downloadURL  https://github.com/Mxyuki/Kyara-Script/raw/refs/heads/main/kyaraPlus.user.js
 // @icon         https://kyara.games/brand/favicon/favicon.svg
 // @match        https://kyara.games/*
 // @run-at       document-idle
