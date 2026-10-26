@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Plus
 // @namespace    https://github.com/Mxyuki/Kyara-Script
-// @version      2.21.0
+// @version      2.25.1
 // @description  Améliore kyara.games : rareté et exemplaires possédés sur les offres d’échange, bouton « Donner » sous chaque carte, wishlist en premier, offres cachées par le site, verrouillage depuis la collection, comptoir masquable, offres bangers et rentables en direct, auto-accept par rareté ou par gain.
 // @author       Myuki
 // @homepageURL  https://github.com/Mxyuki/Kyara-Script
@@ -81,6 +81,21 @@
       gapMs: 1500,
       defaultMinGain: 1e3,
       logLimit: 8
+    },
+    ledger: {
+      // the fair-play windows are 48 h (pairDays / receivedDays = 2); one extra hour covers clock drift
+      keepMs: 49 * 36e5,
+      shownReleases: 6,
+      // on the trades page only, multiplied by x-kyara-rush (3 light GETs per sync)
+      syncMs: 6e4
+    },
+    fairPlay: {
+      // the limits use a rolling window, so the remaining margin is re-read now and then, not only after a trade
+      refreshMs: 6e4
+    },
+    sorting: {
+      // how long the cards on screen must stay the same before they are sorted (the site loads them in bursts)
+      settleMs: 500
     },
     prices: {
       batchSize: 300,
@@ -196,10 +211,21 @@
   var collectionApi = {
     mine: () => request("/me/collection?lean=1"),
     prices: (ids) => request(`/me/collection/prices?ids=${ids.join(",")}`),
-    setPinned: (characterId, pinned) => request(`/me/collection/${characterId}/pin`, { method: "POST", body: { pinned } })
+    setPinned: (characterId, pinned) => request(`/me/collection/${characterId}/pin`, { method: "POST", body: { pinned } }),
+    // Response shape inferred from the site's wiki page (never captured): { user, entry, gained? }.
+    recycle: (characterId, qty) => request(`/me/collection/${characterId}/recycle`, { method: "POST", body: { qty } })
+  };
+  var fairPlayApi = {
+    withPlayer: (userId2) => request(`/fair-play/with/${encodeURIComponent(userId2)}`),
+    prices: (ids) => request(`/fair-play/prices?ids=${ids.join(",")}`)
+  };
+  var notificationsApi = {
+    list: () => request("/me/notifications")
   };
   var tradesApi = {
     mine: () => request("/me/trades"),
+    // Board offers you posted or took, with closedAt, taker and takenWith once accepted.
+    offersMine: () => request("/trades/offers/mine"),
     propose: (body) => request("/trades", { method: "POST", body, withPass: true }),
     // Only accept is pass-protected on the site; decline and cancel are plain POSTs without a body.
     act: (tradeId, action) => request(`/trades/${encodeURIComponent(tradeId)}/${action}`, { method: "POST", withPass: action === "accept" }),
@@ -241,6 +267,7 @@
     const freeOnceUnpinned = entry.qty - (entry.locked ?? 0) - (entry.resaleLocked ?? 0) > 0;
     return entry.pinned && freeOnceUnpinned ? GiveStatus.PINNED : GiveStatus.BLOCKED;
   }
+  var recyclableCopies = (entry) => entry && !entry.pinned ? Math.max(0, entry.qty - (entry.locked ?? 0) - 1) : 0;
   var unpinCard = (characterId) => collectionApi.setPinned(characterId, false);
 
   // src/lib/dom.js
@@ -316,6 +343,17 @@
     const item = h("div", { class: `kp-toast kp-toast--${tone}` }, message);
     container.append(item);
     setTimeout(() => item.remove(), config_default.ui.toastMs);
+  }
+  var FLASH_KEY = "kyara-plus:flash";
+  function flashToast(message, tone = "info") {
+    sessionStorage.setItem(FLASH_KEY, JSON.stringify({ message, tone }));
+  }
+  function showFlashToast() {
+    const stored = sessionStorage.getItem(FLASH_KEY);
+    if (!stored) return;
+    sessionStorage.removeItem(FLASH_KEY);
+    const { message, tone } = JSON.parse(stored);
+    toast(message, tone);
   }
 
   // src/features/collection-albums.js
@@ -654,6 +692,119 @@
     }
   };
 
+  // src/lib/array.js
+  function chunk(items, size) {
+    const chunks = [];
+    for (let start = 0; start < items.length; start += size) chunks.push(items.slice(start, start + size));
+    return chunks;
+  }
+
+  // src/data/prices.js
+  var cache = /* @__PURE__ */ new Map();
+  var unitPrice = (row) => row.median7d || row.median30d || row.lastPrice || null;
+  var isFresh = (entry, now) => entry && now - entry.at < config_default.prices.ttlMs;
+  async function loadPrices(ids) {
+    const now = Date.now();
+    const stale = [...new Set(ids)].filter((id) => !isFresh(cache.get(id), now));
+    for (const batch of chunk(stale, config_default.prices.batchSize)) {
+      const rows = await collectionApi.prices(batch);
+      for (const id of batch) cache.set(id, { value: null, at: now });
+      for (const row of rows) cache.set(row.characterId, { value: unitPrice(row), at: now });
+    }
+  }
+  var priceOf = (id) => cache.get(id)?.value ?? null;
+  var isPriceLoaded = (id) => cache.has(id);
+  function createPriceRequester(onLoaded, onError) {
+    const requested = /* @__PURE__ */ new Set();
+    return (ids) => {
+      const missing = ids.filter((id) => !requested.has(id));
+      if (missing.length === 0) return;
+      missing.forEach((id) => requested.add(id));
+      loadPrices(missing).then(onLoaded, onError);
+    };
+  }
+
+  // src/lib/card-order.js
+  var nameCollator = new Intl.Collator("fr");
+  function compareCards(a, b) {
+    return rarityRank(a.card.rarity) - rarityRank(b.card.rarity) || (b.price ?? -1) - (a.price ?? -1) || nameCollator.compare(a.card.name, b.card.name);
+  }
+  function orderElements(items) {
+    [...items].sort(compareCards).forEach((item, index) => {
+      const order = String(index);
+      if (item.element.style.order !== order) item.element.style.order = order;
+    });
+  }
+  function clearOrder(elements) {
+    for (const element of elements) element.style.removeProperty("order");
+  }
+  function createSettledSorter(recheck) {
+    let signature = "";
+    let changedAt = 0;
+    let timer = 0;
+    return {
+      apply(items, pricesReady) {
+        const current = items.map((item) => item.card.id).join(",");
+        if (current !== signature) {
+          signature = current;
+          changedAt = Date.now();
+          clearOrder(items.map((item) => item.element));
+          clearTimeout(timer);
+          timer = setTimeout(recheck, config_default.sorting.settleMs);
+          return;
+        }
+        if (pricesReady && Date.now() - changedAt >= config_default.sorting.settleMs) orderElements(items);
+      },
+      stop: () => clearTimeout(timer)
+    };
+  }
+
+  // src/features/collection-order.js
+  var CARD_CELL2 = "main .grid > .cell";
+  var collection_order_default = {
+    id: "collection-order",
+    matches: (url) => url.pathname === "/collection",
+    mount() {
+      let catalog = null;
+      let frame = 0;
+      let pricesFailed = false;
+      const sorter = createSettledSorter(() => schedule());
+      const requestPrices = createPriceRequester(
+        () => schedule(),
+        (error) => {
+          pricesFailed = true;
+          schedule();
+          toast(describeError(error), "error");
+        }
+      );
+      function decorate2() {
+        const items = [...document.querySelectorAll(CARD_CELL2)].map((cell) => ({ element: cell, card: catalog.get(cardIdFromLink(cell.querySelector("a.slot"))) })).filter((item) => item.card);
+        requestPrices(items.map((item) => item.card.id));
+        const ready = pricesFailed || items.every((item) => isPriceLoaded(item.card.id));
+        sorter.apply(items.map((item) => ({ ...item, price: priceOf(item.card.id) })), ready);
+      }
+      function schedule() {
+        if (!catalog || frame) return;
+        frame = requestAnimationFrame(() => {
+          frame = 0;
+          decorate2();
+        });
+      }
+      const observer = new MutationObserver(schedule);
+      observer.observe(document.body, { childList: true, subtree: true });
+      loadCatalog().then((loaded) => {
+        catalog = loaded;
+        schedule();
+      }).catch((error) => toast(describeError(error), "error"));
+      return () => {
+        observer.disconnect();
+        cancelAnimationFrame(frame);
+        sorter.stop();
+        clearOrder(document.querySelectorAll(CARD_CELL2));
+      };
+    }
+  };
+
   // src/lib/format.js
   var numberFormat = new Intl.NumberFormat("fr-FR");
   var formatNumber = (value) => numberFormat.format(value);
@@ -671,8 +822,173 @@
     if (hours >= 24) return `${Math.floor(hours / 24)} j ${hours % 24} h`;
     return `${hours} h ${Math.floor(ms / 6e4) % 60} min`;
   }
+  var clockFormat = new Intl.DateTimeFormat("fr-FR", { hour: "2-digit", minute: "2-digit" });
+  var dayClockFormat = new Intl.DateTimeFormat("fr-FR", { weekday: "short", hour: "2-digit", minute: "2-digit" });
+  function formatClock(ms) {
+    const today = (/* @__PURE__ */ new Date()).toDateString() === new Date(ms).toDateString();
+    return (today ? clockFormat : dayClockFormat).format(ms);
+  }
   var plural = (count, word) => `${formatNumber(count)} ${word}${count > 1 ? "s" : ""}`;
   var searchKey = (text) => text.normalize("NFD").replace(new RegExp("\\p{Diacritic}", "gu"), "").toLowerCase();
+
+  // src/features/collection-recycle.js
+  var PRECIOUS_RARITIES = /* @__PURE__ */ new Set(["L", "M"]);
+  function confirmRecycle(picks) {
+    const precious = picks.filter((pick) => PRECIOUS_RARITIES.has(pick.card.rarity));
+    if (precious.length === 0) return true;
+    const lines = precious.map((pick) => `• ${pick.card.name} (${RARITY_LABELS[pick.card.rarity]}) ×${pick.count}`);
+    return window.confirm(`Tu vas recycler des cartes rares :
+
+${lines.join("\n")}
+
+Continuer ?`);
+  }
+  async function recyclePicks(picks, onRecycled) {
+    for (const pick of picks) {
+      const result = await collectionApi.recycle(pick.card.id, pick.count);
+      onRecycled(pick, result?.gained ?? 0);
+    }
+  }
+
+  // src/features/collection-select.js
+  var CARD_CELL3 = "main .cell";
+  function renderPick(button, count) {
+    if (button.dataset.count === String(count)) return;
+    button.dataset.count = String(count);
+    button.classList.toggle("is-picked", count > 0);
+    button.replaceChildren(count > 0 ? `×${count}` : icon("plus"));
+  }
+  var collection_select_default = {
+    id: "collection-select",
+    matches: (url) => url.pathname === "/collection",
+    mount() {
+      let collection = null;
+      let catalog = null;
+      let frame = 0;
+      const selected = /* @__PURE__ */ new Map();
+      const summary = h("span", { class: "kp-pick-bar__text" });
+      const recycleButton = h(
+        "button",
+        { class: "kp-btn kp-btn--warn kp-btn--sm", type: "button", onClick: () => recycle() },
+        icon("recycle"),
+        " Recycler"
+      );
+      const bar = h(
+        "div",
+        { class: "kp-pick-bar", hidden: true },
+        summary,
+        recycleButton,
+        h("button", { class: "kp-btn kp-btn--ghost kp-btn--sm", type: "button", onClick: clear }, "Vider")
+      );
+      async function recycle() {
+        const picks = [...selected].map(([id, count]) => ({ card: catalog.get(id), count })).filter((pick) => pick.card);
+        if (picks.length === 0 || !confirmRecycle(picks)) return;
+        recycleButton.disabled = true;
+        let copies = 0;
+        let gained = 0;
+        const summaryText = () => `${plural(copies, "copie")} recyclée${copies > 1 ? "s" : ""}${gained ? ` · +${formatChakra(gained)}` : ""}.`;
+        try {
+          await recyclePicks(picks, (pick, chakra) => {
+            copies += pick.count;
+            gained += chakra;
+            selected.delete(pick.card.id);
+            renderBar();
+          });
+        } catch (error) {
+          recycleButton.disabled = false;
+          toast(`Recyclage interrompu : ${describeError(error)} ${copies ? summaryText() : ""}`, "error");
+          await reloadCollection();
+          return;
+        }
+        flashToast(summaryText(), "success");
+        location.reload();
+      }
+      async function reloadCollection() {
+        try {
+          collection = await loadCollection();
+        } catch (error) {
+          toast(describeError(error), "error");
+        }
+        schedule();
+      }
+      const requestPrices = createPriceRequester(
+        () => renderBar(),
+        (error) => toast(describeError(error), "error")
+      );
+      function renderBar() {
+        const copies = [...selected.values()].reduce((sum, count) => sum + count, 0);
+        const value = [...selected].reduce((sum, [id, count]) => sum + (priceOf(id) ?? 0) * count, 0);
+        bar.hidden = copies === 0;
+        summary.textContent = `Sélection : ${plural(copies, "copie")} · ${plural(selected.size, "carte")} · ≈ ${formatChakra(value)}`;
+      }
+      function change(cardId, delta) {
+        const max = recyclableCopies(collection.get(cardId));
+        const next = Math.min(max, Math.max(0, (selected.get(cardId) ?? 0) + delta));
+        if (next === 0) selected.delete(cardId);
+        else selected.set(cardId, next);
+        requestPrices([cardId]);
+        renderBar();
+        schedule();
+      }
+      function clear() {
+        selected.clear();
+        renderBar();
+        schedule();
+      }
+      function pickButton(cardId) {
+        const button = h("button", {
+          class: "kp-pick",
+          type: "button",
+          "data-card-id": String(cardId),
+          title: "Clic : ajouter une copie à recycler · clic droit : en retirer une (1 exemplaire est toujours gardé)"
+        });
+        button.addEventListener("click", () => change(cardId, 1));
+        button.addEventListener("contextmenu", (event) => {
+          event.preventDefault();
+          change(cardId, -1);
+        });
+        return button;
+      }
+      function decorateCell(cell) {
+        const slot = cell.querySelector("a.slot");
+        const cardId = cardIdFromLink(slot);
+        const pickable = Boolean(slot) && !slot.querySelector(".miss") && recyclableCopies(collection.get(cardId)) > 0;
+        let button = cell.querySelector(":scope > .kp-pick");
+        if (button && (!pickable || button.dataset.cardId !== String(cardId))) {
+          button.remove();
+          button = null;
+        }
+        cell.classList.toggle("kp-pick-host", pickable);
+        cell.classList.toggle("kp-picked", pickable && selected.has(cardId));
+        if (!pickable) return;
+        if (!button) cell.prepend(button = pickButton(cardId));
+        renderPick(button, selected.get(cardId) ?? 0);
+      }
+      function schedule() {
+        if (!collection || frame) return;
+        frame = requestAnimationFrame(() => {
+          frame = 0;
+          document.querySelectorAll(CARD_CELL3).forEach(decorateCell);
+        });
+      }
+      const observer = new MutationObserver(schedule);
+      observer.observe(document.body, { childList: true, subtree: true });
+      document.body.append(bar);
+      showFlashToast();
+      Promise.all([loadCollection(), loadCatalog()]).then(([loadedCollection, loadedCatalog]) => {
+        collection = loadedCollection;
+        catalog = loadedCatalog;
+        schedule();
+      }).catch((error) => toast(describeError(error), "error"));
+      return () => {
+        observer.disconnect();
+        cancelAnimationFrame(frame);
+        bar.remove();
+        document.querySelectorAll(".kp-pick").forEach((button) => button.remove());
+        document.querySelectorAll(".kp-pick-host, .kp-picked").forEach((cell) => cell.classList.remove("kp-pick-host", "kp-picked"));
+      };
+    }
+  };
 
   // src/features/friends-list.js
   var FRIENDS_TAB = 'main [role="tablist"] [role="tab"]:first-child[aria-selected="true"]';
@@ -811,27 +1127,130 @@
     }
   };
 
-  // src/lib/array.js
-  function chunk(items, size) {
-    const chunks = [];
-    for (let start = 0; start < items.length; start += size) chunks.push(items.slice(start, start + size));
-    return chunks;
+  // src/data/me.js
+  var pending2 = null;
+  function loadMyId() {
+    pending2 ??= meApi.bootstrap().then(({ me }) => me.id).catch((error) => {
+      pending2 = null;
+      throw error;
+    });
+    return pending2;
   }
 
-  // src/data/prices.js
-  var cache = /* @__PURE__ */ new Map();
-  var unitPrice = (row) => row.median7d || row.median30d || row.lastPrice || null;
-  var isFresh = (entry, now) => entry && now - entry.at < config_default.prices.ttlMs;
-  async function loadPrices(ids) {
-    const now = Date.now();
-    const stale = [...new Set(ids)].filter((id) => !isFresh(cache.get(id), now));
-    for (const batch of chunk(stale, config_default.prices.batchSize)) {
-      const rows = await collectionApi.prices(batch);
-      for (const id of batch) cache.set(id, { value: null, at: now });
-      for (const row of rows) cache.set(row.characterId, { value: unitPrice(row), at: now });
+  // src/data/trade-ledger.js
+  var STORAGE_KEY2 = "kyara-plus:trade-ledger";
+  function readEntries() {
+    try {
+      return JSON.parse(localStorage.getItem(STORAGE_KEY2)) ?? [];
+    } catch {
+      return [];
     }
   }
-  var priceOf = (id) => cache.get(id)?.value ?? null;
+  var writeEntries = (entries) => localStorage.setItem(STORAGE_KEY2, JSON.stringify(entries));
+  var oneCard = (characterId) => ({ cards: [{ characterId, qty: 1 }], chakra: 0 });
+  function boardOfferEvents(offers, myId) {
+    return offers.filter((offer) => offer.status === "accepted" && offer.closedAt && offer.taker).map((offer) => {
+      const posted = offer.user.id === myId;
+      return {
+        key: `offer:${offer.id}`,
+        at: Date.parse(offer.closedAt),
+        approximate: false,
+        partner: posted ? offer.taker : offer.user,
+        gave: oneCard(posted ? offer.characterId : offer.takenWith),
+        got: oneCard(posted ? offer.takenWith : offer.characterId)
+      };
+    });
+  }
+  function directTradeEvents({ incoming = [], outgoing = [] }, notifications, myId, now) {
+    const acceptedAt = new Map(
+      notifications.filter((item) => item.type === "trade_accepted").map((item) => [item.data.tradeId, Date.parse(item.createdAt)])
+    );
+    return [...incoming, ...outgoing].filter((trade) => trade.status === "accepted").map((trade) => {
+      const proposed = trade.from.id === myId;
+      const exact = acceptedAt.get(trade.id);
+      return {
+        key: `trade:${trade.id}`,
+        at: exact ?? Math.min(now, Date.parse(trade.expiresAt)),
+        approximate: exact == null,
+        partner: proposed ? trade.to : trade.from,
+        gave: proposed ? trade.give : trade.want,
+        got: proposed ? trade.want : trade.give
+      };
+    });
+  }
+  var eventCardIds = (event) => [...event.gave.cards, ...event.got.cards].map((card) => card.characterId);
+  async function fairPrices(events) {
+    const ids = [...new Set(events.flatMap(eventCardIds))];
+    const prices = {};
+    for (const batch of chunk(ids, config_default.prices.batchSize)) Object.assign(prices, await fairPlayApi.prices(batch));
+    return prices;
+  }
+  var sideValue = ({ cards, chakra = 0 }, prices) => cards.reduce((sum, card) => sum + (prices[card.characterId] ?? 0) * (card.qty ?? 1), chakra);
+  async function syncTradeLedger(myId) {
+    const now = Date.now();
+    const [offers, trades, notifications] = await Promise.all([
+      tradesApi.offersMine(),
+      tradesApi.mine(),
+      notificationsApi.list()
+    ]);
+    const kept = readEntries().filter((entry) => now - entry.at < config_default.ledger.keepMs);
+    const known = new Set(kept.map((entry) => entry.key));
+    const fresh = [...boardOfferEvents(offers, myId), ...directTradeEvents(trades, notifications.items ?? [], myId, now)].filter((event) => !known.has(event.key) && now - event.at < config_default.ledger.keepMs);
+    const prices = fresh.length ? await fairPrices(fresh) : {};
+    const added = fresh.map(({ key, at, approximate, partner, gave, got }) => ({
+      key,
+      at,
+      approximate,
+      partner: { id: partner.id, pseudo: partner.pseudo },
+      given: sideValue(gave, prices),
+      received: sideValue(got, prices)
+    }));
+    const entries = [...kept, ...added].sort((a, b) => a.at - b.at);
+    writeEntries(entries);
+    return entries;
+  }
+
+  // src/features/market-offers/live.js
+  async function fetchNewOffers(isKnown) {
+    const fresh = [];
+    for (let page = 1; page <= config_default.live.maxPages; page++) {
+      const { items, more } = await tradesApi.searchOffers({ page, pageSize: config_default.offers.pageSize, takeable: true });
+      const unseen = items.filter((offer) => !isKnown(offer.id));
+      fresh.push(...unseen.filter((offer) => offer.status === "open"));
+      if (unseen.length < items.length || !more) break;
+    }
+    return fresh;
+  }
+  async function waitNextRound(baseMs, failures, isStopped) {
+    const start = Date.now();
+    const extra = jitter(config_default.live.jitterMs);
+    for (; ; ) {
+      const due = start + baseMs() * rush() * 2 ** failures + extra;
+      if (isStopped() || Date.now() >= due) return;
+      await sleep(Math.min(due - Date.now(), config_default.live.wakeSliceMs));
+    }
+  }
+  function startPolling(poll, baseMs, onGiveUp) {
+    let stopped = false;
+    let failures = 0;
+    (async () => {
+      while (!stopped) {
+        await waitNextRound(baseMs, failures, () => stopped);
+        if (stopped) return;
+        try {
+          await poll();
+          failures = 0;
+        } catch (error) {
+          if (++failures < config_default.live.maxFailures) continue;
+          stopped = true;
+          onGiveUp(error);
+        }
+      }
+    })();
+    return () => {
+      stopped = true;
+    };
+  }
 
   // src/features/market-trades/analysis.js
   var difference = (incoming, outgoing) => incoming == null || outgoing == null ? null : incoming - outgoing;
@@ -1151,7 +1570,15 @@
         fetchMissingPrices([...trades.values()].flatMap(({ trade }) => tradeCardIds(trade)));
         refresh();
       }).catch((error) => toast(describeError(error), "error"));
+      const syncLedger = () => loadMyId().then(syncTradeLedger);
+      syncLedger().catch((error) => toast(describeError(error), "error"));
+      const stopLedgerSync = startPolling(
+        syncLedger,
+        () => config_default.ledger.syncMs,
+        (error) => toast(`Suivi des échanges arrêté : ${describeError(error)}`, "error")
+      );
       return () => {
+        stopLedgerSync();
         detach();
         observer.disconnect();
         cancelAnimationFrame(frame);
@@ -1187,6 +1614,7 @@
 
   // src/features/trade-dialog.js
   var SHELF = '[role="dialog"] .shelf';
+  var TILE = "ul.grid button.tile";
   var DUPLICATE_MIN = config_default.profile.duplicateMin;
   var isTheirTabSelected = (shelf) => [...shelf.querySelectorAll('.tabs [role="tab"]')].findIndex((tab) => tab.getAttribute("aria-selected") === "true") === 1;
   var trade_dialog_default = {
@@ -1194,9 +1622,28 @@
     matches: (url) => url.pathname.startsWith("/profil/"),
     mount() {
       let collection = null;
+      let catalog = null;
       let frame = 0;
       const theirCounts = /* @__PURE__ */ new Map();
       const active = /* @__PURE__ */ new Set();
+      let pricesFailed = false;
+      const sorter = createSettledSorter(() => schedule());
+      const requestPrices = createPriceRequester(
+        () => schedule(),
+        (error) => {
+          pricesFailed = true;
+          schedule();
+          toast(describeError(error), "error");
+        }
+      );
+      function orderTiles(shelf, tiles) {
+        const items = tiles.map((tile) => ({ tile, card: catalog?.get(tileCardId(tile)) })).filter((item) => item.card && item.tile.closest("li"));
+        requestPrices(items.map((item) => item.card.id));
+        const allLoaded = Boolean(catalog) && !shelf.querySelector("button.more");
+        const ready = allLoaded && (pricesFailed || items.every((item) => isPriceLoaded(item.card.id)));
+        const ordered = items.map(({ tile, card }) => ({ element: tile.closest("li"), card, price: priceOf(card.id) }));
+        sorter.apply(ordered, ready);
+      }
       const schedule = () => {
         if (frame) return;
         frame = requestAnimationFrame(() => {
@@ -1269,23 +1716,28 @@
         const activeFilters = filters[tab].filter((filter) => active.has(filter.key));
         placeChips(shelf, tab);
         shelf.querySelector("button.more")?.click();
-        for (const tile of shelf.querySelectorAll("ul.grid button.tile")) {
+        const tiles = [...shelf.querySelectorAll(TILE)];
+        for (const tile of tiles) {
           const id = tileCardId(tile);
           const count = counts ? counts.get(id) ?? 0 : null;
           renderCount(tile, count);
           const hidden = count != null && activeFilters.some((filter) => !filter.keep({ id, tile, count }));
           tile.closest("li")?.classList.toggle("kp-filtered-out", hidden);
         }
+        orderTiles(shelf, tiles);
       }
       const observer = new MutationObserver(schedule);
       observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["aria-selected"] });
-      loadCollection().then((loaded) => {
-        collection = loaded;
+      Promise.all([loadCollection(), loadCatalog()]).then(([loadedCollection, loadedCatalog]) => {
+        collection = loadedCollection;
+        catalog = loadedCatalog;
         schedule();
       }).catch((error) => toast(describeError(error), "error"));
       return () => {
         observer.disconnect();
         cancelAnimationFrame(frame);
+        sorter.stop();
+        clearOrder(document.querySelectorAll(`${SHELF} ul.grid > li`));
         Object.values(chips).flat().forEach((chip) => chip.remove());
         document.querySelectorAll(".kp-site-only").forEach((chip) => chip.classList.remove("kp-site-only"));
         clearCounts();
@@ -1395,6 +1847,32 @@
     }).sort(byDealPriority);
   }
 
+  // src/data/fair-play.js
+  var loadFairPlay = (userId2) => fairPlayApi.withPlayer(userId2);
+  function receiveLeft(fair) {
+    if (!fair.enabled) return null;
+    return { gifts: fair.myReceivedLeft, freeGaps: fair.myFreeLeft, hours: fair.receivedDays * 24 };
+  }
+  var HOUR_MS = 36e5;
+  function tradeImpact({ given, received }, { freeRatio, ignoreBelow }) {
+    const high = Math.max(given, received);
+    const low = Math.min(given, received);
+    const gap = high - low;
+    if (gap < ignoreBelow) return null;
+    const gift = Math.max(0, Math.round(high - freeRatio * low));
+    return { toMe: received > given, gap, gift, free: gap - gift };
+  }
+  function upcomingReleases(entries, fair, { now, direction, partnerId = null }) {
+    const windowMs = (direction === "received" ? fair.receivedDays : fair.pairDays) * HOUR_MS * 24;
+    return entries.map((entry) => ({ entry, impact: tradeImpact(entry, fair) })).filter(({ entry, impact }) => impact && impact.toMe === (direction === "received")).filter(({ entry }) => !partnerId || entry.partner.id === partnerId).map(({ entry, impact }) => ({
+      at: entry.at + windowMs,
+      approximate: entry.approximate,
+      partner: entry.partner,
+      gift: impact.gift,
+      free: impact.free
+    })).filter((release) => release.at > now).sort((a, b) => a.at - b.at);
+  }
+
   // src/data/wishlist.js
   async function loadWishlist() {
     const { wishlist } = await meApi.bootstrap();
@@ -1496,48 +1974,6 @@
     };
   }
 
-  // src/features/market-offers/live.js
-  async function fetchNewOffers(isKnown) {
-    const fresh = [];
-    for (let page = 1; page <= config_default.live.maxPages; page++) {
-      const { items, more } = await tradesApi.searchOffers({ page, pageSize: config_default.offers.pageSize, takeable: true });
-      const unseen = items.filter((offer) => !isKnown(offer.id));
-      fresh.push(...unseen.filter((offer) => offer.status === "open"));
-      if (unseen.length < items.length || !more) break;
-    }
-    return fresh;
-  }
-  async function waitNextRound(baseMs, failures, isStopped) {
-    const start = Date.now();
-    const extra = jitter(config_default.live.jitterMs);
-    for (; ; ) {
-      const due = start + baseMs() * rush() * 2 ** failures + extra;
-      if (isStopped() || Date.now() >= due) return;
-      await sleep(Math.min(due - Date.now(), config_default.live.wakeSliceMs));
-    }
-  }
-  function startPolling(poll, baseMs, onGiveUp) {
-    let stopped = false;
-    let failures = 0;
-    (async () => {
-      while (!stopped) {
-        await waitNextRound(baseMs, failures, () => stopped);
-        if (stopped) return;
-        try {
-          await poll();
-          failures = 0;
-        } catch (error) {
-          if (++failures < config_default.live.maxFailures) continue;
-          stopped = true;
-          onGiveUp(error);
-        }
-      }
-    })();
-    return () => {
-      stopped = true;
-    };
-  }
-
   // src/features/market-offers/controller.js
   var SERVER_FILTERS = {
     [Filter.DOUBLES]: "doubles",
@@ -1558,6 +1994,7 @@
     hiddenCount: 0,
     busy: /* @__PURE__ */ new Set(),
     live: true,
+    fair: null,
     auto: initialAutoState()
   });
   var pinBusyKey = (card) => `pin:${card.id}`;
@@ -1586,6 +2023,21 @@
       });
     }
     const auto = createAutoAccept(store, { take: takeOffer, currentAnalyses: () => store.get().analyses });
+    let fairReadAt = 0;
+    async function refreshFairPlay() {
+      const partner = offers.find((offer) => offer.user?.id)?.user.id;
+      if (!partner) return;
+      fairReadAt = Date.now();
+      try {
+        const [fair, entries] = await Promise.all([loadFairPlay(partner), loadMyId().then(syncTradeLedger)]);
+        const left = receiveLeft(fair);
+        const releases = upcomingReleases(entries, fair, { now: Date.now(), direction: "received" });
+        store.set({ fair: left && { ...left, releases } });
+      } catch (error) {
+        toast(describeError(error), "error");
+      }
+    }
+    const fairPlayIsStale = () => Date.now() - fairReadAt > config_default.fairPlay.refreshMs * rush();
     function hide(offerId) {
       hiddenIds.add(offerId);
       publish();
@@ -1677,7 +2129,10 @@
         (deal) => !bangerIds.has(deal.analysis.offer.id)
       );
       const describe = (kind, { analysis, option }) => `Nouvelle offre ${kind} : ${analysis.received.name} contre ${option.card.name}.`;
-      const messages = [...bangers.map((deal) => describe("banger", deal)), ...gains.map((deal) => describe("rentable", deal))];
+      const messages = [
+        ...bangers.map((deal) => describe("banger", deal)),
+        ...gains.map((deal) => describe("rentable", deal))
+      ];
       if (messages.length > config_default.live.maxToasts) {
         toast(`${messages.length} nouvelles offres intéressantes, en haut de la liste.`, "success");
       } else {
@@ -1685,6 +2140,7 @@
       }
     }
     async function pollNewOffers() {
+      if (fairPlayIsStale()) await refreshFairPlay();
       const fresh = await fetchNewOffers((id) => found.has(id) || takenIds.has(id));
       if (fresh.length === 0) return;
       const now = Date.now();
@@ -1722,6 +2178,7 @@
       }
       dropOffer(offer.id);
       await refreshCollection();
+      await refreshFairPlay();
     }
     async function give(analysis, option) {
       try {
@@ -2070,6 +2527,24 @@
     [Tab.OFFERS, "Offres"],
     [Tab.AUTO, "Auto-accept"]
   ];
+  function releasesTitle({ releases, hours }) {
+    const gifts = releases.filter((release) => release.gift > 0).slice(0, config_default.ledger.shownReleases);
+    if (gifts.length === 0) return `Fenêtre glissante de ${hours} h.`;
+    const lines = gifts.map(
+      ({ at, approximate, gift }) => `${approximate ? "≈ " : ""}${formatClock(at)} : +${formatChakra(gift)}`
+    );
+    return `Revient (fenêtre glissante de ${hours} h) :
+${lines.join("\n")}`;
+  }
+  function renderFairPlay(box, fair) {
+    const key = JSON.stringify(fair);
+    if (box.dataset.key === key) return;
+    box.dataset.key = key;
+    box.title = fair ? releasesTitle(fair) : "";
+    box.replaceChildren(
+      fair ? h("strong", {}, `Dons que tu peux encore accepter : ${formatChakra(fair.gifts)}`) : h("span", { class: "kp-muted" }, "Limite de dons : chargement…")
+    );
+  }
   function dealAction(analysis, option, controller) {
     if (option.status === GiveStatus.PINNED) {
       return h(
@@ -2131,9 +2606,11 @@
       });
       return [key, button];
     });
+    const fairBox = h("div", { class: "kp-fair" });
     const offersView = h(
       "div",
       { class: "kp-side__view", role: "tabpanel" },
+      fairBox,
       h(
         "label",
         { class: "kp-field" },
@@ -2145,7 +2622,11 @@
         "div",
         { class: "kp-side__block" },
         h("h3", { class: "kp-title kp-title--sm" }, "Offres rentables"),
-        h("p", { class: "kp-muted" }, "Toutes les offres qui rapportent au moins le gain minimum. Les nouvelles arrivent en haut."),
+        h(
+          "p",
+          { class: "kp-muted" },
+          "Toutes les offres qui rapportent au moins le gain minimum. Les nouvelles arrivent en haut."
+        ),
         gainList
       ),
       h(
@@ -2185,6 +2666,7 @@
     function render(state) {
       lastState = state;
       renderTabs(state);
+      renderFairPlay(fairBox, state.fair);
       autoPanel.render(state);
       fill(gainList, gainDeals(state.analyses, minGain), "Aucune offre à ce gain.", state);
       fill(bangerList, bangerDeals(state.analyses), "Aucune offre banger pour le moment.", state);
@@ -2343,7 +2825,7 @@
   };
 
   // src/features/profile-collection/filters.js
-  var byRarityThenName = (a, b) => rarityRank(a.card.rarity) - rarityRank(b.card.rarity) || a.card.name.localeCompare(b.card.name, "fr");
+  var sortEntries = (entries) => entries.sort(compareCards);
   function buildEntries({ catalog, ownedIds, tradeable, myCollection }) {
     return ownedIds.map((id) => catalog.get(id)).filter(Boolean).map((card) => ({
       card,
@@ -2351,7 +2833,20 @@
       mine: myCollection.get(card.id)?.qty ?? 0,
       nameKey: searchKey(card.name),
       seriesKey: searchKey(card.series ?? "")
-    })).sort(byRarityThenName);
+    })).sort(compareCards);
+  }
+  var indexCatalog = (catalog) => [...catalog.values()].map((card) => ({ id: card.id, rarity: card.rarity, seriesKey: searchKey(card.series ?? "") }));
+  function completion(catalogIndex, ownedIds, { series, rarities }) {
+    const seriesKey = searchKey(series.trim());
+    let owned = 0;
+    let total = 0;
+    for (const card of catalogIndex) {
+      if (rarities.size > 0 && !rarities.has(card.rarity)) continue;
+      if (seriesKey && !card.seriesKey.includes(seriesKey)) continue;
+      total++;
+      if (ownedIds.has(card.id)) owned++;
+    }
+    return { owned, total };
   }
   var seriesOf = (entries) => [...new Set(entries.map((entry) => entry.card.series).filter(Boolean))].sort((a, b) => a.localeCompare(b, "fr"));
   var totalPrice = (entries) => entries.reduce((sum, entry) => sum + (entry.price ?? 0), 0);
@@ -2400,7 +2895,9 @@
     let shown = [];
     let rendered = 0;
     let pricesReady = false;
+    let ownership = null;
     const status = h("span", { class: "kp-muted" }, "Chargement…");
+    const completionPill = h("span", { class: "kp-pc__total kp-pc__completion" });
     const total = h("span", { class: "kp-pc__total" });
     const grid = h("div", { class: "kp-pc__grid" });
     const sentinel = h("div", { class: "kp-pc__sentinel" });
@@ -2419,6 +2916,13 @@
       const selection = shown.length === entries.length ? "" : ` · sélection ${formatChakra(totalPrice(shown))}`;
       total.textContent = `Valeur ${formatChakra(totalPrice(entries))}${selection}`;
     }
+    function renderCompletion() {
+      const { owned, total: inGame } = completion(ownership.catalogIndex, ownership.ownedIds, filters);
+      const scope = [...filters.rarities].map((rarity) => RARITY_LABELS[rarity]).join(" + ") || "Toutes raretés";
+      const percent = inGame ? Math.floor(owned / inGame * 100) : 0;
+      completionPill.textContent = `${scope} : ${formatNumber(owned)} / ${formatNumber(inGame)} (${percent} %)`;
+      completionPill.title = "Cartes différentes possédées sur le nombre de cartes du jeu (filtres rareté et série)";
+    }
     function render() {
       if (!entries) return;
       shown = filterEntries(entries, filters);
@@ -2427,6 +2931,7 @@
       grid.replaceChildren();
       body.scrollTop = 0;
       status.textContent = `${formatNumber(shown.length)} / ${plural(entries.length, "carte")}`;
+      renderCompletion();
       if (shown.length === 0) grid.append(h("p", { class: "kp-empty" }, "Aucune carte avec ces filtres."));
       else appendNextStep();
     }
@@ -2482,6 +2987,7 @@
           { class: "kp-pc__head" },
           h("h2", { class: "kp-title" }, title),
           status,
+          completionPill,
           total,
           h("button", { class: "kp-hide kp-pc__close", type: "button", title: "Fermer", onClick: onClose }, icon("xmark"))
         ),
@@ -2500,18 +3006,17 @@
     );
     return {
       root,
-      setEntries(loaded) {
+      setEntries(loaded, game) {
         entries = loaded;
+        ownership = game;
         seriesList.replaceChildren(...seriesOf(entries).map((series) => h("option", { value: series })));
         render();
       },
+      // Prices change the order inside each rarity, so the grid is rebuilt rather than patched.
       showPrices() {
         pricesReady = true;
-        const byId = new Map(entries.map((entry) => [String(entry.card.id), entry]));
-        for (const tile of grid.querySelectorAll(".kp-pcard")) {
-          tile.querySelector(".kp-price").textContent = formatPrice(byId.get(tile.dataset.cardId)?.price);
-        }
-        renderTotal();
+        sortEntries(entries);
+        render();
       },
       setError(message) {
         status.textContent = message;
@@ -2542,7 +3047,11 @@
       tradesApi.availableFrom(userId2)
     ]);
     const tradeable = new Map(available.map((row) => [row.characterId, row.n]));
-    return buildEntries({ catalog, ownedIds, tradeable, myCollection });
+    return {
+      entries: buildEntries({ catalog, ownedIds, tradeable, myCollection }),
+      catalogIndex: indexCatalog(catalog),
+      ownedIds: new Set(ownedIds)
+    };
   }
   async function attachPrices(entries) {
     await loadPrices(entries.map((entry) => entry.card.id));
@@ -2569,8 +3078,8 @@
         document.body.classList.add("kp-modal-open");
         document.body.append(current.root);
         if (!cache2.has(userId2)) cache2.set(userId2, loadEntries(userId2));
-        cache2.get(userId2).then(async (entries) => {
-          current.setEntries(entries);
+        cache2.get(userId2).then(async ({ entries, catalogIndex, ownedIds }) => {
+          current.setEntries(entries, { catalogIndex, ownedIds });
           try {
             await attachPrices(entries);
             current.showPrices();
@@ -2610,10 +3119,25 @@
   }
 
   // src/styles.css
-  var styles_default = "body.kp-market main aside.chat-side > :not(.kp-side) {\n  display: none !important;\n}\n\nbody.kp-market:not(.kp-offers) main aside.chat-side {\n  display: none !important;\n}\n\nbody.kp-market:not(.kp-offers) main .layout {\n  grid-template-columns: minmax(0, 1fr) !important;\n}\n\nbody.kp-offers main .wrap {\n  --wrap: 1320px;\n}\n\nbody.kp-offers main .layout {\n  grid-template-columns: minmax(0, 1fr) 400px !important;\n}\n\n/* The site may render its offer dialogs inside the board, so only the board's own content is hidden. */\nbody.kp-offers main section.board {\n  display: contents !important;\n}\n\nbody.kp-offers main section.board > :not([role='dialog']):not(:has([role='dialog'])) {\n  display: none !important;\n}\n\n.kp-tab-link {\n  display: inline-flex;\n  align-items: center;\n  color: inherit;\n  text-decoration: none;\n}\n\n.kp-filters {\n  display: flex;\n  flex-wrap: wrap;\n  gap: var(--s-2);\n}\n\n.kp-chip {\n  padding: 5px 12px;\n  border: 1px solid var(--line2);\n  border-radius: var(--r-pill);\n  background: transparent;\n  color: var(--fg2);\n  font: 500 var(--t-sm) var(--body);\n  cursor: pointer;\n}\n\n.kp-chip:hover {\n  background: var(--raise);\n}\n\n.kp-chip[aria-pressed='true'] {\n  border-color: var(--acc);\n  background: var(--acc-soft);\n  color: var(--fg);\n}\n\n.kp-title {\n  margin: 0;\n  font-family: var(--disp);\n  font-size: var(--t-h3);\n}\n\n.kp-title--sm {\n  font-size: var(--t-base);\n}\n\n.kp-muted,\n.kp-empty {\n  margin: 0;\n  color: var(--mut);\n  font-size: var(--t-sm);\n}\n\n.kp-empty {\n  padding: var(--s-6) 0;\n  text-align: center;\n}\n\n.kp-label {\n  color: var(--mut);\n  font-size: var(--t-meta);\n  letter-spacing: 0.06em;\n  text-transform: uppercase;\n}\n\n.kp-name {\n  overflow: hidden;\n  font-size: var(--t-sm);\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n.kp-price {\n  color: var(--fg2);\n  font-family: var(--mono);\n  font-size: var(--t-meta);\n}\n\n.kp-note {\n  overflow: hidden;\n  color: var(--mut);\n  font-size: var(--t-meta);\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n.kp-note--warn {\n  color: var(--warn);\n}\n\n.kp-note--new {\n  color: var(--ok);\n}\n\n.kp-note--wish {\n  color: var(--wish);\n}\n\n.kp-tag {\n  align-self: flex-start;\n  padding: 2px 8px;\n  border: 1px solid var(--line2);\n  border-radius: var(--r-pill);\n  color: var(--fg2);\n  font-size: var(--t-meta);\n}\n\n.kp-art {\n  position: relative;\n  display: block;\n  overflow: hidden;\n  aspect-ratio: 2 / 3;\n  border: 3px solid var(--kp-rarity);\n  border-radius: var(--r-md);\n  background: var(--bg2);\n  box-shadow: 0 0 14px color-mix(in srgb, var(--kp-rarity) 30%, transparent);\n}\n\n.kp-art img {\n  display: block;\n  width: 100%;\n  height: 100%;\n  object-fit: cover;\n}\n\n.kp-art--md {\n  width: 100%;\n}\n\n.kp-art--lg {\n  width: 120px;\n}\n\n.kp-art--sm {\n  width: 44px;\n  border-width: 2px;\n  border-radius: var(--r-sm);\n}\n\n.kp-badge {\n  position: absolute;\n  right: 4px;\n  bottom: 4px;\n  padding: 1px 6px;\n  border-radius: var(--r-pill);\n  background: color-mix(in srgb, var(--bg) 85%, transparent);\n  color: var(--fg);\n  font-family: var(--mono);\n  font-size: var(--t-meta);\n  line-height: 1.4;\n}\n\n.kp-badge--lock {\n  top: 4px;\n  bottom: auto;\n  color: var(--warn);\n}\n\n.kp-art--sm .kp-badge {\n  right: 1px;\n  bottom: 1px;\n  padding: 0 3px;\n  font-size: 9px;\n}\n\n.kp-art--sm .kp-badge--lock {\n  top: 1px;\n  bottom: auto;\n}\n\n.kp-swap {\n  align-self: center;\n  color: var(--mut);\n  font-size: 18px;\n  text-align: center;\n}\n\n.kp-btn {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  gap: 6px;\n  padding: 6px 10px;\n  border: 1px solid transparent;\n  border-radius: var(--r-md);\n  background: var(--acc);\n  color: #fff;\n  font: 600 var(--t-sm) var(--body);\n  cursor: pointer;\n  transition: background 0.15s, opacity 0.15s;\n}\n\n.kp-btn[hidden] {\n  display: none;\n}\n\n.kp-btn:hover {\n  background: var(--acc2);\n}\n\n.kp-btn--ghost {\n  border-color: var(--line2);\n  background: transparent;\n  color: var(--fg);\n}\n\n.kp-btn--ghost:hover {\n  background: var(--raise);\n}\n\n.kp-btn--warn {\n  background: var(--warn);\n  color: var(--bg);\n}\n\n.kp-btn--double {\n  background: #ff5f1f;\n  color: var(--bg);\n}\n\n.kp-btn--double:hover {\n  background: #ff7a45;\n}\n\n.kp-btn--single {\n  background: var(--gold);\n  color: var(--bg);\n}\n\n.kp-btn--single:hover {\n  background: #ffd84d;\n}\n\n.kp-btn--sm {\n  padding: 4px 8px;\n  font-size: var(--t-meta);\n}\n\n.kp-gain {\n  padding: 1px 6px;\n  border-radius: var(--r-pill);\n  font-family: var(--mono);\n  font-size: var(--t-meta);\n  white-space: nowrap;\n}\n\n.kp-gain--up {\n  background: color-mix(in srgb, var(--ok) 18%, transparent);\n  color: var(--ok);\n}\n\n.kp-gain--down {\n  background: color-mix(in srgb, var(--danger) 18%, transparent);\n  color: var(--danger);\n}\n\n.kp-gain--flat {\n  background: var(--raise);\n  color: var(--mut);\n}\n\n.kp-btn .kp-gain {\n  background: var(--bg);\n}\n\n.kp-board {\n  display: flex;\n  flex-direction: column;\n  gap: var(--s-4);\n}\n\n.kp-board__bar {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: flex-end;\n  justify-content: space-between;\n  gap: var(--s-3);\n}\n\n.kp-board__actions {\n  display: flex;\n  gap: var(--s-2);\n}\n\n.kp-board__list {\n  display: flex;\n  flex-direction: column;\n  gap: var(--s-5);\n}\n\n.kp-group {\n  display: flex;\n  flex-direction: column;\n  gap: var(--s-3);\n}\n\n.kp-group__title {\n  margin: 0;\n  padding-bottom: var(--s-2);\n  border-bottom: 1px solid color-mix(in srgb, var(--kp-rarity) 40%, transparent);\n  color: var(--kp-rarity);\n  font-family: var(--disp);\n  font-size: var(--t-base);\n}\n\n.kp-offer {\n  position: relative;\n  display: grid;\n  grid-template-columns: 132px 24px minmax(0, 1fr);\n  gap: var(--s-4);\n  padding: var(--s-3);\n  border: 1px solid var(--line);\n  border-radius: var(--r-lg);\n  background: var(--panel);\n  transition: opacity 0.15s;\n}\n\n.kp-offer__get,\n.kp-option {\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n  min-width: 0;\n}\n\n.kp-offer__give {\n  display: flex;\n  flex-direction: column;\n  gap: var(--s-2);\n  min-width: 0;\n}\n\n.kp-options {\n  display: grid;\n  grid-template-columns: repeat(5, 112px);\n  justify-content: start;\n  gap: var(--s-3);\n}\n\n.kp-option--missing {\n  opacity: 0.35;\n}\n\n.kp-option .kp-btn {\n  width: 100%;\n  margin-top: auto;\n  padding: 4px 6px;\n  font-size: var(--t-meta);\n}\n\n.kp-hide {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  width: 26px;\n  height: 26px;\n  padding: 0;\n  border: 1px solid var(--line2);\n  border-radius: var(--r-pill);\n  background: var(--panel2);\n  color: var(--mut);\n  cursor: pointer;\n}\n\n.kp-hide:hover {\n  background: var(--raise);\n  color: var(--fg);\n}\n\n.kp-offer > .kp-hide {\n  position: absolute;\n  top: var(--s-2);\n  right: var(--s-2);\n}\n\n.kp-deal .kp-hide {\n  width: 22px;\n  height: 22px;\n  margin-left: auto;\n  font-size: 11px;\n}\n\n.kp-more {\n  align-self: center;\n}\n\n.is-busy {\n  opacity: 0.45;\n  pointer-events: none;\n}\n\n.kp-side {\n  display: flex;\n  flex-direction: column;\n  gap: var(--s-5);\n  height: 100%;\n  overflow-y: auto;\n  padding: var(--s-4);\n  border: 1px solid var(--line);\n  border-radius: var(--r-lg);\n  background: var(--panel);\n}\n\n.kp-side__controls {\n  position: sticky;\n  top: calc(-1 * var(--s-4));\n  z-index: 1;\n  margin: calc(-1 * var(--s-4)) calc(-1 * var(--s-4)) 0;\n  padding: var(--s-3) var(--s-4);\n  border-bottom: 1px solid var(--line);\n  background: var(--panel);\n}\n\n.kp-side__block {\n  display: flex;\n  flex-direction: column;\n  gap: var(--s-3);\n}\n\n.kp-field {\n  display: flex;\n  align-items: center;\n  gap: var(--s-2);\n}\n\n.kp-input {\n  flex: 1;\n  min-width: 0;\n  padding: 6px 10px;\n  border: 1px solid var(--line2);\n  border-radius: var(--r-md);\n  background: var(--bg2);\n  color: var(--fg);\n  font-family: var(--mono);\n}\n\n.kp-input:focus {\n  border-color: var(--acc);\n  outline: none;\n}\n\n.kp-board__search {\n  flex-basis: 100%;\n  max-width: 420px;\n}\n\n.kp-deals {\n  display: flex;\n  flex-direction: column;\n  gap: var(--s-2);\n}\n\n.kp-deal {\n  display: grid;\n  grid-template-columns: 44px auto 44px minmax(0, 1fr);\n  align-items: center;\n  gap: var(--s-2);\n  padding: var(--s-2);\n  border: 1px solid var(--line);\n  border-radius: var(--r-md);\n  background: var(--panel2);\n}\n\n.kp-deal .kp-swap {\n  font-size: 12px;\n}\n\n.kp-deal__info {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n  min-width: 0;\n}\n\n.kp-deal__actions {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: var(--s-2);\n  margin-top: 2px;\n}\n\n.kp-deal.is-new {\n  border-color: var(--acc);\n  box-shadow: 0 0 0 1px var(--acc-soft);\n}\n\n.kp-new {\n  margin-right: 6px;\n  padding: 1px 6px;\n  border-radius: var(--r-pill);\n  background: var(--acc);\n  color: #fff;\n  font-size: var(--t-meta);\n  font-weight: 700;\n}\n\n.kp-auto {\n  padding: var(--s-3);\n  border: 1px solid var(--line2);\n  border-radius: var(--r-md);\n  background: var(--panel2);\n}\n\n.kp-auto__head {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: var(--s-2);\n}\n\n.kp-rules {\n  border-spacing: 4px;\n  margin: 0 -4px;\n}\n\n.kp-rules th {\n  font-weight: 400;\n  text-align: center;\n}\n\n.kp-rules thead th:first-child {\n  max-width: 90px;\n  text-align: left;\n}\n\n.kp-gem {\n  display: inline-grid;\n  place-items: center;\n  width: 22px;\n  height: 22px;\n  border: 2px solid var(--kp-rarity);\n  border-radius: 50%;\n  color: var(--kp-rarity);\n  font: 900 10px var(--body);\n}\n\n.kp-rule {\n  display: block;\n  width: 28px;\n  height: 28px;\n  margin: auto;\n  border: 1px solid var(--line2);\n  border-radius: var(--r-sm, 6px);\n  background: transparent;\n  cursor: pointer;\n}\n\n.kp-rule:hover {\n  border-color: var(--kp-rarity);\n}\n\n.kp-rule[aria-pressed='true'] {\n  border-color: var(--kp-rarity);\n  background: var(--kp-rarity);\n  box-shadow: 0 0 10px color-mix(in srgb, var(--kp-rarity) 50%, transparent);\n}\n\n.kp-side__tabs {\n  display: flex;\n  gap: var(--s-2);\n}\n\n.kp-side__view {\n  display: flex;\n  flex-direction: column;\n  gap: var(--s-5);\n}\n\n.kp-side__view[hidden] {\n  display: none;\n}\n\n/* A dot on the Auto-accept tab while it runs, so it stays visible from the Offres tab. */\n.kp-side__tabs .kp-chip.is-live::after {\n  content: '';\n  display: inline-block;\n  width: 7px;\n  height: 7px;\n  margin-left: 6px;\n  border-radius: 50%;\n  background: var(--ok);\n  box-shadow: 0 0 6px var(--ok);\n  vertical-align: middle;\n}\n\n.kp-auto__head .kp-btn:disabled {\n  cursor: not-allowed;\n}\n\n.kp-auto > .kp-chip {\n  align-self: flex-start;\n}\n\n.kp-toasts {\n  position: fixed;\n  right: 16px;\n  bottom: 16px;\n  z-index: 2147483647;\n  display: flex;\n  flex-direction: column;\n  gap: var(--s-2);\n}\n\n.kp-toast {\n  max-width: 360px;\n  padding: 10px 14px;\n  border: 1px solid var(--line2);\n  border-radius: var(--r-md);\n  background: var(--raise);\n  box-shadow: var(--sh-1);\n  color: var(--fg);\n  font-size: var(--t-sm);\n}\n\n.kp-toast--success {\n  border-color: var(--ok);\n}\n\n.kp-toast--error {\n  border-color: var(--danger);\n}\n\n.kp-replaced {\n  display: none !important;\n}\n\n.tcg.kp-ghost {\n  filter: saturate(0.45) brightness(0.8);\n}\n\n.tcg.kp-ghost .art img {\n  filter: grayscale(1) brightness(0.7);\n}\n\n.kp-filtered-out {\n  display: none !important;\n}\n\n.kp-album-filters {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: center;\n  gap: var(--s-3);\n  margin: var(--s-3) 0;\n}\n\n.kp-input--short {\n  flex: 0 0 72px;\n  width: 72px;\n}\n\n.kp-gem-chip {\n  display: inline-grid;\n  place-items: center;\n  width: 26px;\n  height: 26px;\n  padding: 0;\n  border: 2px solid var(--kp-rarity);\n  border-radius: 50%;\n  background: transparent;\n  color: var(--kp-rarity);\n  font: 900 11px var(--body);\n  cursor: pointer;\n}\n\n.kp-gem-chip[aria-pressed='true'] {\n  background: var(--kp-rarity);\n  box-shadow: 0 0 12px color-mix(in srgb, var(--kp-rarity) 60%, transparent);\n  color: var(--bg);\n}\n\n.kp-btn:disabled {\n  opacity: 0.5;\n  cursor: progress;\n}\n\n.kp-lock-host {\n  position: relative;\n}\n\n.kp-lock-host .pin {\n  display: none !important;\n}\n\n.kp-lock {\n  position: absolute;\n  top: 2px;\n  left: 0;\n  z-index: 6;\n  display: grid;\n  place-items: center;\n  width: 30px;\n  height: 30px;\n  padding: 0;\n  border: 1px solid var(--line2);\n  border-radius: 50%;\n  background: var(--panel2);\n  color: var(--dim);\n  font-size: 13px;\n  cursor: pointer;\n  opacity: 0;\n  transition: opacity 0.15s, color 0.15s;\n}\n\n.kp-lock-host:hover .kp-lock,\n.kp-lock.is-locked,\n.kp-lock:focus-visible {\n  opacity: 1;\n}\n\n.kp-lock.is-locked {\n  color: var(--warn);\n}\n\n.kp-lock:hover {\n  color: var(--fg);\n}\n\n.kp-lock:disabled {\n  cursor: progress;\n}\n\nbody[data-kp-trades-tab] main [role='tabpanel'] > h2[data-kp-section],\nbody[data-kp-trades-tab='board'] main [data-kp-section]:not([data-kp-section='board']),\nbody[data-kp-trades-tab='received'] main [data-kp-section]:not([data-kp-section='received']),\nbody[data-kp-trades-tab='sent'] main [data-kp-section]:not([data-kp-section='sent']) {\n  display: none !important;\n}\n\n.kp-trade-tabs {\n  margin: var(--s-3) 0;\n}\n\n.kp-trade-host > .compact,\n.kp-trade-host > .trays,\n.kp-trade-host > .verdict,\n.kp-trade-host > .more,\n.kp-trade-host > .sides {\n  display: none !important;\n}\n\n.kp-badge--new {\n  color: var(--ok);\n}\n\n[data-kp-section='board'] .kp-trade-host {\n  text-align: center;\n}\n\n[data-kp-section='board'] .kp-trade-host > .th {\n  justify-content: center;\n  gap: var(--s-2);\n}\n\nbody[data-kp-trades-tab] main [role='tabpanel'] ul.trades[data-kp-section='board'] {\n  display: grid;\n  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));\n  align-items: start;\n  gap: var(--s-3);\n}\n\n.kp-trade {\n  display: grid;\n  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);\n  align-items: start;\n  gap: var(--s-2);\n  margin: var(--s-2) 0;\n}\n\n.kp-trade > .kp-swap {\n  align-self: center;\n  color: var(--acc);\n  font-size: 14px;\n}\n\n.kp-trade__side {\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  gap: var(--s-2);\n  min-width: 0;\n}\n\n.kp-trade__cards {\n  display: flex;\n  flex-wrap: wrap;\n  justify-content: center;\n  gap: var(--s-2);\n}\n\n.kp-tcard {\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  gap: 2px;\n  width: 92px;\n  min-width: 0;\n}\n\n.kp-tcard .kp-name {\n  max-width: 100%;\n}\n\n.kp-trade__cards:has(> .kp-tcard:nth-child(2)) .kp-tcard {\n  width: 60px;\n}\n\n.kp-trade__total {\n  color: var(--mut);\n}\n\n.kp-trade__net {\n  grid-column: 1 / -1;\n  justify-self: center;\n  font-family: var(--mono);\n  font-size: var(--t-base);\n  font-weight: 700;\n}\n\n.kp-trade__net--up {\n  color: var(--ok);\n}\n\n.kp-trade__net--down {\n  color: var(--danger);\n}\n\n.kp-trade__net--flat {\n  color: var(--mut);\n}\n\n.kp-trade--wide {\n  display: grid;\n  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);\n  align-items: stretch;\n  gap: var(--s-3);\n}\n\n.kp-trade--wide > .kp-swap {\n  align-self: center;\n  color: var(--acc);\n}\n\n.kp-trade__summary {\n  display: inline-flex;\n  align-items: center;\n  gap: var(--s-3);\n  margin-left: auto;\n  margin-right: var(--s-2);\n}\n\n.kp-pill {\n  padding: 2px 10px;\n  border: 1px solid currentColor;\n  border-radius: var(--r-pill);\n  font-family: var(--mono);\n  font-size: var(--t-sm);\n  font-weight: 700;\n}\n\n.kp-pill--up {\n  color: var(--ok);\n}\n\n.kp-pill--down {\n  color: var(--danger);\n}\n\n.kp-pill--flat {\n  color: var(--mut);\n}\n\n.kp-trade__box {\n  container-type: inline-size;\n  display: flex;\n  flex-direction: column;\n  gap: var(--s-2);\n  padding: var(--s-2) var(--s-3) var(--s-3);\n  border: 1px solid var(--line);\n  border-radius: var(--r-lg);\n  background: var(--panel2);\n}\n\n.kp-trade__box-head {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: center;\n  gap: var(--s-1) var(--s-3);\n}\n\n.kp-trade__box-total {\n  margin-left: auto;\n}\n\n.kp-trade__grid {\n  display: grid;\n  grid-template-columns: repeat(10, minmax(0, 1fr));\n  gap: 6px;\n}\n\n@container (max-width: 480px) {\n  .kp-trade__grid {\n    grid-template-columns: repeat(5, minmax(0, 1fr));\n  }\n}\n\n.kp-trade__grid .kp-tcard {\n  width: auto;\n}\n\n.kp-trade__box .kp-badge {\n  right: 2px;\n  bottom: 2px;\n  padding: 0 4px;\n  font-size: 9px;\n}\n\n.kp-trade__note {\n  font-size: var(--t-meta);\n  font-weight: 600;\n}\n\n.kp-trade__note--warn {\n  color: var(--warn);\n}\n\n.kp-trade__note--new {\n  color: var(--ok);\n}\n\n.kp-trade__note--muted {\n  color: var(--fg2);\n}\n\n.kp-trade-host .tact .talk {\n  display: none !important;\n}\n\n.kp-trade-host .tact:not(:has(> :not(.talk))) {\n  display: none !important;\n}\n\n.kp-talk {\n  display: inline-grid;\n  place-items: center;\n  width: 22px;\n  height: 22px;\n  margin-left: 6px;\n  padding: 0;\n  border: none;\n  border-radius: 50%;\n  background: transparent;\n  color: var(--mut);\n  font-size: 13px;\n  vertical-align: middle;\n  cursor: pointer;\n}\n\n.kp-talk:hover {\n  background: var(--raise);\n  color: var(--fg);\n}\n\n.kp-count-host {\n  container-type: inline-size;\n}\n\n/* The tile image spans the tile width with a 5:7 ratio, so its bottom edge sits at 140% of that width. */\n.kp-count {\n  position: absolute;\n  top: calc(140cqw - 22px);\n  right: 5px;\n  padding: 0 6px;\n  border-radius: var(--r-pill);\n  background: #0a090ed9;\n  color: var(--fg2);\n  font: 700 11px var(--mono);\n  line-height: 18px;\n  pointer-events: none;\n}\n\n.kp-count--dupe {\n  color: var(--ok);\n}\n\n.kp-site-only {\n  display: none !important;\n}\n\n.kp-native-hidden {\n  display: none !important;\n}\n\nbody.kp-modal-open {\n  overflow: hidden;\n}\n\n.kp-modal {\n  position: fixed;\n  inset: 0;\n  z-index: 1000;\n  display: grid;\n  place-items: center;\n  padding: var(--s-4);\n  background: color-mix(in srgb, var(--bg) 70%, transparent);\n  backdrop-filter: blur(4px);\n}\n\n.kp-pc {\n  display: flex;\n  flex-direction: column;\n  width: min(1200px, 100%);\n  height: min(900px, 100%);\n  overflow: hidden;\n  border: 1px solid var(--line2);\n  border-radius: var(--r-lg);\n  background: var(--panel);\n  box-shadow: var(--sh-1);\n}\n\n.kp-pc__head {\n  display: flex;\n  align-items: center;\n  gap: var(--s-3);\n  padding: var(--s-3) var(--s-4);\n  border-bottom: 1px solid var(--line);\n}\n\n.kp-pc__close {\n  margin-left: auto;\n}\n\n.kp-pc__filters {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: center;\n  gap: var(--s-2) var(--s-3);\n  padding: var(--s-3) var(--s-4);\n  border-bottom: 1px solid var(--line);\n}\n\n.kp-pc__filters .kp-input {\n  flex: 0 1 200px;\n}\n\n.kp-pc__body {\n  flex: 1;\n  overflow-y: auto;\n  padding: var(--s-4);\n}\n\n.kp-pc__grid {\n  display: grid;\n  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));\n  gap: var(--s-3);\n}\n\n.kp-pc__grid .kp-empty {\n  grid-column: 1 / -1;\n}\n\n.kp-pc__sentinel {\n  height: 1px;\n}\n\n.kp-pcard {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n  min-width: 0;\n}\n\n.kp-badge--dupe {\n  color: var(--ok);\n}\n\n.kp-badge--corner {\n  top: 4px;\n  right: auto;\n  bottom: auto;\n  left: 4px;\n}\n\n.kp-pc__total {\n  padding: 2px 10px;\n  border: 1px solid var(--line2);\n  border-radius: var(--r-pill);\n  color: var(--fg);\n  font: 700 var(--t-sm) var(--mono);\n}\n\n.kp-friend-search {\n  display: block;\n  width: 100%;\n  max-width: 880px;\n  margin-bottom: var(--s-3);\n}\n\nbody.kp-friends main ul.people {\n  display: flex;\n  flex-direction: column;\n}\n\nbody.kp-friends main ul.people > li.kp-pinned {\n  order: -1;\n  box-shadow: inset 3px 0 0 var(--gold);\n}\n\n.kp-pin,\n.kp-friend-act {\n  display: inline-flex !important;\n  flex: none;\n  align-items: center;\n  justify-content: center;\n  gap: 0 !important;\n  box-sizing: border-box;\n  width: 32px;\n  height: 32px;\n  min-width: 0 !important;\n  min-height: 0 !important;\n  margin: 0 !important;\n  padding: 0 !important;\n  line-height: 0 !important;\n  vertical-align: middle;\n  border: 1px solid var(--line2) !important;\n  border-radius: 50% !important;\n  background: var(--panel2) !important;\n  color: var(--mut) !important;\n  font-size: 0 !important;\n  text-decoration: none !important;\n  cursor: pointer;\n  transition: color 0.15s, background 0.15s;\n}\n\n.kp-pin i,\n.kp-friend-act i {\n  width: 1.25em;\n  font-size: 13px;\n  line-height: 1;\n  text-align: center;\n}\n\n.kp-pin:hover,\n.kp-friend-act:hover {\n  background: var(--raise) !important;\n  color: var(--fg) !important;\n}\n\n.kp-friend-act[data-kp-icon='Retirer']:hover,\n.kp-friend-act[data-kp-icon='Bloquer']:hover {\n  color: var(--danger) !important;\n}\n\n.kp-pin.is-pinned {\n  border-color: var(--gold) !important;\n  color: var(--gold) !important;\n}\n\n.kp-pin.is-pinned i {\n  transform: rotate(-45deg);\n}\n\n.kp-friend-act--confirm {\n  gap: 6px !important;\n  width: auto;\n  padding: 0 12px !important;\n  border-color: var(--danger) !important;\n  border-radius: var(--r-pill) !important;\n  color: var(--danger) !important;\n  font-size: var(--t-sm) !important;\n  line-height: 1 !important;\n}\n\n.kp-series-collapsed > ul.quests {\n  display: none !important;\n}\n\n.kp-series-toggle {\n  display: inline-flex;\n  align-items: center;\n  gap: var(--s-2);\n  margin-left: auto;\n  padding: 4px 12px;\n  border: 1px solid var(--line2);\n  border-radius: var(--r-pill);\n  background: var(--panel2);\n  color: var(--fg2);\n  font: 600 var(--t-sm) var(--body);\n  cursor: pointer;\n}\n\n.kp-series-toggle:hover {\n  background: var(--raise);\n  color: var(--fg);\n}\n\n.kp-series-summary.has-claim {\n  color: var(--ok);\n}\n\n.kp-series-chevron {\n  display: inline-flex;\n  font-size: 11px;\n  transition: transform 0.15s;\n}\n\n.kp-series-toggle[aria-expanded='true'] .kp-series-chevron {\n  transform: rotate(180deg);\n}\n\nhtml:has(body.kp-video-bg),\nbody.kp-video-bg,\nbody.kp-video-bg main section.band,\nbody.kp-video-bg main .box.coll {\n  background: transparent !important;\n}\n\n.kp-bg-video {\n  position: fixed;\n  inset: 0;\n  z-index: -1;\n  width: 100vw;\n  height: 100vh;\n  object-fit: cover;\n  filter: brightness(0.45);\n  pointer-events: none;\n}\n\n.kp-filters__rarities {\n  margin-left: auto;\n}\n";
+  var styles_default = "body.kp-market main aside.chat-side > :not(.kp-side) {\n  display: none !important;\n}\n\nbody.kp-market:not(.kp-offers) main aside.chat-side {\n  display: none !important;\n}\n\nbody.kp-market:not(.kp-offers) main .layout {\n  grid-template-columns: minmax(0, 1fr) !important;\n}\n\nbody.kp-offers main .wrap {\n  --wrap: 1320px;\n}\n\nbody.kp-offers main .layout {\n  grid-template-columns: minmax(0, 1fr) 400px !important;\n}\n\n/* The site may render its offer dialogs inside the board, so only the board's own content is hidden. */\nbody.kp-offers main section.board {\n  display: contents !important;\n}\n\nbody.kp-offers main section.board > :not([role='dialog']):not(:has([role='dialog'])) {\n  display: none !important;\n}\n\n.kp-tab-link {\n  display: inline-flex;\n  align-items: center;\n  color: inherit;\n  text-decoration: none;\n}\n\n.kp-filters {\n  display: flex;\n  flex-wrap: wrap;\n  gap: var(--s-2);\n}\n\n.kp-chip {\n  padding: 5px 12px;\n  border: 1px solid var(--line2);\n  border-radius: var(--r-pill);\n  background: transparent;\n  color: var(--fg2);\n  font: 500 var(--t-sm) var(--body);\n  cursor: pointer;\n}\n\n.kp-chip:hover {\n  background: var(--raise);\n}\n\n.kp-chip[aria-pressed='true'] {\n  border-color: var(--acc);\n  background: var(--acc-soft);\n  color: var(--fg);\n}\n\n.kp-title {\n  margin: 0;\n  font-family: var(--disp);\n  font-size: var(--t-h3);\n}\n\n.kp-title--sm {\n  font-size: var(--t-base);\n}\n\n.kp-muted,\n.kp-empty {\n  margin: 0;\n  color: var(--mut);\n  font-size: var(--t-sm);\n}\n\n.kp-empty {\n  padding: var(--s-6) 0;\n  text-align: center;\n}\n\n.kp-label {\n  color: var(--mut);\n  font-size: var(--t-meta);\n  letter-spacing: 0.06em;\n  text-transform: uppercase;\n}\n\n.kp-name {\n  overflow: hidden;\n  font-size: var(--t-sm);\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n.kp-price {\n  color: var(--fg2);\n  font-family: var(--mono);\n  font-size: var(--t-meta);\n}\n\n.kp-note {\n  overflow: hidden;\n  color: var(--mut);\n  font-size: var(--t-meta);\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n.kp-note--warn {\n  color: var(--warn);\n}\n\n.kp-note--new {\n  color: var(--ok);\n}\n\n.kp-note--wish {\n  color: var(--wish);\n}\n\n.kp-tag {\n  align-self: flex-start;\n  padding: 2px 8px;\n  border: 1px solid var(--line2);\n  border-radius: var(--r-pill);\n  color: var(--fg2);\n  font-size: var(--t-meta);\n}\n\n.kp-art {\n  position: relative;\n  display: block;\n  overflow: hidden;\n  aspect-ratio: 2 / 3;\n  border: 3px solid var(--kp-rarity);\n  border-radius: var(--r-md);\n  background: var(--bg2);\n  box-shadow: 0 0 14px color-mix(in srgb, var(--kp-rarity) 30%, transparent);\n}\n\n.kp-art img {\n  display: block;\n  width: 100%;\n  height: 100%;\n  object-fit: cover;\n}\n\n.kp-art--md {\n  width: 100%;\n}\n\n.kp-art--lg {\n  width: 120px;\n}\n\n.kp-art--sm {\n  width: 44px;\n  border-width: 2px;\n  border-radius: var(--r-sm);\n}\n\n.kp-badge {\n  position: absolute;\n  right: 4px;\n  bottom: 4px;\n  padding: 1px 6px;\n  border-radius: var(--r-pill);\n  background: color-mix(in srgb, var(--bg) 85%, transparent);\n  color: var(--fg);\n  font-family: var(--mono);\n  font-size: var(--t-meta);\n  line-height: 1.4;\n}\n\n.kp-badge--lock {\n  top: 4px;\n  bottom: auto;\n  color: var(--warn);\n}\n\n.kp-art--sm .kp-badge {\n  right: 1px;\n  bottom: 1px;\n  padding: 0 3px;\n  font-size: 9px;\n}\n\n.kp-art--sm .kp-badge--lock {\n  top: 1px;\n  bottom: auto;\n}\n\n.kp-swap {\n  align-self: center;\n  color: var(--mut);\n  font-size: 18px;\n  text-align: center;\n}\n\n.kp-btn {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  gap: 6px;\n  padding: 6px 10px;\n  border: 1px solid transparent;\n  border-radius: var(--r-md);\n  background: var(--acc);\n  color: #fff;\n  font: 600 var(--t-sm) var(--body);\n  cursor: pointer;\n  transition: background 0.15s, opacity 0.15s;\n}\n\n.kp-btn[hidden] {\n  display: none;\n}\n\n.kp-btn:hover {\n  background: var(--acc2);\n}\n\n.kp-btn--ghost {\n  border-color: var(--line2);\n  background: transparent;\n  color: var(--fg);\n}\n\n.kp-btn--ghost:hover {\n  background: var(--raise);\n}\n\n.kp-btn--warn {\n  background: var(--warn);\n  color: var(--bg);\n}\n\n.kp-btn--double {\n  background: #ff5f1f;\n  color: var(--bg);\n}\n\n.kp-btn--double:hover {\n  background: #ff7a45;\n}\n\n.kp-btn--single {\n  background: var(--gold);\n  color: var(--bg);\n}\n\n.kp-btn--single:hover {\n  background: #ffd84d;\n}\n\n.kp-btn--sm {\n  padding: 4px 8px;\n  font-size: var(--t-meta);\n}\n\n.kp-gain {\n  padding: 1px 6px;\n  border-radius: var(--r-pill);\n  font-family: var(--mono);\n  font-size: var(--t-meta);\n  white-space: nowrap;\n}\n\n.kp-gain--up {\n  background: color-mix(in srgb, var(--ok) 18%, transparent);\n  color: var(--ok);\n}\n\n.kp-gain--down {\n  background: color-mix(in srgb, var(--danger) 18%, transparent);\n  color: var(--danger);\n}\n\n.kp-gain--flat {\n  background: var(--raise);\n  color: var(--mut);\n}\n\n.kp-btn .kp-gain {\n  background: var(--bg);\n}\n\n.kp-board {\n  display: flex;\n  flex-direction: column;\n  gap: var(--s-4);\n}\n\n.kp-board__bar {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: flex-end;\n  justify-content: space-between;\n  gap: var(--s-3);\n}\n\n.kp-board__actions {\n  display: flex;\n  gap: var(--s-2);\n}\n\n.kp-board__list {\n  display: flex;\n  flex-direction: column;\n  gap: var(--s-5);\n}\n\n.kp-group {\n  display: flex;\n  flex-direction: column;\n  gap: var(--s-3);\n}\n\n.kp-group__title {\n  margin: 0;\n  padding-bottom: var(--s-2);\n  border-bottom: 1px solid color-mix(in srgb, var(--kp-rarity) 40%, transparent);\n  color: var(--kp-rarity);\n  font-family: var(--disp);\n  font-size: var(--t-base);\n}\n\n.kp-offer {\n  position: relative;\n  display: grid;\n  grid-template-columns: 132px 24px minmax(0, 1fr);\n  gap: var(--s-4);\n  padding: var(--s-3);\n  border: 1px solid var(--line);\n  border-radius: var(--r-lg);\n  background: var(--panel);\n  transition: opacity 0.15s;\n}\n\n.kp-offer__get,\n.kp-option {\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n  min-width: 0;\n}\n\n.kp-offer__give {\n  display: flex;\n  flex-direction: column;\n  gap: var(--s-2);\n  min-width: 0;\n}\n\n.kp-options {\n  display: grid;\n  grid-template-columns: repeat(5, 112px);\n  justify-content: start;\n  gap: var(--s-3);\n}\n\n.kp-option--missing {\n  opacity: 0.35;\n}\n\n.kp-option .kp-btn {\n  width: 100%;\n  margin-top: auto;\n  padding: 4px 6px;\n  font-size: var(--t-meta);\n}\n\n.kp-hide {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  width: 26px;\n  height: 26px;\n  padding: 0;\n  border: 1px solid var(--line2);\n  border-radius: var(--r-pill);\n  background: var(--panel2);\n  color: var(--mut);\n  cursor: pointer;\n}\n\n.kp-hide:hover {\n  background: var(--raise);\n  color: var(--fg);\n}\n\n.kp-offer > .kp-hide {\n  position: absolute;\n  top: var(--s-2);\n  right: var(--s-2);\n}\n\n.kp-deal .kp-hide {\n  width: 22px;\n  height: 22px;\n  margin-left: auto;\n  font-size: 11px;\n}\n\n.kp-more {\n  align-self: center;\n}\n\n.is-busy {\n  opacity: 0.45;\n  pointer-events: none;\n}\n\n.kp-side {\n  display: flex;\n  flex-direction: column;\n  gap: var(--s-5);\n  height: 100%;\n  overflow-y: auto;\n  padding: var(--s-4);\n  border: 1px solid var(--line);\n  border-radius: var(--r-lg);\n  background: var(--panel);\n}\n\n.kp-side__controls {\n  position: sticky;\n  top: calc(-1 * var(--s-4));\n  z-index: 1;\n  margin: calc(-1 * var(--s-4)) calc(-1 * var(--s-4)) 0;\n  padding: var(--s-3) var(--s-4);\n  border-bottom: 1px solid var(--line);\n  background: var(--panel);\n}\n\n.kp-side__block {\n  display: flex;\n  flex-direction: column;\n  gap: var(--s-3);\n}\n\n.kp-field {\n  display: flex;\n  align-items: center;\n  gap: var(--s-2);\n}\n\n.kp-input {\n  flex: 1;\n  min-width: 0;\n  padding: 6px 10px;\n  border: 1px solid var(--line2);\n  border-radius: var(--r-md);\n  background: var(--bg2);\n  color: var(--fg);\n  font-family: var(--mono);\n}\n\n.kp-input:focus {\n  border-color: var(--acc);\n  outline: none;\n}\n\n.kp-board__search {\n  flex-basis: 100%;\n  max-width: 420px;\n}\n\n.kp-deals {\n  display: flex;\n  flex-direction: column;\n  gap: var(--s-2);\n}\n\n.kp-deal {\n  display: grid;\n  grid-template-columns: 44px auto 44px minmax(0, 1fr);\n  align-items: center;\n  gap: var(--s-2);\n  padding: var(--s-2);\n  border: 1px solid var(--line);\n  border-radius: var(--r-md);\n  background: var(--panel2);\n}\n\n.kp-deal .kp-swap {\n  font-size: 12px;\n}\n\n.kp-deal__info {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n  min-width: 0;\n}\n\n.kp-deal__actions {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: var(--s-2);\n  margin-top: 2px;\n}\n\n.kp-deal.is-new {\n  border-color: var(--acc);\n  box-shadow: 0 0 0 1px var(--acc-soft);\n}\n\n.kp-new {\n  margin-right: 6px;\n  padding: 1px 6px;\n  border-radius: var(--r-pill);\n  background: var(--acc);\n  color: #fff;\n  font-size: var(--t-meta);\n  font-weight: 700;\n}\n\n.kp-auto {\n  padding: var(--s-3);\n  border: 1px solid var(--line2);\n  border-radius: var(--r-md);\n  background: var(--panel2);\n}\n\n.kp-auto__head {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: var(--s-2);\n}\n\n.kp-rules {\n  border-spacing: 4px;\n  margin: 0 -4px;\n}\n\n.kp-rules th {\n  font-weight: 400;\n  text-align: center;\n}\n\n.kp-rules thead th:first-child {\n  max-width: 90px;\n  text-align: left;\n}\n\n.kp-gem {\n  display: inline-grid;\n  place-items: center;\n  width: 22px;\n  height: 22px;\n  border: 2px solid var(--kp-rarity);\n  border-radius: 50%;\n  color: var(--kp-rarity);\n  font: 900 10px var(--body);\n}\n\n.kp-rule {\n  display: block;\n  width: 28px;\n  height: 28px;\n  margin: auto;\n  border: 1px solid var(--line2);\n  border-radius: var(--r-sm, 6px);\n  background: transparent;\n  cursor: pointer;\n}\n\n.kp-rule:hover {\n  border-color: var(--kp-rarity);\n}\n\n.kp-rule[aria-pressed='true'] {\n  border-color: var(--kp-rarity);\n  background: var(--kp-rarity);\n  box-shadow: 0 0 10px color-mix(in srgb, var(--kp-rarity) 50%, transparent);\n}\n\n.kp-side__tabs {\n  display: flex;\n  gap: var(--s-2);\n}\n\n.kp-side__view {\n  display: flex;\n  flex-direction: column;\n  gap: var(--s-5);\n}\n\n.kp-side__view[hidden] {\n  display: none;\n}\n\n/* A dot on the Auto-accept tab while it runs, so it stays visible from the Offres tab. */\n.kp-side__tabs .kp-chip.is-live::after {\n  content: '';\n  display: inline-block;\n  width: 7px;\n  height: 7px;\n  margin-left: 6px;\n  border-radius: 50%;\n  background: var(--ok);\n  box-shadow: 0 0 6px var(--ok);\n  vertical-align: middle;\n}\n\n.kp-auto__head .kp-btn:disabled {\n  cursor: not-allowed;\n}\n\n.kp-auto > .kp-chip {\n  align-self: flex-start;\n}\n\n.kp-toasts {\n  position: fixed;\n  right: 16px;\n  bottom: 16px;\n  z-index: 2147483647;\n  display: flex;\n  flex-direction: column;\n  gap: var(--s-2);\n}\n\n.kp-toast {\n  max-width: 360px;\n  padding: 10px 14px;\n  border: 1px solid var(--line2);\n  border-radius: var(--r-md);\n  background: var(--raise);\n  box-shadow: var(--sh-1);\n  color: var(--fg);\n  font-size: var(--t-sm);\n}\n\n.kp-toast--success {\n  border-color: var(--ok);\n}\n\n.kp-toast--error {\n  border-color: var(--danger);\n}\n\n.kp-replaced {\n  display: none !important;\n}\n\n.tcg.kp-ghost {\n  filter: saturate(0.45) brightness(0.8);\n}\n\n.tcg.kp-ghost .art img {\n  filter: grayscale(1) brightness(0.7);\n}\n\n.kp-filtered-out {\n  display: none !important;\n}\n\n.kp-album-filters {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: center;\n  gap: var(--s-3);\n  margin: var(--s-3) 0;\n}\n\n.kp-input--short {\n  flex: 0 0 72px;\n  width: 72px;\n}\n\n.kp-gem-chip {\n  display: inline-grid;\n  place-items: center;\n  width: 26px;\n  height: 26px;\n  padding: 0;\n  border: 2px solid var(--kp-rarity);\n  border-radius: 50%;\n  background: transparent;\n  color: var(--kp-rarity);\n  font: 900 11px var(--body);\n  cursor: pointer;\n}\n\n.kp-gem-chip[aria-pressed='true'] {\n  background: var(--kp-rarity);\n  box-shadow: 0 0 12px color-mix(in srgb, var(--kp-rarity) 60%, transparent);\n  color: var(--bg);\n}\n\n.kp-btn:disabled {\n  opacity: 0.5;\n  cursor: progress;\n}\n\n.kp-lock-host {\n  position: relative;\n}\n\n.kp-lock-host .pin {\n  display: none !important;\n}\n\n.kp-lock {\n  position: absolute;\n  top: 2px;\n  left: 0;\n  z-index: 6;\n  display: grid;\n  place-items: center;\n  width: 30px;\n  height: 30px;\n  padding: 0;\n  border: 1px solid var(--line2);\n  border-radius: 50%;\n  background: var(--panel2);\n  color: var(--dim);\n  font-size: 13px;\n  cursor: pointer;\n  opacity: 0;\n  transition: opacity 0.15s, color 0.15s;\n}\n\n.kp-lock-host:hover .kp-lock,\n.kp-lock.is-locked,\n.kp-lock:focus-visible {\n  opacity: 1;\n}\n\n.kp-lock.is-locked {\n  color: var(--warn);\n}\n\n.kp-lock:hover {\n  color: var(--fg);\n}\n\n.kp-pick-host {\n  position: relative;\n}\n\n.kp-pick {\n  position: absolute;\n  top: 2px;\n  left: 34px;\n  z-index: 6;\n  display: grid;\n  place-items: center;\n  min-width: 30px;\n  height: 30px;\n  padding: 0 6px;\n  border: 1px solid var(--line2);\n  border-radius: var(--r-pill);\n  background: var(--panel2);\n  color: var(--dim);\n  font: 700 12px var(--mono);\n  cursor: pointer;\n  opacity: 0;\n  transition: opacity 0.15s, color 0.15s;\n}\n\n.kp-pick-host:hover .kp-pick,\n.kp-pick.is-picked,\n.kp-pick:focus-visible {\n  opacity: 1;\n}\n\n.kp-pick:hover {\n  color: var(--fg);\n}\n\n.kp-pick.is-picked {\n  border-color: var(--acc);\n  background: var(--acc);\n  color: #fff;\n}\n\n.kp-picked .slot {\n  outline: 2px solid var(--acc);\n  outline-offset: 2px;\n  border-radius: var(--r-md);\n}\n\n.kp-pick-bar {\n  position: fixed;\n  bottom: 16px;\n  left: 50%;\n  z-index: 1000;\n  display: flex;\n  align-items: center;\n  gap: var(--s-3);\n  padding: 8px 8px 8px 16px;\n  border: 1px solid var(--acc);\n  border-radius: var(--r-pill);\n  background: var(--raise);\n  box-shadow: var(--sh-1);\n  color: var(--fg);\n  font-size: var(--t-sm);\n  transform: translateX(-50%);\n}\n\n.kp-pick-bar[hidden] {\n  display: none;\n}\n\n.kp-fair {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n  padding: var(--s-2) var(--s-3);\n  border: 1px solid var(--line2);\n  border-radius: var(--r-md);\n  background: var(--panel2);\n  font-size: var(--t-sm);\n}\n\n.kp-releases {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n  margin: 0;\n  padding: 0;\n  list-style: none;\n  font-size: var(--t-meta);\n}\n\n.kp-release__time {\n  display: inline-block;\n  min-width: 82px;\n  color: var(--fg2);\n  font-family: var(--mono);\n}\n\n\n.kp-pc__completion {\n  font-weight: 600;\n}\n\n.kp-lock:disabled {\n  cursor: progress;\n}\n\nbody[data-kp-trades-tab] main [role='tabpanel'] > h2[data-kp-section],\nbody[data-kp-trades-tab='board'] main [data-kp-section]:not([data-kp-section='board']),\nbody[data-kp-trades-tab='received'] main [data-kp-section]:not([data-kp-section='received']),\nbody[data-kp-trades-tab='sent'] main [data-kp-section]:not([data-kp-section='sent']) {\n  display: none !important;\n}\n\n.kp-trade-tabs {\n  margin: var(--s-3) 0;\n}\n\n.kp-trade-host > .compact,\n.kp-trade-host > .trays,\n.kp-trade-host > .verdict,\n.kp-trade-host > .more,\n.kp-trade-host > .sides {\n  display: none !important;\n}\n\n.kp-badge--new {\n  color: var(--ok);\n}\n\n[data-kp-section='board'] .kp-trade-host {\n  text-align: center;\n}\n\n[data-kp-section='board'] .kp-trade-host > .th {\n  justify-content: center;\n  gap: var(--s-2);\n}\n\nbody[data-kp-trades-tab] main [role='tabpanel'] ul.trades[data-kp-section='board'] {\n  display: grid;\n  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));\n  align-items: start;\n  gap: var(--s-3);\n}\n\n.kp-trade {\n  display: grid;\n  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);\n  align-items: start;\n  gap: var(--s-2);\n  margin: var(--s-2) 0;\n}\n\n.kp-trade > .kp-swap {\n  align-self: center;\n  color: var(--acc);\n  font-size: 14px;\n}\n\n.kp-trade__side {\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  gap: var(--s-2);\n  min-width: 0;\n}\n\n.kp-trade__cards {\n  display: flex;\n  flex-wrap: wrap;\n  justify-content: center;\n  gap: var(--s-2);\n}\n\n.kp-tcard {\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  gap: 2px;\n  width: 92px;\n  min-width: 0;\n}\n\n.kp-tcard .kp-name {\n  max-width: 100%;\n}\n\n.kp-trade__cards:has(> .kp-tcard:nth-child(2)) .kp-tcard {\n  width: 60px;\n}\n\n.kp-trade__total {\n  color: var(--mut);\n}\n\n.kp-trade__net {\n  grid-column: 1 / -1;\n  justify-self: center;\n  font-family: var(--mono);\n  font-size: var(--t-base);\n  font-weight: 700;\n}\n\n.kp-trade__net--up {\n  color: var(--ok);\n}\n\n.kp-trade__net--down {\n  color: var(--danger);\n}\n\n.kp-trade__net--flat {\n  color: var(--mut);\n}\n\n.kp-trade--wide {\n  display: grid;\n  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);\n  align-items: stretch;\n  gap: var(--s-3);\n}\n\n.kp-trade--wide > .kp-swap {\n  align-self: center;\n  color: var(--acc);\n}\n\n.kp-trade__summary {\n  display: inline-flex;\n  align-items: center;\n  gap: var(--s-3);\n  margin-left: auto;\n  margin-right: var(--s-2);\n}\n\n.kp-pill {\n  padding: 2px 10px;\n  border: 1px solid currentColor;\n  border-radius: var(--r-pill);\n  font-family: var(--mono);\n  font-size: var(--t-sm);\n  font-weight: 700;\n}\n\n.kp-pill--up {\n  color: var(--ok);\n}\n\n.kp-pill--down {\n  color: var(--danger);\n}\n\n.kp-pill--flat {\n  color: var(--mut);\n}\n\n.kp-trade__box {\n  container-type: inline-size;\n  display: flex;\n  flex-direction: column;\n  gap: var(--s-2);\n  padding: var(--s-2) var(--s-3) var(--s-3);\n  border: 1px solid var(--line);\n  border-radius: var(--r-lg);\n  background: var(--panel2);\n}\n\n.kp-trade__box-head {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: center;\n  gap: var(--s-1) var(--s-3);\n}\n\n.kp-trade__box-total {\n  margin-left: auto;\n}\n\n.kp-trade__grid {\n  display: grid;\n  grid-template-columns: repeat(10, minmax(0, 1fr));\n  gap: 6px;\n}\n\n@container (max-width: 480px) {\n  .kp-trade__grid {\n    grid-template-columns: repeat(5, minmax(0, 1fr));\n  }\n}\n\n.kp-trade__grid .kp-tcard {\n  width: auto;\n}\n\n.kp-trade__box .kp-badge {\n  right: 2px;\n  bottom: 2px;\n  padding: 0 4px;\n  font-size: 9px;\n}\n\n.kp-trade__note {\n  font-size: var(--t-meta);\n  font-weight: 600;\n}\n\n.kp-trade__note--warn {\n  color: var(--warn);\n}\n\n.kp-trade__note--new {\n  color: var(--ok);\n}\n\n.kp-trade__note--muted {\n  color: var(--fg2);\n}\n\n.kp-trade-host .tact .talk {\n  display: none !important;\n}\n\n.kp-trade-host .tact:not(:has(> :not(.talk))) {\n  display: none !important;\n}\n\n.kp-talk {\n  display: inline-grid;\n  place-items: center;\n  width: 22px;\n  height: 22px;\n  margin-left: 6px;\n  padding: 0;\n  border: none;\n  border-radius: 50%;\n  background: transparent;\n  color: var(--mut);\n  font-size: 13px;\n  vertical-align: middle;\n  cursor: pointer;\n}\n\n.kp-talk:hover {\n  background: var(--raise);\n  color: var(--fg);\n}\n\n.kp-count-host {\n  container-type: inline-size;\n}\n\n/* The tile image spans the tile width with a 5:7 ratio, so its bottom edge sits at 140% of that width. */\n.kp-count {\n  position: absolute;\n  top: calc(140cqw - 22px);\n  right: 5px;\n  padding: 0 6px;\n  border-radius: var(--r-pill);\n  background: #0a090ed9;\n  color: var(--fg2);\n  font: 700 11px var(--mono);\n  line-height: 18px;\n  pointer-events: none;\n}\n\n.kp-count--dupe {\n  color: var(--ok);\n}\n\n.kp-site-only {\n  display: none !important;\n}\n\n.kp-native-hidden {\n  display: none !important;\n}\n\nbody.kp-modal-open {\n  overflow: hidden;\n}\n\n.kp-modal {\n  position: fixed;\n  inset: 0;\n  z-index: 1000;\n  display: grid;\n  place-items: center;\n  padding: var(--s-4);\n  background: color-mix(in srgb, var(--bg) 70%, transparent);\n  backdrop-filter: blur(4px);\n}\n\n.kp-pc {\n  display: flex;\n  flex-direction: column;\n  width: min(1200px, 100%);\n  height: min(900px, 100%);\n  overflow: hidden;\n  border: 1px solid var(--line2);\n  border-radius: var(--r-lg);\n  background: var(--panel);\n  box-shadow: var(--sh-1);\n}\n\n.kp-pc__head {\n  display: flex;\n  align-items: center;\n  gap: var(--s-3);\n  padding: var(--s-3) var(--s-4);\n  border-bottom: 1px solid var(--line);\n}\n\n.kp-pc__close {\n  margin-left: auto;\n}\n\n.kp-pc__filters {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: center;\n  gap: var(--s-2) var(--s-3);\n  padding: var(--s-3) var(--s-4);\n  border-bottom: 1px solid var(--line);\n}\n\n.kp-pc__filters .kp-input {\n  flex: 0 1 200px;\n}\n\n.kp-pc__body {\n  flex: 1;\n  overflow-y: auto;\n  padding: var(--s-4);\n}\n\n.kp-pc__grid {\n  display: grid;\n  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));\n  gap: var(--s-3);\n}\n\n.kp-pc__grid .kp-empty {\n  grid-column: 1 / -1;\n}\n\n.kp-pc__sentinel {\n  height: 1px;\n}\n\n.kp-pcard {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n  min-width: 0;\n}\n\n.kp-badge--dupe {\n  color: var(--ok);\n}\n\n.kp-badge--corner {\n  top: 4px;\n  right: auto;\n  bottom: auto;\n  left: 4px;\n}\n\n.kp-pc__total {\n  padding: 2px 10px;\n  border: 1px solid var(--line2);\n  border-radius: var(--r-pill);\n  color: var(--fg);\n  font: 700 var(--t-sm) var(--mono);\n}\n\n.kp-friend-search {\n  display: block;\n  width: 100%;\n  max-width: 880px;\n  margin-bottom: var(--s-3);\n}\n\nbody.kp-friends main ul.people {\n  display: flex;\n  flex-direction: column;\n}\n\nbody.kp-friends main ul.people > li.kp-pinned {\n  order: -1;\n  box-shadow: inset 3px 0 0 var(--gold);\n}\n\n.kp-pin,\n.kp-friend-act {\n  display: inline-flex !important;\n  flex: none;\n  align-items: center;\n  justify-content: center;\n  gap: 0 !important;\n  box-sizing: border-box;\n  width: 32px;\n  height: 32px;\n  min-width: 0 !important;\n  min-height: 0 !important;\n  margin: 0 !important;\n  padding: 0 !important;\n  line-height: 0 !important;\n  vertical-align: middle;\n  border: 1px solid var(--line2) !important;\n  border-radius: 50% !important;\n  background: var(--panel2) !important;\n  color: var(--mut) !important;\n  font-size: 0 !important;\n  text-decoration: none !important;\n  cursor: pointer;\n  transition: color 0.15s, background 0.15s;\n}\n\n.kp-pin i,\n.kp-friend-act i {\n  width: 1.25em;\n  font-size: 13px;\n  line-height: 1;\n  text-align: center;\n}\n\n.kp-pin:hover,\n.kp-friend-act:hover {\n  background: var(--raise) !important;\n  color: var(--fg) !important;\n}\n\n.kp-friend-act[data-kp-icon='Retirer']:hover,\n.kp-friend-act[data-kp-icon='Bloquer']:hover {\n  color: var(--danger) !important;\n}\n\n.kp-pin.is-pinned {\n  border-color: var(--gold) !important;\n  color: var(--gold) !important;\n}\n\n.kp-pin.is-pinned i {\n  transform: rotate(-45deg);\n}\n\n.kp-friend-act--confirm {\n  gap: 6px !important;\n  width: auto;\n  padding: 0 12px !important;\n  border-color: var(--danger) !important;\n  border-radius: var(--r-pill) !important;\n  color: var(--danger) !important;\n  font-size: var(--t-sm) !important;\n  line-height: 1 !important;\n}\n\n.kp-series-collapsed > ul.quests {\n  display: none !important;\n}\n\n.kp-series-toggle {\n  display: inline-flex;\n  align-items: center;\n  gap: var(--s-2);\n  margin-left: auto;\n  padding: 4px 12px;\n  border: 1px solid var(--line2);\n  border-radius: var(--r-pill);\n  background: var(--panel2);\n  color: var(--fg2);\n  font: 600 var(--t-sm) var(--body);\n  cursor: pointer;\n}\n\n.kp-series-toggle:hover {\n  background: var(--raise);\n  color: var(--fg);\n}\n\n.kp-series-summary.has-claim {\n  color: var(--ok);\n}\n\n.kp-series-chevron {\n  display: inline-flex;\n  font-size: 11px;\n  transition: transform 0.15s;\n}\n\n.kp-series-toggle[aria-expanded='true'] .kp-series-chevron {\n  transform: rotate(180deg);\n}\n\nhtml:has(body.kp-video-bg),\nbody.kp-video-bg,\nbody.kp-video-bg main section.band,\nbody.kp-video-bg main .box.coll {\n  background: transparent !important;\n}\n\n.kp-bg-video {\n  position: fixed;\n  inset: 0;\n  z-index: -1;\n  width: 100vw;\n  height: 100vh;\n  object-fit: cover;\n  filter: brightness(0.45);\n  pointer-events: none;\n}\n\n.kp-filters__rarities {\n  margin-left: auto;\n}\n";
 
   // src/main.js
-  var features = [market_counter_default, market_offers_default, market_trades_default, collection_ghosts_default, collection_albums_default, collection_locks_default, trade_dialog_default, profile_collection_default, friends_list_default, missions_series_default, profile_background_default, offer_dialog_default];
+  var features = [
+    market_counter_default,
+    market_offers_default,
+    market_trades_default,
+    collection_ghosts_default,
+    collection_albums_default,
+    collection_locks_default,
+    collection_order_default,
+    collection_select_default,
+    trade_dialog_default,
+    profile_collection_default,
+    friends_list_default,
+    missions_series_default,
+    profile_background_default,
+    offer_dialog_default
+  ];
   var mounted = /* @__PURE__ */ new Map();
   function syncFeatures() {
     const url = new URL(location.href);
