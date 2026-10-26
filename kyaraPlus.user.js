@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Plus
 // @namespace    https://github.com/Mxyuki/Kyara-Script
-// @version      2.25.2
+// @version      2.26.0
 // @description  Améliore kyara.games : rareté et exemplaires possédés sur les offres d’échange, bouton « Donner » sous chaque carte, wishlist en premier, offres cachées par le site, verrouillage depuis la collection, comptoir masquable, offres bangers et rentables en direct, auto-accept par rareté ou par gain.
 // @author       Myuki
 // @homepageURL  https://github.com/Mxyuki/Kyara-Script
@@ -724,87 +724,6 @@
     };
   }
 
-  // src/lib/card-order.js
-  var nameCollator = new Intl.Collator("fr");
-  function compareCards(a, b) {
-    return rarityRank(a.card.rarity) - rarityRank(b.card.rarity) || (b.price ?? -1) - (a.price ?? -1) || nameCollator.compare(a.card.name, b.card.name);
-  }
-  function orderElements(items) {
-    [...items].sort(compareCards).forEach((item, index) => {
-      const order = String(index);
-      if (item.element.style.order !== order) item.element.style.order = order;
-    });
-  }
-  function clearOrder(elements) {
-    for (const element of elements) element.style.removeProperty("order");
-  }
-  function createSettledSorter(recheck) {
-    let signature = "";
-    let changedAt = 0;
-    let timer = 0;
-    return {
-      apply(items, pricesReady) {
-        const current = items.map((item) => item.card.id).join(",");
-        if (current !== signature) {
-          signature = current;
-          changedAt = Date.now();
-          clearOrder(items.map((item) => item.element));
-          clearTimeout(timer);
-          timer = setTimeout(recheck, config_default.sorting.settleMs);
-          return;
-        }
-        if (pricesReady && Date.now() - changedAt >= config_default.sorting.settleMs) orderElements(items);
-      },
-      stop: () => clearTimeout(timer)
-    };
-  }
-
-  // src/features/collection-order.js
-  var CARD_CELL2 = "main .grid > .cell";
-  var collection_order_default = {
-    id: "collection-order",
-    matches: (url) => url.pathname === "/collection",
-    mount() {
-      let catalog = null;
-      let frame = 0;
-      let pricesFailed = false;
-      const sorter = createSettledSorter(() => schedule());
-      const requestPrices = createPriceRequester(
-        () => schedule(),
-        (error) => {
-          pricesFailed = true;
-          schedule();
-          toast(describeError(error), "error");
-        }
-      );
-      function decorate2() {
-        const items = [...document.querySelectorAll(CARD_CELL2)].map((cell) => ({ element: cell, card: catalog.get(cardIdFromLink(cell.querySelector("a.slot"))) })).filter((item) => item.card);
-        requestPrices(items.map((item) => item.card.id));
-        const ready = pricesFailed || items.every((item) => isPriceLoaded(item.card.id));
-        sorter.apply(items.map((item) => ({ ...item, price: priceOf(item.card.id) })), ready);
-      }
-      function schedule() {
-        if (!catalog || frame) return;
-        frame = requestAnimationFrame(() => {
-          frame = 0;
-          decorate2();
-        });
-      }
-      const observer = new MutationObserver(schedule);
-      observer.observe(document.body, { childList: true, subtree: true });
-      loadCatalog().then((loaded) => {
-        catalog = loaded;
-        schedule();
-      }).catch((error) => toast(describeError(error), "error"));
-      return () => {
-        observer.disconnect();
-        cancelAnimationFrame(frame);
-        sorter.stop();
-        clearOrder(document.querySelectorAll(CARD_CELL2));
-      };
-    }
-  };
-
   // src/lib/format.js
   var numberFormat = new Intl.NumberFormat("fr-FR");
   var formatNumber = (value) => numberFormat.format(value);
@@ -851,7 +770,7 @@ Continuer ?`);
   }
 
   // src/features/collection-select.js
-  var CARD_CELL3 = "main .cell";
+  var CARD_CELL2 = "main .cell";
   function renderPick(button, count) {
     if (button.dataset.count === String(count)) return;
     button.dataset.count = String(count);
@@ -968,7 +887,7 @@ Continuer ?`);
         if (!collection || frame) return;
         frame = requestAnimationFrame(() => {
           frame = 0;
-          document.querySelectorAll(CARD_CELL3).forEach(decorateCell);
+          document.querySelectorAll(CARD_CELL2).forEach(decorateCell);
         });
       }
       const observer = new MutationObserver(schedule);
@@ -1592,6 +1511,41 @@ Continuer ?`);
       };
     }
   };
+
+  // src/lib/card-order.js
+  var nameCollator = new Intl.Collator("fr");
+  function compareCards(a, b) {
+    return rarityRank(a.card.rarity) - rarityRank(b.card.rarity) || (b.price ?? -1) - (a.price ?? -1) || nameCollator.compare(a.card.name, b.card.name);
+  }
+  function orderElements(items) {
+    [...items].sort(compareCards).forEach((item, index) => {
+      const order = String(index);
+      if (item.element.style.order !== order) item.element.style.order = order;
+    });
+  }
+  function clearOrder(elements) {
+    for (const element of elements) element.style.removeProperty("order");
+  }
+  function createSettledSorter(recheck) {
+    let signature = "";
+    let changedAt = 0;
+    let timer = 0;
+    return {
+      apply(items, pricesReady) {
+        const current = items.map((item) => item.card.id).join(",");
+        if (current !== signature) {
+          signature = current;
+          changedAt = Date.now();
+          clearOrder(items.map((item) => item.element));
+          clearTimeout(timer);
+          timer = setTimeout(recheck, config_default.sorting.settleMs);
+          return;
+        }
+        if (pricesReady && Date.now() - changedAt >= config_default.sorting.settleMs) orderElements(items);
+      },
+      stop: () => clearTimeout(timer)
+    };
+  }
 
   // src/features/shelf-tiles.js
   var tileCardId = (tile) => Number(tile.querySelector("img")?.getAttribute("src")?.match(/\/cards\/\w+\/(\d+)\./)?.[1]);
@@ -3129,7 +3083,6 @@ ${lines.join("\n")}`;
     collection_ghosts_default,
     collection_albums_default,
     collection_locks_default,
-    collection_order_default,
     collection_select_default,
     trade_dialog_default,
     profile_collection_default,
