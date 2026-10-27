@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Plus
 // @namespace    https://github.com/Mxyuki/Kyara-Script
-// @version      2.26.1
+// @version      2.26.2
 // @description  Améliore kyara.games : rareté et exemplaires possédés sur les offres d’échange, bouton « Donner » sous chaque carte, wishlist en premier, offres cachées par le site, verrouillage depuis la collection, comptoir masquable, offres bangers et rentables en direct, auto-accept par rareté ou par gain.
 // @author       Myuki
 // @homepageURL  https://github.com/Mxyuki/Kyara-Script
@@ -115,7 +115,7 @@
     },
     profileBackground: {
       userId: "2766a197-9905-4dd8-8583-a0ec324d5ec7",
-      video: "https://files.catbox.moe/3ze1ly.mp4",
+      video: "https://files.catbox.moe/aoucj6.webm",
       volume: 0.15
     },
     tradeLab: {
