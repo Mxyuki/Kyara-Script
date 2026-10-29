@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Plus
 // @namespace    https://github.com/Mxyuki/Kyara-Script
-// @version      2.29.1
+// @version      2.31.0
 // @description  Améliore kyara.games : rareté et exemplaires possédés sur les offres d’échange, bouton « Donner » sous chaque carte, wishlist en premier, offres cachées par le site, verrouillage depuis la collection, comptoir masquable, offres bangers et rentables en direct, auto-accept par rareté ou par gain.
 // @author       Myuki
 // @homepageURL  https://github.com/Mxyuki/Kyara-Script
@@ -15,40 +15,6 @@
 // ==/UserScript==
 
 (() => {
-  // src/api/errors.js
-  var ErrorCode = {
-    NETWORK: "network",
-    PASS_REQUIRED: "pass_required",
-    QUEUED: "queued",
-    GIFT_LIMIT: "gift_limit"
-  };
-  var ApiError = class extends Error {
-    constructor(status, code, message) {
-      super(message ?? code);
-      this.name = "ApiError";
-      this.status = status;
-      this.code = code;
-    }
-  };
-  var CODE_MESSAGES = {
-    [ErrorCode.NETWORK]: "Serveur injoignable.",
-    [ErrorCode.PASS_REQUIRED]: "Le site demande une vérification : désactive Kyara Plus, fais un échange sur le site, puis réessaie."
-  };
-  var STATUS_MESSAGES = {
-    401: "Session expirée : recharge la page.",
-    402: "Pas assez de chakra.",
-    404: "Introuvable : l’offre a sans doute déjà été prise.",
-    429: "Trop de requêtes, patiente quelques secondes.",
-    503: "Le serveur est surchargé, réessaie dans un instant."
-  };
-  function describeError(error) {
-    if (!(error instanceof ApiError)) return "Erreur inattendue.";
-    const serverMessage = error.message !== error.code ? error.message : null;
-    return CODE_MESSAGES[error.code] ?? serverMessage ?? STATUS_MESSAGES[error.status] ?? `Erreur ${error.status} (${error.code}).`;
-  }
-  var isGiftLimit = (error) => error instanceof ApiError && error.code === ErrorCode.GIFT_LIMIT;
-  var isGone = (error) => error instanceof ApiError && ([404, 410].includes(error.status) || error.status === 409 && !isGiftLimit(error));
-
   // src/config.js
   var config_default = {
     api: {
@@ -105,6 +71,23 @@
       // the site keeps retrying a failed open for 2 minutes with the same request
       overrideMs: 12e4
     },
+    autoOpen: {
+      defaultBatch: [3, 10],
+      // just under the 10 min it takes a free pack to come back, so the wait never skips a whole pack
+      defaultDelayMs: [1e4, 59e4],
+      maxDelayMs: 3599e3,
+      wakeSliceMs: 1e3,
+      // the free-pack count is predicted from nextFreeAt; this re-reads it now and then (multiplied by x-kyara-rush)
+      resyncMs: 15 * 6e4,
+      // when the server reports fewer packs than predicted (clock difference, packs used elsewhere)
+      recheckMs: 3e4,
+      gapMs: 1500,
+      jitterMs: 1e3,
+      maxFailures: 3,
+      backoffMs: 6e4,
+      uiTickMs: 1e3,
+      logLimit: 8
+    },
     prices: {
       batchSize: 300,
       ttlMs: 10 * 6e4
@@ -142,6 +125,41 @@
   var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   var jitter = (maxMs) => Math.random() * maxMs;
 
+  // src/api/errors.js
+  var ErrorCode = {
+    NETWORK: "network",
+    PASS_REQUIRED: "pass_required",
+    QUEUED: "queued",
+    GIFT_LIMIT: "gift_limit"
+  };
+  var ApiError = class extends Error {
+    constructor(status, code, message) {
+      super(message ?? code);
+      this.name = "ApiError";
+      this.status = status;
+      this.code = code;
+    }
+  };
+  var CODE_MESSAGES = {
+    [ErrorCode.NETWORK]: "Serveur injoignable.",
+    [ErrorCode.PASS_REQUIRED]: "Le site demande une vérification : désactive Kyara Plus, fais un échange sur le site, puis réessaie."
+  };
+  var STATUS_MESSAGES = {
+    401: "Session expirée : recharge la page.",
+    402: "Pas assez de chakra.",
+    404: "Introuvable : l’offre a sans doute déjà été prise.",
+    429: "Trop de requêtes, patiente quelques secondes.",
+    503: "Le serveur est surchargé, réessaie dans un instant."
+  };
+  function describeError(error) {
+    if (!(error instanceof ApiError)) return "Erreur inattendue.";
+    const serverMessage = error.message !== error.code ? error.message : null;
+    return CODE_MESSAGES[error.code] ?? serverMessage ?? STATUS_MESSAGES[error.status] ?? `Erreur ${error.status} (${error.code}).`;
+  }
+  var isGiftLimit = (error) => error instanceof ApiError && error.code === ErrorCode.GIFT_LIMIT;
+  var isGone = (error) => error instanceof ApiError && ([404, 410].includes(error.status) || error.status === 409 && !isGiftLimit(error));
+  var isTransient = (error) => error instanceof ApiError && (error.status === 0 || error.status === 429 || error.status >= 500);
+
   // src/api/client.js
   var RETRYABLE_STATUS = /* @__PURE__ */ new Set([429, 503]);
   var rushFactor = 1;
@@ -167,8 +185,8 @@
       return null;
     }
   }
-  function buildHeaders({ hasBody, withPass }) {
-    const headers = { "x-device-id": localStorage.getItem("kyara_device") ?? "" };
+  function buildHeaders({ hasBody, withPass, extra }) {
+    const headers = { ...extra, "x-device-id": localStorage.getItem("kyara_device") ?? "" };
     const token = localStorage.getItem("kyara_token");
     const pass = withPass ? readPass() : null;
     if (token) headers.authorization = `Bearer ${token}`;
@@ -176,21 +194,21 @@
     if (pass) headers["x-pass"] = pass;
     return headers;
   }
-  async function send(path, { method, body, withPass }) {
+  async function send(path, { method, body, withPass, headers }) {
     await waitForTurn();
     try {
       return await fetch(`/api${path}`, {
         method,
-        headers: buildHeaders({ hasBody: body !== void 0, withPass }),
+        headers: buildHeaders({ hasBody: body !== void 0, withPass, extra: headers }),
         body: body === void 0 ? void 0 : JSON.stringify(body)
       });
     } catch {
       throw new ApiError(0, ErrorCode.NETWORK);
     }
   }
-  async function request(path, { method = "GET", body, withPass = false } = {}) {
+  async function request(path, { method = "GET", body, withPass = false, headers } = {}) {
     for (let attempt = 0; ; attempt++) {
-      const response = await send(path, { method, body, withPass });
+      const response = await send(path, { method, body, withPass, headers });
       rushFactor = Number(response.headers.get("x-kyara-rush")) || 1;
       const data = await response.json().catch(() => null);
       if (response.ok) return data;
@@ -216,8 +234,18 @@
   var meApi = {
     bootstrap: () => request("/me/bootstrap")
   };
+  var configApi = {
+    get: () => request("/config")
+  };
   var packsApi = {
-    list: () => request("/packs")
+    list: () => request("/packs"),
+    // The request id is the server's idempotency key: a retry with the same id cannot open the packs twice.
+    openMany: (packId, { count, maxChakra, requestId }) => request(`/packs/${encodeURIComponent(packId)}/open-many`, {
+      method: "POST",
+      body: { count, maxChakra },
+      withPass: true,
+      headers: { "x-request-id": requestId }
+    })
   };
   var collectionApi = {
     mine: () => request("/me/collection?lean=1"),
@@ -251,35 +279,37 @@
     })
   };
 
-  // src/data/catalog.js
-  var pending = null;
-  function loadCatalog() {
-    pending ??= catalogApi.characters().then((characters) => new Map(characters.map((character) => [character.id, character]))).catch((error) => {
-      pending = null;
-      throw error;
-    });
-    return pending;
-  }
-
-  // src/data/collection.js
-  var GiveStatus = {
-    AVAILABLE: "available",
-    PINNED: "pinned",
-    BLOCKED: "blocked",
-    MISSING: "missing"
+  // src/lib/rarity.js
+  var RARITIES = ["M", "L", "E", "R", "U", "C"];
+  var RARITY_LABELS = {
+    M: "Mythique",
+    L: "Légendaire",
+    E: "Épique",
+    R: "Rare",
+    U: "Peu commune",
+    C: "Commune"
   };
-  async function loadCollection() {
-    const entries = await collectionApi.mine();
-    return new Map(entries.map((entry) => [entry.characterId, entry]));
+  function rarityRank(rarity) {
+    const index = RARITIES.indexOf(rarity);
+    return index === -1 ? RARITIES.length : index;
   }
-  function giveStatus(entry) {
-    if (!entry || entry.qty <= 0) return GiveStatus.MISSING;
-    if ((entry.listable ?? 0) > 0) return GiveStatus.AVAILABLE;
-    const freeOnceUnpinned = entry.qty - (entry.locked ?? 0) - (entry.resaleLocked ?? 0) > 0;
-    return entry.pinned && freeOnceUnpinned ? GiveStatus.PINNED : GiveStatus.BLOCKED;
+  var rarityColor = (rarity) => `var(--${rarity}, var(--line3))`;
+
+  // src/data/packs.js
+  var usesFreePacks = (pack) => pack.usesFreePacks ?? pack.price === 0;
+  function freeOpensLeft(pack, me) {
+    if (!pack || !me) return 0;
+    const granted = me.grants?.[pack.id] ?? 0;
+    return granted + (usesFreePacks(pack) ? (me.freePacks ?? 0) + (me.bonusPacks ?? 0) : 0);
   }
-  var recyclableCopies = (entry) => entry && !entry.pinned ? Math.max(0, entry.qty - (entry.locked ?? 0) - 1) : 0;
-  var unpinCard = (characterId) => collectionApi.setPinned(characterId, false);
+  var withFreeCount = (body, count) => JSON.stringify({ ...JSON.parse(body), count, maxChakra: 0 });
+  var newRequestId = () => crypto.randomUUID().replace(/-/g, "");
+  var pulledCards = (results) => results.flatMap((result) => result.cards ?? []);
+  function countByRarity(cards) {
+    const counts = new Map(RARITIES.map((rarity) => [rarity, 0]));
+    for (const card of cards) counts.set(card.rarity, (counts.get(card.rarity) ?? 0) + 1);
+    return [...counts].filter(([, count]) => count > 0);
+  }
 
   // src/lib/dom.js
   function h(tag, props = {}, ...children) {
@@ -314,35 +344,28 @@
     document.head.append(h("style", { "data-kyara-plus": "" }, css));
   }
 
-  // src/lib/rarity.js
-  var RARITIES = ["M", "L", "E", "R", "U", "C"];
-  var RARITY_LABELS = {
-    M: "Mythique",
-    L: "Légendaire",
-    E: "Épique",
-    R: "Rare",
-    U: "Peu commune",
-    C: "Commune"
-  };
-  function rarityRank(rarity) {
-    const index = RARITIES.indexOf(rarity);
-    return index === -1 ? RARITIES.length : index;
+  // src/lib/store.js
+  function createStore(initialState3) {
+    const state = { ...initialState3 };
+    const listeners = /* @__PURE__ */ new Set();
+    return {
+      get: () => state,
+      set(patch) {
+        Object.assign(state, patch);
+        for (const listener of listeners) listener(state);
+      },
+      subscribe(listener) {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      }
+    };
   }
-  var rarityColor = (rarity) => `var(--${rarity}, var(--line3))`;
 
-  // src/lib/settings.js
-  var STORAGE_KEY = "kyara-plus:settings";
-  function readAll() {
-    try {
-      return JSON.parse(localStorage.getItem(STORAGE_KEY)) ?? {};
-    } catch {
-      return {};
-    }
-  }
-  var readSetting = (name, fallback) => readAll()[name] ?? fallback;
-  function writeSetting(name, value) {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...readAll(), [name]: value }));
-  }
+  // src/lib/site.js
+  var profileIdFromPath = () => location.pathname.match(/^\/profil\/([^/]+)/)?.[1];
+  var cardIdFromLink = (link) => Number(link?.getAttribute("href")?.match(/\/wiki\/(\d+)/)?.[1]);
+  var cardImageUrl = (cardId) => `/cards/sm/${cardId}.webp`;
+  var packIdFromPath = () => location.pathname.match(/^\/ouvrir\/([^/]+)/)?.[1];
 
   // src/lib/toast.js
   var container = null;
@@ -365,6 +388,547 @@
     sessionStorage.removeItem(FLASH_KEY);
     const { message, tone } = JSON.parse(stored);
     toast(message, tone);
+  }
+
+  // src/lib/format.js
+  var numberFormat = new Intl.NumberFormat("fr-FR");
+  var formatNumber = (value) => numberFormat.format(value);
+  var formatChakra = (value) => value == null ? "? ◆" : `${formatNumber(value)} ◆`;
+  var formatPrice = (value) => value == null ? "prix inconnu" : `≈ ${formatNumber(value)}`;
+  function formatGain(value) {
+    if (value == null) return "?";
+    const sign = value > 0 ? "+" : value < 0 ? "−" : "±";
+    return `${sign}${formatNumber(Math.abs(value))}`;
+  }
+  function formatRemaining(isoDate) {
+    const ms = new Date(isoDate).getTime() - Date.now();
+    if (ms <= 0) return "terminé";
+    const hours = Math.floor(ms / 36e5);
+    if (hours >= 24) return `${Math.floor(hours / 24)} j ${hours % 24} h`;
+    return `${hours} h ${Math.floor(ms / 6e4) % 60} min`;
+  }
+  var clockFormat = new Intl.DateTimeFormat("fr-FR", { hour: "2-digit", minute: "2-digit" });
+  var dayClockFormat = new Intl.DateTimeFormat("fr-FR", { weekday: "short", hour: "2-digit", minute: "2-digit" });
+  function formatClock(ms) {
+    const today = (/* @__PURE__ */ new Date()).toDateString() === new Date(ms).toDateString();
+    return (today ? clockFormat : dayClockFormat).format(ms);
+  }
+  function formatCountdown(ms) {
+    const seconds = Math.max(0, Math.ceil(ms / 1e3));
+    const minutes = Math.floor(seconds / 60);
+    const rest = String(seconds % 60).padStart(2, "0");
+    if (minutes >= 60) return `${Math.floor(minutes / 60)} h ${String(minutes % 60).padStart(2, "0")} min`;
+    return minutes > 0 ? `${minutes} min ${rest} s` : `${seconds} s`;
+  }
+  var plural = (count, word) => `${formatNumber(count)} ${word}${count > 1 ? "s" : ""}`;
+  var searchKey = (text) => text.normalize("NFD").replace(new RegExp("\\p{Diacritic}", "gu"), "").toLowerCase();
+
+  // src/features/auto-open/schedule.js
+  var SECOND_MS = 1e3;
+  var MINUTE_SECONDS = 60;
+  var CLOCK_PATTERN = /^(\d{1,3}):([0-5]\d)$/;
+  var SECONDS_PATTERN = /^\d{1,4}$/;
+  var randomInt = (min, max, random = Math.random) => min + Math.floor(random() * (max - min + 1));
+  var randomBetween = (min, max, random = Math.random) => min + random() * (max - min);
+  function normalizeRange([first, second], { min, max }) {
+    const clamp = (value) => Math.min(max, Math.max(min, value));
+    return [clamp(Math.min(first, second)), clamp(Math.max(first, second))];
+  }
+  function parseDuration(text) {
+    const value = String(text).trim();
+    const clock = value.match(CLOCK_PATTERN);
+    if (clock) return (Number(clock[1]) * MINUTE_SECONDS + Number(clock[2])) * SECOND_MS;
+    return SECONDS_PATTERN.test(value) ? Number(value) * SECOND_MS : null;
+  }
+  function formatDuration(ms) {
+    const seconds = Math.round(ms / SECOND_MS);
+    return `${Math.floor(seconds / MINUTE_SECONDS)}:${String(seconds % MINUTE_SECONDS).padStart(2, "0")}`;
+  }
+  function rollCycle({ batchMin, batchMax, delayMinMs, delayMaxMs }, random = Math.random) {
+    return {
+      target: randomInt(batchMin, batchMax, random),
+      delayMs: Math.round(randomBetween(delayMinMs, delayMaxMs, random))
+    };
+  }
+  function regeneratedStock(me, now, regenMs) {
+    const have = me.freePacks ?? 0;
+    const max = me.freePacksMax ?? have;
+    const next = Date.parse(me.nextFreeAt);
+    if (have >= max || !Number.isFinite(next) || now < next) return have;
+    return Math.min(max, have + 1 + Math.floor((now - next) / regenMs));
+  }
+  function planOpening({ pack, me, now, regenMs, cycle }) {
+    const regenerates = usesFreePacks(pack);
+    const have = regenerates ? me.freePacks ?? 0 : 0;
+    const max = regenerates ? me.freePacksMax ?? have : 0;
+    const fixed = freeOpensLeft(pack, { ...me, freePacks: 0 });
+    const target = Math.min(cycle.target, fixed + max);
+    const needed = target - fixed;
+    const next = Date.parse(me.nextFreeAt);
+    const arrivalOf = (count) => Number.isFinite(next) ? next + (count - have - 1) * regenMs : Infinity;
+    const reachedAt = needed <= have ? -Infinity : arrivalOf(needed);
+    const fullAt = have >= max ? -Infinity : arrivalOf(max);
+    const base = Math.max(reachedAt, now);
+    const openAt = Math.max(base, Math.min(base + cycle.delayMs, fullAt));
+    return { target, reachedAt, openAt, leftNow: fixed + (regenerates ? regeneratedStock(me, now, regenMs) : 0) };
+  }
+
+  // src/lib/settings.js
+  var STORAGE_KEY = "kyara-plus:settings";
+  function readAll() {
+    try {
+      return JSON.parse(localStorage.getItem(STORAGE_KEY)) ?? {};
+    } catch {
+      return {};
+    }
+  }
+  var readSetting = (name, fallback) => readAll()[name] ?? fallback;
+  function writeSetting(name, value) {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...readAll(), [name]: value }));
+  }
+
+  // src/features/auto-open/settings.js
+  var BATCH_LIMITS = { min: 1, max: config_default.packs.maxPerOpen };
+  var DELAY_LIMITS = { min: 0, max: config_default.autoOpen.maxDelayMs };
+  function readAutoOpenSettings() {
+    const [batchMin, batchMax] = normalizeRange(readSetting("autoOpenBatch", config_default.autoOpen.defaultBatch), BATCH_LIMITS);
+    const [delayMinMs, delayMaxMs] = normalizeRange(
+      readSetting("autoOpenDelayMs", config_default.autoOpen.defaultDelayMs),
+      DELAY_LIMITS
+    );
+    return { batchMin, batchMax, delayMinMs, delayMaxMs };
+  }
+  function saveAutoOpenSettings({ batchMin, batchMax, delayMinMs, delayMaxMs }) {
+    const [lowBatch, highBatch] = normalizeRange([batchMin, batchMax], BATCH_LIMITS);
+    const [lowDelay, highDelay] = normalizeRange([delayMinMs, delayMaxMs], DELAY_LIMITS);
+    writeSetting("autoOpenBatch", [lowBatch, highBatch]);
+    writeSetting("autoOpenDelayMs", [lowDelay, highDelay]);
+    return readAutoOpenSettings();
+  }
+
+  // src/features/auto-open/controller.js
+  var SECONDS_PER_HOUR = 3600;
+  var SECOND_MS2 = 1e3;
+  var Phase = {
+    IDLE: "idle",
+    WAITING: "waiting",
+    OPENING: "opening",
+    BACKOFF: "backoff"
+  };
+  var initialState = () => ({
+    ready: false,
+    unavailable: null,
+    enabled: false,
+    phase: Phase.IDLE,
+    target: null,
+    openAt: null,
+    leftNow: 0,
+    opened: 0,
+    log: [],
+    stopReason: null,
+    settings: readAutoOpenSettings()
+  });
+  function createAutoOpen({ store, api: api2, clock, notify: notify2, currentPackId }) {
+    let pack = null;
+    let regenMs = 0;
+    let runId = 0;
+    const state = () => store.get();
+    const patch = (changes) => store.set(changes);
+    const isCurrent = (id) => id === runId && state().enabled;
+    async function load() {
+      const packId = currentPackId();
+      const [packs, serverConfig, me] = await Promise.all([api2.listPacks(), api2.getConfig(), api2.loadMe()]);
+      pack = packs.find((candidate) => candidate.id === packId) ?? null;
+      regenMs = Math.round(serverConfig.freePacks.regenHours * SECONDS_PER_HOUR) * SECOND_MS2;
+      const unavailable = !pack ? "Booster introuvable." : !usesFreePacks(pack) ? "Ce booster n’utilise pas les boosters gratuits." : null;
+      patch({ ready: true, unavailable, leftNow: freeOpensLeft(pack, me) });
+    }
+    async function sleepUntil(at, id, maxMs) {
+      const end = Math.min(at, clock.now() + maxMs);
+      while (isCurrent(id) && clock.now() < end) {
+        if (currentPackId() !== pack.id) return stop("Tu as changé de booster.");
+        await clock.sleep(Math.min(config_default.autoOpen.wakeSliceMs, end - clock.now()));
+      }
+    }
+    function stop(reason = null) {
+      runId++;
+      patch({ enabled: false, phase: Phase.IDLE, openAt: null, stopReason: reason });
+      if (reason) notify2.error(`Auto-ouverture arrêtée : ${reason}`);
+    }
+    function record(opened, cards) {
+      if (opened === 0) return;
+      const rarities = countByRarity(cards);
+      const entry = { at: clock.now(), opened, rarities };
+      patch({ opened: state().opened + opened, log: [entry, ...state().log].slice(0, config_default.autoOpen.logLimit) });
+      const summary = rarities.map(([rarity, count]) => `${rarity}×${count}`).join(" ");
+      notify2.success(`Auto-ouverture : ${plural(opened, "booster")} (${summary}).`);
+    }
+    async function openAll(id, known) {
+      let me = known;
+      let left = freeOpensLeft(pack, me);
+      let opened = 0;
+      const cards = [];
+      while (left > 0 && isCurrent(id)) {
+        const count = Math.min(left, config_default.packs.maxPerOpen);
+        const { results = [], stopped = null } = await api2.openMany(pack.id, count);
+        if (results.length === 0) {
+          stop(stopped?.message ?? stopped?.code ?? "Le serveur n’a ouvert aucun booster.");
+          break;
+        }
+        me = results.at(-1).user;
+        notify2.pulled(results.at(-1));
+        opened += results.length;
+        cards.push(...pulledCards(results));
+        left = stopped || results.length < count ? 0 : freeOpensLeft(pack, me);
+        if (left > 0) await clock.sleep(config_default.autoOpen.gapMs * rush() + jitter(config_default.autoOpen.jitterMs));
+      }
+      record(opened, cards);
+      return me;
+    }
+    async function cycleOnce(id, cycle, known) {
+      const me = known ?? await api2.loadMe();
+      if (!isCurrent(id)) return { me };
+      const plan = planOpening({ pack, me, now: clock.now(), regenMs, cycle });
+      patch({ phase: Phase.WAITING, target: plan.target, openAt: plan.openAt, leftNow: plan.leftNow });
+      await sleepUntil(plan.openAt, id, config_default.autoOpen.resyncMs * rush());
+      if (!isCurrent(id)) return { me };
+      if (clock.now() < plan.openAt) return { me: null };
+      const fresh = await api2.loadMe();
+      if (freeOpensLeft(pack, fresh) < plan.target) {
+        await sleepUntil(clock.now() + config_default.autoOpen.recheckMs, id, config_default.autoOpen.recheckMs);
+        return { me: null };
+      }
+      patch({ phase: Phase.OPENING, openAt: null });
+      return { me: await openAll(id, fresh), opened: true };
+    }
+    async function backoff(id, failures) {
+      const wait = config_default.autoOpen.backoffMs * 2 ** (failures - 1) * rush() + jitter(config_default.autoOpen.jitterMs);
+      patch({ phase: Phase.BACKOFF, openAt: clock.now() + wait });
+      await sleepUntil(clock.now() + wait, id, wait);
+    }
+    async function run(id) {
+      let cycle = rollCycle(state().settings);
+      let me = null;
+      let failures = 0;
+      while (isCurrent(id)) {
+        try {
+          const result = await cycleOnce(id, cycle, me);
+          me = result.me;
+          failures = 0;
+          if (result.opened) cycle = rollCycle(state().settings);
+        } catch (error) {
+          if (!isCurrent(id)) return;
+          if (!(error instanceof ApiError)) console.error("[Kyara Plus] auto-open", error);
+          if (!isTransient(error)) return stop(describeError(error));
+          failures++;
+          if (failures >= config_default.autoOpen.maxFailures) return stop(`${describeError(error)} (échecs répétés)`);
+          me = null;
+          await backoff(id, failures);
+        }
+      }
+    }
+    function start() {
+      if (state().enabled || !state().ready || state().unavailable) return;
+      const id = ++runId;
+      patch({ enabled: true, stopReason: null, phase: Phase.WAITING });
+      run(id);
+    }
+    function setSettings(settings) {
+      patch({ settings: saveAutoOpenSettings(settings) });
+    }
+    function dispose() {
+      runId++;
+      patch({ enabled: false });
+    }
+    return { load, start, stop: () => stop(), setSettings, dispose };
+  }
+
+  // src/lib/icon.js
+  var icon = (name) => h("i", { class: `fa-solid fa-${name}`, "aria-hidden": "true" });
+
+  // src/data/collection.js
+  var GiveStatus = {
+    AVAILABLE: "available",
+    PINNED: "pinned",
+    BLOCKED: "blocked",
+    MISSING: "missing"
+  };
+  async function loadCollection() {
+    const entries = await collectionApi.mine();
+    return new Map(entries.map((entry) => [entry.characterId, entry]));
+  }
+  function giveStatus(entry) {
+    if (!entry || entry.qty <= 0) return GiveStatus.MISSING;
+    if ((entry.listable ?? 0) > 0) return GiveStatus.AVAILABLE;
+    const freeOnceUnpinned = entry.qty - (entry.locked ?? 0) - (entry.resaleLocked ?? 0) > 0;
+    return entry.pinned && freeOnceUnpinned ? GiveStatus.PINNED : GiveStatus.BLOCKED;
+  }
+  var recyclableCopies = (entry) => entry && !entry.pinned ? Math.max(0, entry.qty - (entry.locked ?? 0) - 1) : 0;
+  var unpinCard = (characterId) => collectionApi.setPinned(characterId, false);
+
+  // src/features/market-offers/widgets.js
+  function cardArt(card, size = "md", overlays = []) {
+    return h(
+      "a",
+      {
+        class: `kp-art kp-art--${size}`,
+        href: `/wiki/${card.id}`,
+        title: card.name,
+        style: { "--kp-rarity": rarityColor(card.rarity) }
+      },
+      h("img", {
+        src: cardImageUrl(card.id),
+        alt: card.name,
+        loading: "lazy",
+        referrerpolicy: "no-referrer",
+        onError: (event) => {
+          if (card.image && event.target.src !== card.image) event.target.src = card.image;
+        }
+      }),
+      overlays
+    );
+  }
+  var gem = (rarity) => h("span", { class: "kp-gem", title: RARITY_LABELS[rarity], style: { "--kp-rarity": rarityColor(rarity) } }, rarity);
+  function optionOverlays({ entry, status }) {
+    const qty = entry?.qty ?? 0;
+    return [
+      qty >= 2 ? h("span", { class: "kp-badge kp-badge--count", title: plural(qty, "exemplaire") }, `×${qty}`) : null,
+      status === GiveStatus.PINNED ? h("span", { class: "kp-badge kp-badge--lock", title: "Carte verrouillée" }, icon("lock")) : null
+    ];
+  }
+  var hideButton = (onClick) => h("button", { class: "kp-hide", type: "button", title: "Masquer cette offre", onClick }, icon("eye-slash"));
+  var swapIcon = () => h("span", { class: "kp-swap" }, icon("arrow-right-arrow-left"));
+  function gainBadge(gain) {
+    const tone = !gain ? "flat" : gain > 0 ? "up" : "down";
+    return h("span", { class: `kp-gain kp-gain--${tone}`, title: "Écart de prix moyen" }, formatGain(gain));
+  }
+  function giveButton(option, onClick, className = "") {
+    const tone = option.entry.qty >= 2 ? "double" : "single";
+    return h(
+      "button",
+      { class: `kp-btn kp-btn--${tone} ${className}`, type: "button", onClick },
+      "Donner",
+      gainBadge(option.gain)
+    );
+  }
+  function ownershipNote(entry) {
+    const qty = entry?.qty ?? 0;
+    if (qty === 0) return h("span", { class: "kp-note" }, "Tu ne l’as pas");
+    if (qty === 1) return h("span", { class: "kp-note kp-note--warn" }, "Dernier exemplaire");
+    return null;
+  }
+  function blockedTag(entry) {
+    const text = entry?.sellBlock === "resale_lock" && entry.resaleUntil ? `Bloquée encore ${formatRemaining(entry.resaleUntil)}` : "Indisponible";
+    return h("span", { class: "kp-tag" }, text);
+  }
+
+  // src/features/auto-open/panel.js
+  var timeFormat = new Intl.DateTimeFormat("fr-FR", { hour: "2-digit", minute: "2-digit" });
+  function statusText(state, now) {
+    if (state.unavailable) return state.unavailable;
+    if (!state.ready) return "Chargement…";
+    if (!state.enabled) {
+      const stock = `${plural(state.leftNow, "booster")} gratuit${state.leftNow > 1 ? "s" : ""} en stock`;
+      return state.stopReason ? `Arrêtée : ${state.stopReason}` : `Inactive · ${stock}`;
+    }
+    const remaining = state.openAt == null ? null : state.openAt - now;
+    const countdown = remaining == null || !Number.isFinite(remaining) ? "…" : formatCountdown(remaining);
+    if (state.phase === Phase.OPENING) return "Ouverture en cours…";
+    if (state.phase === Phase.BACKOFF) return `Erreur temporaire, nouvel essai dans ${countdown}`;
+    return `Prochain lot : ${plural(state.target ?? 0, "booster")} · ouverture dans ${countdown}`;
+  }
+  function rangeRow({ label, parse, format, onChange }) {
+    const field = (ariaLabel) => h("input", { class: "kp-input kp-input--short", type: "text", inputmode: "numeric", "aria-label": ariaLabel });
+    const low = field(`${label} (minimum)`);
+    const high = field(`${label} (maximum)`);
+    let values = [0, 0];
+    const show = () => {
+      if (document.activeElement !== low) low.value = format(values[0]);
+      if (document.activeElement !== high) high.value = format(values[1]);
+    };
+    const commit = () => {
+      const parsed = [parse(low.value), parse(high.value)];
+      if (parsed.every((value) => value != null)) onChange(parsed);
+      else show();
+    };
+    low.addEventListener("change", commit);
+    high.addEventListener("change", commit);
+    const root = h("div", { class: "kp-field" }, h("span", { class: "kp-label" }, label), low, "–", high);
+    return {
+      root,
+      set(next) {
+        values = next;
+        show();
+      }
+    };
+  }
+  function logRow({ at, opened, rarities }) {
+    return h(
+      "div",
+      { class: "kp-auto-open__log-row" },
+      h("span", { class: "kp-note" }, timeFormat.format(at)),
+      h("strong", {}, plural(opened, "booster")),
+      h("span", { class: "kp-auto-open__gems" }, rarities.flatMap(([rarity, count]) => [gem(rarity), `×${count}`]))
+    );
+  }
+  function createAutoOpenPanel(controller) {
+    let lastState = null;
+    const parseCount = (text) => /^\d{1,2}$/.test(text.trim()) ? Number(text) : null;
+    const status = h("p", { class: "kp-auto-open__status" });
+    const toggle = h("button", { class: "kp-btn", type: "button" });
+    const stats = h("p", { class: "kp-muted" });
+    const log = h("div", { class: "kp-auto-open__log" });
+    const batchRow = rangeRow({
+      label: "Lot de boosters",
+      parse: parseCount,
+      format: String,
+      onChange: ([batchMin, batchMax]) => controller.setSettings({ ...lastState.settings, batchMin, batchMax })
+    });
+    const delayRow = rangeRow({
+      label: "Attente avant d’ouvrir",
+      parse: parseDuration,
+      format: formatDuration,
+      onChange: ([delayMinMs, delayMaxMs]) => controller.setSettings({ ...lastState.settings, delayMinMs, delayMaxMs })
+    });
+    const trigger = h("button", {
+      type: "button",
+      class: "kp-auto-open__trigger",
+      title: "Auto-ouverture",
+      "aria-label": "Auto-ouverture",
+      "aria-expanded": "false"
+    }, icon("arrows-rotate"));
+    const close = h("button", { class: "kp-hide", type: "button", title: "Fermer" }, icon("xmark"));
+    const root = h(
+      "section",
+      { class: "kp-auto-open", hidden: true, "aria-label": "Auto-ouverture des boosters" },
+      h("header", { class: "kp-auto-open__head" }, h("h3", { class: "kp-title kp-title--sm" }, "Auto-ouverture"), close),
+      status,
+      toggle,
+      batchRow.root,
+      delayRow.root,
+      h(
+        "p",
+        { class: "kp-muted" },
+        "Un lot et une attente sont tirés au hasard dans ces plages avant chaque ouverture. ",
+        "Si le stock gratuit est plein, tout s’ouvre sans attendre pour ne rien perdre. ",
+        "Seuls les boosters gratuits sont ouverts, jamais de chakra. Les réglages valent pour le prochain tirage."
+      ),
+      stats,
+      log
+    );
+    const setOpen = (open) => {
+      root.hidden = !open;
+      trigger.setAttribute("aria-expanded", String(open));
+    };
+    trigger.addEventListener("click", () => setOpen(root.hidden));
+    close.addEventListener("click", () => setOpen(false));
+    toggle.addEventListener("click", () => lastState.enabled ? controller.stop() : controller.start());
+    const tick = () => {
+      if (lastState && !root.hidden) status.textContent = statusText(lastState, Date.now());
+    };
+    const timer = setInterval(tick, config_default.autoOpen.uiTickMs);
+    return {
+      root,
+      trigger,
+      setOpen,
+      render(state) {
+        lastState = state;
+        trigger.classList.toggle("is-live", state.enabled);
+        toggle.textContent = state.enabled ? "Arrêter" : "Activer";
+        toggle.classList.toggle("kp-btn--warn", state.enabled);
+        toggle.disabled = !state.enabled && (!state.ready || Boolean(state.unavailable));
+        batchRow.set([state.settings.batchMin, state.settings.batchMax]);
+        delayRow.set([state.settings.delayMinMs, state.settings.delayMaxMs]);
+        stats.textContent = `Cette visite : ${plural(state.opened, "booster")} ouvert${state.opened > 1 ? "s" : ""}`;
+        log.replaceChildren(...state.log.map(logRow));
+        status.textContent = statusText(state, Date.now());
+      },
+      destroy() {
+        clearInterval(timer);
+        root.remove();
+        trigger.remove();
+      }
+    };
+  }
+
+  // src/features/auto-open/site-counter.js
+  var PILL = "header.bar .bar-side .pill:has(.meter)";
+  var PERCENT = 100;
+  var counterOf = (user) => ({
+    text: `${user.freePacks}/${user.freePacksMax}`,
+    percent: Math.min(PERCENT, user.freePacks / Math.max(1, user.freePacksMax) * PERCENT)
+  });
+  function showFreePacks(user) {
+    const pill = document.querySelector(PILL);
+    if (!pill || user?.freePacks == null || user.freePacksMax == null) return;
+    const { text, percent } = counterOf(user);
+    const label = pill.querySelector(".mono")?.firstChild;
+    if (label?.nodeType === Node.TEXT_NODE && label.nodeValue !== text) label.nodeValue = text;
+    const bar = pill.querySelector(".meter i");
+    if (bar) bar.style.width = `${percent}%`;
+  }
+
+  // src/features/auto-open/index.js
+  var BAR_BUTTONS = "header.bar .bar-side .opts-w";
+  var RUNNING_CLASS = "kp-auto-open-on";
+  var PULL_EVENT = "kyara:pull";
+  var api = {
+    loadMe: async () => (await meApi.bootstrap()).me,
+    listPacks: () => packsApi.list(),
+    getConfig: () => configApi.get(),
+    openMany: (packId, count) => packsApi.openMany(packId, { count, maxChakra: 0, requestId: newRequestId() })
+  };
+  var notify = {
+    success: (message) => toast(message, "success"),
+    error: (message) => toast(message, "error"),
+    pulled: (result) => {
+      window.dispatchEvent(new CustomEvent(PULL_EVENT, { detail: result }));
+      showFreePacks(result.user);
+    }
+  };
+  var auto_open_default = {
+    id: "auto-open",
+    matches: (url) => /^\/ouvrir\/[^/]+\/?$/.test(url.pathname),
+    mount() {
+      const store = createStore(initialState());
+      const controller = createAutoOpen({
+        store,
+        api,
+        clock: { now: Date.now, sleep },
+        notify,
+        currentPackId: packIdFromPath
+      });
+      const panel = createAutoOpenPanel(controller);
+      const unsubscribe = store.subscribe((state) => {
+        panel.render(state);
+        document.body.classList.toggle(RUNNING_CLASS, state.enabled);
+      });
+      const detach = keepAttached(panel.trigger, BAR_BUTTONS, (anchor, trigger) => {
+        const siteButton = anchor.querySelector("button.icon");
+        trigger.className = `${siteButton?.className ?? ""} kp-auto-open__trigger`.trim();
+        anchor.before(trigger);
+      });
+      document.body.append(panel.root);
+      panel.render(store.get());
+      controller.load().catch((error) => toast(describeError(error), "error"));
+      return () => {
+        controller.dispose();
+        unsubscribe();
+        detach();
+        panel.destroy();
+        document.body.classList.remove(RUNNING_CLASS);
+      };
+    }
+  };
+
+  // src/data/catalog.js
+  var pending = null;
+  function loadCatalog() {
+    pending ??= catalogApi.characters().then((characters) => new Map(characters.map((character) => [character.id, character]))).catch((error) => {
+      pending = null;
+      throw error;
+    });
+    return pending;
   }
 
   // src/features/collection-albums.js
@@ -528,12 +1092,6 @@
     }
   };
 
-  // src/lib/site.js
-  var profileIdFromPath = () => location.pathname.match(/^\/profil\/([^/]+)/)?.[1];
-  var cardIdFromLink = (link) => Number(link?.getAttribute("href")?.match(/\/wiki\/(\d+)/)?.[1]);
-  var cardImageUrl = (cardId) => `/cards/sm/${cardId}.webp`;
-  var packIdFromPath = () => location.pathname.match(/^\/ouvrir\/([^/]+)/)?.[1];
-
   // src/features/collection-ghosts.js
   var MISSING_CARD = "main a.slot .miss";
   var FOIL_MAX_RANK = rarityRank("E");
@@ -635,9 +1193,6 @@
     }
   };
 
-  // src/lib/icon.js
-  var icon = (name) => h("i", { class: `fa-solid fa-${name}`, "aria-hidden": "true" });
-
   // src/features/collection-locks.js
   var CARD_CELL = "main .cell";
   function renderLockButton(button, pinned) {
@@ -736,32 +1291,6 @@
       loadPrices(missing).then(onLoaded, onError);
     };
   }
-
-  // src/lib/format.js
-  var numberFormat = new Intl.NumberFormat("fr-FR");
-  var formatNumber = (value) => numberFormat.format(value);
-  var formatChakra = (value) => value == null ? "? ◆" : `${formatNumber(value)} ◆`;
-  var formatPrice = (value) => value == null ? "prix inconnu" : `≈ ${formatNumber(value)}`;
-  function formatGain(value) {
-    if (value == null) return "?";
-    const sign = value > 0 ? "+" : value < 0 ? "−" : "±";
-    return `${sign}${formatNumber(Math.abs(value))}`;
-  }
-  function formatRemaining(isoDate) {
-    const ms = new Date(isoDate).getTime() - Date.now();
-    if (ms <= 0) return "terminé";
-    const hours = Math.floor(ms / 36e5);
-    if (hours >= 24) return `${Math.floor(hours / 24)} j ${hours % 24} h`;
-    return `${hours} h ${Math.floor(ms / 6e4) % 60} min`;
-  }
-  var clockFormat = new Intl.DateTimeFormat("fr-FR", { hour: "2-digit", minute: "2-digit" });
-  var dayClockFormat = new Intl.DateTimeFormat("fr-FR", { weekday: "short", hour: "2-digit", minute: "2-digit" });
-  function formatClock(ms) {
-    const today = (/* @__PURE__ */ new Date()).toDateString() === new Date(ms).toDateString();
-    return (today ? clockFormat : dayClockFormat).format(ms);
-  }
-  var plural = (count, word) => `${formatNumber(count)} ${word}${count > 1 ? "s" : ""}`;
-  var searchKey = (text) => text.normalize("NFD").replace(new RegExp("\\p{Diacritic}", "gu"), "").toLowerCase();
 
   // src/features/collection-recycle.js
   var PRECIOUS_RARITIES = /* @__PURE__ */ new Set(["L", "M"]);
@@ -922,15 +1451,6 @@ Continuer ?`);
     }
   };
 
-  // src/data/packs.js
-  var usesFreePacks = (pack) => pack.usesFreePacks ?? pack.price === 0;
-  function freeOpensLeft(pack, me) {
-    if (!pack || !me) return 0;
-    const granted = me.grants?.[pack.id] ?? 0;
-    return granted + (usesFreePacks(pack) ? (me.freePacks ?? 0) + (me.bonusPacks ?? 0) : 0);
-  }
-  var withFreeCount = (body, count) => JSON.stringify({ ...JSON.parse(body), count, maxChakra: 0 });
-
   // src/features/free-packs/paid-warning.js
   var PAID_OK_KEY = "kyara.open.paidok";
   function suppressPaidWarning() {
@@ -976,7 +1496,7 @@ Continuer ?`);
   var SITE_COUNT_BUTTONS = `${COUNT_GROUP} button:not(.kp-free-count)`;
   var OPEN_BUTTON = "main .under button.btn-open";
   var FREE_MODE_CLASS = "kp-free-mode";
-  var PULL_EVENT = "kyara:pull";
+  var PULL_EVENT2 = "kyara:pull";
   var siteButtons = () => [...document.querySelectorAll(SITE_COUNT_BUTTONS)];
   var buttonCount = (button) => Number(button?.textContent.replace(/\D/g, "")) || 0;
   function placeChip(chip, count) {
@@ -1052,7 +1572,7 @@ Continuer ?`);
           toast(describeError(error), "error");
         }
       }
-      window.addEventListener(PULL_EVENT, onPull);
+      window.addEventListener(PULL_EVENT2, onPull);
       document.addEventListener("click", onSiteCountClick, true);
       const detach = keepAttached(chip, COUNT_GROUP, render);
       load();
@@ -1060,7 +1580,7 @@ Continuer ?`);
         detach();
         leaveFreeMode();
         override.restore();
-        window.removeEventListener(PULL_EVENT, onPull);
+        window.removeEventListener(PULL_EVENT2, onPull);
         document.removeEventListener("click", onSiteCountClick, true);
         chip.remove();
       };
@@ -1364,62 +1884,6 @@ Continuer ?`);
       give.cards.forEach((item) => item.gain = difference(receive.cards[0].price, item.price));
     }
     return { give, receive };
-  }
-
-  // src/features/market-offers/widgets.js
-  function cardArt(card, size = "md", overlays = []) {
-    return h(
-      "a",
-      {
-        class: `kp-art kp-art--${size}`,
-        href: `/wiki/${card.id}`,
-        title: card.name,
-        style: { "--kp-rarity": rarityColor(card.rarity) }
-      },
-      h("img", {
-        src: cardImageUrl(card.id),
-        alt: card.name,
-        loading: "lazy",
-        referrerpolicy: "no-referrer",
-        onError: (event) => {
-          if (card.image && event.target.src !== card.image) event.target.src = card.image;
-        }
-      }),
-      overlays
-    );
-  }
-  var gem = (rarity) => h("span", { class: "kp-gem", title: RARITY_LABELS[rarity], style: { "--kp-rarity": rarityColor(rarity) } }, rarity);
-  function optionOverlays({ entry, status }) {
-    const qty = entry?.qty ?? 0;
-    return [
-      qty >= 2 ? h("span", { class: "kp-badge kp-badge--count", title: plural(qty, "exemplaire") }, `×${qty}`) : null,
-      status === GiveStatus.PINNED ? h("span", { class: "kp-badge kp-badge--lock", title: "Carte verrouillée" }, icon("lock")) : null
-    ];
-  }
-  var hideButton = (onClick) => h("button", { class: "kp-hide", type: "button", title: "Masquer cette offre", onClick }, icon("eye-slash"));
-  var swapIcon = () => h("span", { class: "kp-swap" }, icon("arrow-right-arrow-left"));
-  function gainBadge(gain) {
-    const tone = !gain ? "flat" : gain > 0 ? "up" : "down";
-    return h("span", { class: `kp-gain kp-gain--${tone}`, title: "Écart de prix moyen" }, formatGain(gain));
-  }
-  function giveButton(option, onClick, className = "") {
-    const tone = option.entry.qty >= 2 ? "double" : "single";
-    return h(
-      "button",
-      { class: `kp-btn kp-btn--${tone} ${className}`, type: "button", onClick },
-      "Donner",
-      gainBadge(option.gain)
-    );
-  }
-  function ownershipNote(entry) {
-    const qty = entry?.qty ?? 0;
-    if (qty === 0) return h("span", { class: "kp-note" }, "Tu ne l’as pas");
-    if (qty === 1) return h("span", { class: "kp-note kp-note--warn" }, "Dernier exemplaire");
-    return null;
-  }
-  function blockedTag(entry) {
-    const text = entry?.sellBlock === "resale_lock" && entry.resaleUntil ? `Bloquée encore ${formatRemaining(entry.resaleUntil)}` : "Indisponible";
-    return h("span", { class: "kp-tag" }, text);
   }
 
   // src/features/market-trades/trade-panel.js
@@ -1866,23 +2330,6 @@ Continuer ?`);
     }
   };
 
-  // src/lib/store.js
-  function createStore(initialState2) {
-    const state = { ...initialState2 };
-    const listeners = /* @__PURE__ */ new Set();
-    return {
-      get: () => state,
-      set(patch) {
-        Object.assign(state, patch);
-        for (const listener of listeners) listener(state);
-      },
-      subscribe(listener) {
-        listeners.add(listener);
-        return () => listeners.delete(listener);
-      }
-    };
-  }
-
   // src/features/market-offers/analysis.js
   var GIVABLE = /* @__PURE__ */ new Set([GiveStatus.AVAILABLE, GiveStatus.PINNED]);
   var OWNED = /* @__PURE__ */ new Set([GiveStatus.AVAILABLE, GiveStatus.PINNED, GiveStatus.BLOCKED]);
@@ -1938,19 +2385,27 @@ Continuer ?`);
   }
   var newFirst = (a, b) => Number(b.analysis.isNew) - Number(a.analysis.isNew);
   var byDealPriority = (a, b) => newFirst(a, b) || rarityRank(a.analysis.received.rarity) - rarityRank(b.analysis.received.rarity) || descending(gainKey(a.option.gain), gainKey(b.option.gain));
-  function bangerDeals(analyses) {
-    return analyses.flatMap((analysis) => {
-      const rank = rarityRank(analysis.received.rarity);
-      if (rank > BANGER_MAX_RANK) return [];
-      const option = bestOption(analysis.options, (o) => isGivable(o) && rarityRank(o.card.rarity) > rank);
-      return option ? [{ analysis, option }] : [];
-    }).sort(byDealPriority);
+  function dealsPerOffer(analyses, qualifies, compareOffers) {
+    return analyses.map(
+      (analysis) => analysis.options.filter((option) => qualifies(analysis, option)).sort((a, b) => descending(gainKey(a.gain), gainKey(b.gain))).map((option) => ({ analysis, option }))
+    ).filter((deals) => deals.length > 0).sort((a, b) => compareOffers(a[0], b[0])).flat();
   }
-  function gainDeals(analyses, minGain) {
-    return analyses.flatMap((analysis) => {
-      const option = bestOption(analysis.options, (o) => isGivable(o) && o.gain != null && o.gain >= minGain);
-      return option ? [{ analysis, option }] : [];
-    }).sort((a, b) => newFirst(a, b) || descending(a.option.gain, b.option.gain));
+  var bangerDeals = (analyses) => dealsPerOffer(
+    analyses,
+    (analysis, option) => {
+      const rank = rarityRank(analysis.received.rarity);
+      return rank <= BANGER_MAX_RANK && isGivable(option) && rarityRank(option.card.rarity) > rank;
+    },
+    byDealPriority
+  );
+  var gainDeals = (analyses, minGain) => dealsPerOffer(
+    analyses,
+    (analysis, option) => isGivable(option) && option.gain != null && option.gain >= minGain,
+    (a, b) => newFirst(a, b) || descending(a.option.gain, b.option.gain)
+  );
+  function bestDealPerOffer(deals) {
+    const seen = /* @__PURE__ */ new Set();
+    return deals.filter(({ analysis }) => !seen.has(analysis.offer.id) && seen.add(analysis.offer.id));
   }
   var ruleKey = (giveRarity, receiveRarity) => `${giveRarity}>${receiveRarity}`;
   function autoAcceptOption(analysis, { rules, doublesOnly, minGain }) {
@@ -2107,14 +2562,14 @@ Continuer ?`);
     [Filter.MISSING]: "missing",
     [Filter.WISHED]: "wished"
   };
-  var Phase = {
+  var Phase2 = {
     IDLE: "idle",
     LOADING: "loading",
     READY: "ready",
     ERROR: "error"
   };
-  var initialState = () => ({
-    phase: Phase.IDLE,
+  var initialState2 = () => ({
+    phase: Phase2.IDLE,
     scanned: 0,
     error: null,
     analyses: [],
@@ -2234,25 +2689,25 @@ Continuer ?`);
       const loadGeneration = ++generation;
       found = /* @__PURE__ */ new Map();
       scannedFilters.clear();
-      store.set({ phase: Phase.LOADING, scanned: 0, error: null });
+      store.set({ phase: Phase2.LOADING, scanned: 0, error: null });
       try {
         const [catalog, collection, wishlist] = await Promise.all([loadCatalog(), loadCollection(), loadWishlist()]);
         if (loadGeneration !== generation) return;
         context = { catalog, collection, wishlist, priceOf };
         startLive();
         await scanOffers(catalog, filters, loadGeneration);
-        if (loadGeneration === generation) store.set({ phase: Phase.READY });
+        if (loadGeneration === generation) store.set({ phase: Phase2.READY });
         auto.consider();
       } catch (error) {
-        if (loadGeneration === generation) store.set({ phase: Phase.ERROR, error: describeError(error) });
+        if (loadGeneration === generation) store.set({ phase: Phase2.ERROR, error: describeError(error) });
       }
     }
     function announce(fresh) {
       const freshIds = new Set(fresh.map((offer) => offer.id));
       const analyses = store.get().analyses.filter((analysis) => freshIds.has(analysis.offer.id));
-      const bangers = bangerDeals(analyses);
+      const bangers = bestDealPerOffer(bangerDeals(analyses));
       const bangerIds = new Set(bangers.map((deal) => deal.analysis.offer.id));
-      const gains = gainDeals(analyses, readSetting("minGain", config_default.side.defaultMinGain)).filter(
+      const gains = bestDealPerOffer(gainDeals(analyses, readSetting("minGain", config_default.side.defaultMinGain))).filter(
         (deal) => !bangerIds.has(deal.analysis.offer.id)
       );
       const describe = (kind, { analysis, option }) => `Nouvelle offre ${kind} : ${analysis.received.name} contre ${option.card.name}.`;
@@ -2357,10 +2812,10 @@ Continuer ?`);
     [Filter.WISHED, "Ma wishlist"]
   ];
   var WISHLIST_GROUP = "wishlist";
-  function statusText(state, count) {
-    if (state.phase === Phase.LOADING) return `Analyse des offres… ${formatNumber(state.scanned)}`;
-    if (state.phase === Phase.ERROR) return state.error;
-    if (state.phase === Phase.READY) return plural(count, "offre");
+  function statusText2(state, count) {
+    if (state.phase === Phase2.LOADING) return `Analyse des offres… ${formatNumber(state.scanned)}`;
+    if (state.phase === Phase2.ERROR) return state.error;
+    if (state.phase === Phase2.READY) return plural(count, "offre");
     return "";
   }
   function groupOffers(analyses) {
@@ -2521,10 +2976,10 @@ Continuer ?`);
       lastState = state;
       const offers = boardOffers(state.analyses, activeFilters, activeRarities, search);
       const visible = offers.slice(0, visibleCount);
-      status.textContent = statusText(state, offers.length);
+      status.textContent = statusText2(state, offers.length);
       showHiddenButton.hidden = state.hiddenCount === 0;
       showHiddenButton.textContent = `Réafficher les masquées (${state.hiddenCount})`;
-      if (state.phase === Phase.READY && offers.length === 0) {
+      if (state.phase === Phase2.READY && offers.length === 0) {
         list.replaceChildren(h("p", { class: "kp-empty" }, "Aucune offre avec ces filtres."));
         return;
       }
@@ -2540,8 +2995,8 @@ Continuer ?`);
   // src/features/market-offers/auto-panel.js
   var RECEIVED = RARITIES.slice(0, -1);
   var GIVEN = RARITIES.slice(1).reverse();
-  var timeFormat = new Intl.DateTimeFormat("fr-FR", { hour: "2-digit", minute: "2-digit" });
-  function statusText2({ auto, live }) {
+  var timeFormat2 = new Intl.DateTimeFormat("fr-FR", { hour: "2-digit", minute: "2-digit" });
+  function statusText3({ auto, live }) {
     const parts = [live ? "En direct" : "Suivi en direct arrêté"];
     if (auto.enabled) parts.push(`auto-accept actif, ${plural(auto.log.length, "échange")}`);
     else if (auto.stopReason) parts.push(`auto-accept arrêté : ${auto.stopReason}`);
@@ -2549,7 +3004,7 @@ Continuer ?`);
     if (auto.giftLimited) parts.push(`ignorées (limite de dons) : ${plural(auto.giftLimited, "offre")}`);
     return parts.join(" · ");
   }
-  function logRow({ received, given, at }) {
+  function logRow2({ received, given, at }) {
     return h(
       "div",
       { class: "kp-deal" },
@@ -2560,7 +3015,7 @@ Continuer ?`);
         "div",
         { class: "kp-deal__info" },
         h("strong", { class: "kp-name", title: received.name }, received.name),
-        h("span", { class: "kp-note", title: given.name }, `contre ${given.name} · ${timeFormat.format(at)}`)
+        h("span", { class: "kp-note", title: given.name }, `contre ${given.name} · ${timeFormat2.format(at)}`)
       )
     );
   }
@@ -2632,7 +3087,7 @@ Continuer ?`);
       enabled = auto.enabled;
       doublesOnly = auto.doublesOnly;
       gainEnabled = auto.gainEnabled;
-      status.textContent = statusText2(state);
+      status.textContent = statusText3(state);
       toggle.textContent = enabled ? "Arrêter" : "Activer";
       toggle.classList.toggle("kp-btn--warn", enabled);
       toggle.disabled = !enabled && !hasAutoRule(autoSettings(auto));
@@ -2640,7 +3095,7 @@ Continuer ?`);
       gainChip.setAttribute("aria-pressed", String(gainEnabled));
       if (document.activeElement !== gainInput) gainInput.value = String(auto.minGain);
       for (const [key, button] of cells) button.setAttribute("aria-pressed", String(auto.rules.has(key)));
-      log.replaceChildren(...auto.log.map(logRow));
+      log.replaceChildren(...auto.log.map(logRow2));
     }
     return { root, render };
   }
@@ -2752,7 +3207,7 @@ ${lines.join("\n")}`;
         h(
           "p",
           { class: "kp-muted" },
-          "Toutes les offres qui rapportent au moins le gain minimum. Les nouvelles arrivent en haut."
+          "Chaque carte que tu peux donner et qui rapporte au moins le gain minimum : une offre revient une fois par carte. Les nouvelles arrivent en haut."
         ),
         gainList
       ),
@@ -2760,7 +3215,11 @@ ${lines.join("\n")}`;
         "div",
         { class: "kp-side__block" },
         h("h3", { class: "kp-title kp-title--sm" }, "Offres bangers"),
-        h("p", { class: "kp-muted" }, "Une Mythique ou Légendaire contre une carte de rareté inférieure."),
+        h(
+          "p",
+          { class: "kp-muted" },
+          "Une Mythique ou Légendaire contre une carte de rareté inférieure, une ligne par carte possible."
+        ),
         bangerList
       )
     );
@@ -2783,7 +3242,7 @@ ${lines.join("\n")}`;
       autoView.hidden = tab !== Tab.AUTO;
     }
     function fill(list, deals, emptyText, state) {
-      if (state.phase !== Phase.READY && deals.length === 0) {
+      if (state.phase !== Phase2.READY && deals.length === 0) {
         list.replaceChildren(h("p", { class: "kp-muted" }, "Chargement…"));
         return;
       }
@@ -2809,7 +3268,7 @@ ${lines.join("\n")}`;
     id: "market-offers",
     matches: (url) => url.pathname === "/marche" && url.searchParams.get("onglet") === "offres",
     mount() {
-      const store = createStore(initialState());
+      const store = createStore(initialState2());
       const controller = createOffersController(store);
       const board = createBoard(controller, { onPropose: () => document.querySelector(NATIVE_PROPOSE)?.click() });
       const side = createSidePanel(controller);
@@ -3246,7 +3705,1471 @@ ${lines.join("\n")}`;
   }
 
   // src/styles.css
-  var styles_default = "body.kp-market main aside.chat-side > :not(.kp-side) {\r\n  display: none !important;\r\n}\r\n\r\nbody.kp-market:not(.kp-offers) main aside.chat-side {\r\n  display: none !important;\r\n}\r\n\r\nbody.kp-market:not(.kp-offers) main .layout {\r\n  grid-template-columns: minmax(0, 1fr) !important;\r\n}\r\n\r\nbody.kp-offers main .wrap {\r\n  --wrap: 1320px;\r\n}\r\n\r\nbody.kp-offers main .layout {\r\n  grid-template-columns: minmax(0, 1fr) 400px !important;\r\n}\r\n\r\n/* The site may render its offer dialogs inside the board, so only the board's own content is hidden. */\r\nbody.kp-offers main section.board {\r\n  display: contents !important;\r\n}\r\n\r\nbody.kp-offers main section.board > :not([role='dialog']):not(:has([role='dialog'])) {\r\n  display: none !important;\r\n}\r\n\r\n.kp-tab-link {\r\n  display: inline-flex;\r\n  align-items: center;\r\n  color: inherit;\r\n  text-decoration: none;\r\n}\r\n\r\n.kp-filters {\r\n  display: flex;\r\n  flex-wrap: wrap;\r\n  gap: var(--s-2);\r\n}\r\n\r\n.kp-chip {\r\n  padding: 5px 12px;\r\n  border: 1px solid var(--line2);\r\n  border-radius: var(--r-pill);\r\n  background: transparent;\r\n  color: var(--fg2);\r\n  font: 500 var(--t-sm) var(--body);\r\n  cursor: pointer;\r\n}\r\n\r\n.kp-chip:hover {\r\n  background: var(--raise);\r\n}\r\n\r\n.kp-chip[aria-pressed='true'] {\r\n  border-color: var(--acc);\r\n  background: var(--acc-soft);\r\n  color: var(--fg);\r\n}\r\n\r\n.kp-title {\r\n  margin: 0;\r\n  font-family: var(--disp);\r\n  font-size: var(--t-h3);\r\n}\r\n\r\n.kp-title--sm {\r\n  font-size: var(--t-base);\r\n}\r\n\r\n.kp-muted,\r\n.kp-empty {\r\n  margin: 0;\r\n  color: var(--mut);\r\n  font-size: var(--t-sm);\r\n}\r\n\r\n.kp-empty {\r\n  padding: var(--s-6) 0;\r\n  text-align: center;\r\n}\r\n\r\n.kp-label {\r\n  color: var(--mut);\r\n  font-size: var(--t-meta);\r\n  letter-spacing: 0.06em;\r\n  text-transform: uppercase;\r\n}\r\n\r\n.kp-name {\r\n  overflow: hidden;\r\n  font-size: var(--t-sm);\r\n  text-overflow: ellipsis;\r\n  white-space: nowrap;\r\n}\r\n\r\n.kp-price {\r\n  color: var(--fg2);\r\n  font-family: var(--mono);\r\n  font-size: var(--t-meta);\r\n}\r\n\r\n.kp-note {\r\n  overflow: hidden;\r\n  color: var(--mut);\r\n  font-size: var(--t-meta);\r\n  text-overflow: ellipsis;\r\n  white-space: nowrap;\r\n}\r\n\r\n.kp-note--warn {\r\n  color: var(--warn);\r\n}\r\n\r\n.kp-note--new {\r\n  color: var(--ok);\r\n}\r\n\r\n.kp-note--wish {\r\n  color: var(--wish);\r\n}\r\n\r\n.kp-tag {\r\n  align-self: flex-start;\r\n  padding: 2px 8px;\r\n  border: 1px solid var(--line2);\r\n  border-radius: var(--r-pill);\r\n  color: var(--fg2);\r\n  font-size: var(--t-meta);\r\n}\r\n\r\n.kp-art {\r\n  position: relative;\r\n  display: block;\r\n  overflow: hidden;\r\n  aspect-ratio: 2 / 3;\r\n  border: 3px solid var(--kp-rarity);\r\n  border-radius: var(--r-md);\r\n  background: var(--bg2);\r\n  box-shadow: 0 0 14px color-mix(in srgb, var(--kp-rarity) 30%, transparent);\r\n}\r\n\r\n.kp-art img {\r\n  display: block;\r\n  width: 100%;\r\n  height: 100%;\r\n  object-fit: cover;\r\n}\r\n\r\n.kp-art--md {\r\n  width: 100%;\r\n}\r\n\r\n.kp-art--lg {\r\n  width: 120px;\r\n}\r\n\r\n.kp-art--sm {\r\n  width: 44px;\r\n  border-width: 2px;\r\n  border-radius: var(--r-sm);\r\n}\r\n\r\n.kp-badge {\r\n  position: absolute;\r\n  right: 4px;\r\n  bottom: 4px;\r\n  padding: 1px 6px;\r\n  border-radius: var(--r-pill);\r\n  background: color-mix(in srgb, var(--bg) 85%, transparent);\r\n  color: var(--fg);\r\n  font-family: var(--mono);\r\n  font-size: var(--t-meta);\r\n  line-height: 1.4;\r\n}\r\n\r\n.kp-badge--lock {\r\n  top: 4px;\r\n  bottom: auto;\r\n  color: var(--warn);\r\n}\r\n\r\n.kp-art--sm .kp-badge {\r\n  right: 1px;\r\n  bottom: 1px;\r\n  padding: 0 3px;\r\n  font-size: 9px;\r\n}\r\n\r\n.kp-art--sm .kp-badge--lock {\r\n  top: 1px;\r\n  bottom: auto;\r\n}\r\n\r\n.kp-swap {\r\n  align-self: center;\r\n  color: var(--mut);\r\n  font-size: 18px;\r\n  text-align: center;\r\n}\r\n\r\n.kp-btn {\r\n  display: inline-flex;\r\n  align-items: center;\r\n  justify-content: center;\r\n  gap: 6px;\r\n  padding: 6px 10px;\r\n  border: 1px solid transparent;\r\n  border-radius: var(--r-md);\r\n  background: var(--acc);\r\n  color: #fff;\r\n  font: 600 var(--t-sm) var(--body);\r\n  cursor: pointer;\r\n  transition: background 0.15s, opacity 0.15s;\r\n}\r\n\r\n.kp-btn[hidden] {\r\n  display: none;\r\n}\r\n\r\n.kp-btn:hover {\r\n  background: var(--acc2);\r\n}\r\n\r\n.kp-btn--ghost {\r\n  border-color: var(--line2);\r\n  background: transparent;\r\n  color: var(--fg);\r\n}\r\n\r\n.kp-btn--ghost:hover {\r\n  background: var(--raise);\r\n}\r\n\r\n.kp-btn--warn {\r\n  background: var(--warn);\r\n  color: var(--bg);\r\n}\r\n\r\n.kp-btn--double {\r\n  background: #ff5f1f;\r\n  color: var(--bg);\r\n}\r\n\r\n.kp-btn--double:hover {\r\n  background: #ff7a45;\r\n}\r\n\r\n.kp-btn--single {\r\n  background: var(--gold);\r\n  color: var(--bg);\r\n}\r\n\r\n.kp-btn--single:hover {\r\n  background: #ffd84d;\r\n}\r\n\r\n.kp-btn--sm {\r\n  padding: 4px 8px;\r\n  font-size: var(--t-meta);\r\n}\r\n\r\n.kp-gain {\r\n  padding: 1px 6px;\r\n  border-radius: var(--r-pill);\r\n  font-family: var(--mono);\r\n  font-size: var(--t-meta);\r\n  white-space: nowrap;\r\n}\r\n\r\n.kp-gain--up {\r\n  background: color-mix(in srgb, var(--ok) 18%, transparent);\r\n  color: var(--ok);\r\n}\r\n\r\n.kp-gain--down {\r\n  background: color-mix(in srgb, var(--danger) 18%, transparent);\r\n  color: var(--danger);\r\n}\r\n\r\n.kp-gain--flat {\r\n  background: var(--raise);\r\n  color: var(--mut);\r\n}\r\n\r\n.kp-btn .kp-gain {\r\n  background: var(--bg);\r\n}\r\n\r\n.kp-board {\r\n  display: flex;\r\n  flex-direction: column;\r\n  gap: var(--s-4);\r\n}\r\n\r\n.kp-board__bar {\r\n  display: flex;\r\n  flex-wrap: wrap;\r\n  align-items: flex-end;\r\n  justify-content: space-between;\r\n  gap: var(--s-3);\r\n}\r\n\r\n.kp-board__actions {\r\n  display: flex;\r\n  gap: var(--s-2);\r\n}\r\n\r\n.kp-board__list {\r\n  display: flex;\r\n  flex-direction: column;\r\n  gap: var(--s-5);\r\n}\r\n\r\n.kp-group {\r\n  display: flex;\r\n  flex-direction: column;\r\n  gap: var(--s-3);\r\n}\r\n\r\n.kp-group__title {\r\n  margin: 0;\r\n  padding-bottom: var(--s-2);\r\n  border-bottom: 1px solid color-mix(in srgb, var(--kp-rarity) 40%, transparent);\r\n  color: var(--kp-rarity);\r\n  font-family: var(--disp);\r\n  font-size: var(--t-base);\r\n}\r\n\r\n.kp-offer {\r\n  position: relative;\r\n  display: grid;\r\n  grid-template-columns: 132px 24px minmax(0, 1fr);\r\n  gap: var(--s-4);\r\n  padding: var(--s-3);\r\n  border: 1px solid var(--line);\r\n  border-radius: var(--r-lg);\r\n  background: var(--panel);\r\n  transition: opacity 0.15s;\r\n}\r\n\r\n.kp-offer__get,\r\n.kp-option {\r\n  display: flex;\r\n  flex-direction: column;\r\n  gap: 4px;\r\n  min-width: 0;\r\n}\r\n\r\n.kp-offer__give {\r\n  display: flex;\r\n  flex-direction: column;\r\n  gap: var(--s-2);\r\n  min-width: 0;\r\n}\r\n\r\n.kp-options {\r\n  display: grid;\r\n  grid-template-columns: repeat(5, 112px);\r\n  justify-content: start;\r\n  gap: var(--s-3);\r\n}\r\n\r\n.kp-option--missing {\r\n  opacity: 0.35;\r\n}\r\n\r\n.kp-option .kp-btn {\r\n  width: 100%;\r\n  margin-top: auto;\r\n  padding: 4px 6px;\r\n  font-size: var(--t-meta);\r\n}\r\n\r\n.kp-hide {\r\n  display: inline-flex;\r\n  align-items: center;\r\n  justify-content: center;\r\n  width: 26px;\r\n  height: 26px;\r\n  padding: 0;\r\n  border: 1px solid var(--line2);\r\n  border-radius: var(--r-pill);\r\n  background: var(--panel2);\r\n  color: var(--mut);\r\n  cursor: pointer;\r\n}\r\n\r\n.kp-hide:hover {\r\n  background: var(--raise);\r\n  color: var(--fg);\r\n}\r\n\r\n.kp-offer > .kp-hide {\r\n  position: absolute;\r\n  top: var(--s-2);\r\n  right: var(--s-2);\r\n}\r\n\r\n.kp-deal .kp-hide {\r\n  width: 22px;\r\n  height: 22px;\r\n  margin-left: auto;\r\n  font-size: 11px;\r\n}\r\n\r\n.kp-more {\r\n  align-self: center;\r\n}\r\n\r\n.is-busy {\r\n  opacity: 0.45;\r\n  pointer-events: none;\r\n}\r\n\r\n.kp-side {\r\n  display: flex;\r\n  flex-direction: column;\r\n  gap: var(--s-5);\r\n  height: 100%;\r\n  overflow-y: auto;\r\n  padding: var(--s-4);\r\n  border: 1px solid var(--line);\r\n  border-radius: var(--r-lg);\r\n  background: var(--panel);\r\n}\r\n\r\n.kp-side__controls {\r\n  position: sticky;\r\n  top: calc(-1 * var(--s-4));\r\n  z-index: 1;\r\n  margin: calc(-1 * var(--s-4)) calc(-1 * var(--s-4)) 0;\r\n  padding: var(--s-3) var(--s-4);\r\n  border-bottom: 1px solid var(--line);\r\n  background: var(--panel);\r\n}\r\n\r\n.kp-side__block {\r\n  display: flex;\r\n  flex-direction: column;\r\n  gap: var(--s-3);\r\n}\r\n\r\n.kp-field {\r\n  display: flex;\r\n  align-items: center;\r\n  gap: var(--s-2);\r\n}\r\n\r\n.kp-input {\r\n  flex: 1;\r\n  min-width: 0;\r\n  padding: 6px 10px;\r\n  border: 1px solid var(--line2);\r\n  border-radius: var(--r-md);\r\n  background: var(--bg2);\r\n  color: var(--fg);\r\n  font-family: var(--mono);\r\n}\r\n\r\n.kp-input:focus {\r\n  border-color: var(--acc);\r\n  outline: none;\r\n}\r\n\r\n.kp-board__search {\r\n  flex-basis: 100%;\r\n  max-width: 420px;\r\n}\r\n\r\n.kp-deals {\r\n  display: flex;\r\n  flex-direction: column;\r\n  gap: var(--s-2);\r\n}\r\n\r\n.kp-deal {\r\n  display: grid;\r\n  grid-template-columns: 44px auto 44px minmax(0, 1fr);\r\n  align-items: center;\r\n  gap: var(--s-2);\r\n  padding: var(--s-2);\r\n  border: 1px solid var(--line);\r\n  border-radius: var(--r-md);\r\n  background: var(--panel2);\r\n}\r\n\r\n.kp-deal .kp-swap {\r\n  font-size: 12px;\r\n}\r\n\r\n.kp-deal__info {\r\n  display: flex;\r\n  flex-direction: column;\r\n  gap: 2px;\r\n  min-width: 0;\r\n}\r\n\r\n.kp-deal__actions {\r\n  display: flex;\r\n  align-items: center;\r\n  justify-content: space-between;\r\n  gap: var(--s-2);\r\n  margin-top: 2px;\r\n}\r\n\r\n.kp-deal.is-new {\r\n  border-color: var(--acc);\r\n  box-shadow: 0 0 0 1px var(--acc-soft);\r\n}\r\n\r\n.kp-new {\r\n  margin-right: 6px;\r\n  padding: 1px 6px;\r\n  border-radius: var(--r-pill);\r\n  background: var(--acc);\r\n  color: #fff;\r\n  font-size: var(--t-meta);\r\n  font-weight: 700;\r\n}\r\n\r\n.kp-auto {\r\n  padding: var(--s-3);\r\n  border: 1px solid var(--line2);\r\n  border-radius: var(--r-md);\r\n  background: var(--panel2);\r\n}\r\n\r\n.kp-auto__head {\r\n  display: flex;\r\n  align-items: center;\r\n  justify-content: space-between;\r\n  gap: var(--s-2);\r\n}\r\n\r\n.kp-rules {\r\n  border-spacing: 4px;\r\n  margin: 0 -4px;\r\n}\r\n\r\n.kp-rules th {\r\n  font-weight: 400;\r\n  text-align: center;\r\n}\r\n\r\n.kp-rules thead th:first-child {\r\n  max-width: 90px;\r\n  text-align: left;\r\n}\r\n\r\n.kp-gem {\r\n  display: inline-grid;\r\n  place-items: center;\r\n  width: 22px;\r\n  height: 22px;\r\n  border: 2px solid var(--kp-rarity);\r\n  border-radius: 50%;\r\n  color: var(--kp-rarity);\r\n  font: 900 10px var(--body);\r\n}\r\n\r\n.kp-rule {\r\n  display: block;\r\n  width: 28px;\r\n  height: 28px;\r\n  margin: auto;\r\n  border: 1px solid var(--line2);\r\n  border-radius: var(--r-sm, 6px);\r\n  background: transparent;\r\n  cursor: pointer;\r\n}\r\n\r\n.kp-rule:hover {\r\n  border-color: var(--kp-rarity);\r\n}\r\n\r\n.kp-rule[aria-pressed='true'] {\r\n  border-color: var(--kp-rarity);\r\n  background: var(--kp-rarity);\r\n  box-shadow: 0 0 10px color-mix(in srgb, var(--kp-rarity) 50%, transparent);\r\n}\r\n\r\n.kp-side__tabs {\r\n  display: flex;\r\n  gap: var(--s-2);\r\n}\r\n\r\n.kp-side__view {\r\n  display: flex;\r\n  flex-direction: column;\r\n  gap: var(--s-5);\r\n}\r\n\r\n.kp-side__view[hidden] {\r\n  display: none;\r\n}\r\n\r\n/* A dot on the Auto-accept tab while it runs, so it stays visible from the Offres tab. */\r\n.kp-side__tabs .kp-chip.is-live::after {\r\n  content: '';\r\n  display: inline-block;\r\n  width: 7px;\r\n  height: 7px;\r\n  margin-left: 6px;\r\n  border-radius: 50%;\r\n  background: var(--ok);\r\n  box-shadow: 0 0 6px var(--ok);\r\n  vertical-align: middle;\r\n}\r\n\r\n.kp-auto__head .kp-btn:disabled {\r\n  cursor: not-allowed;\r\n}\r\n\r\n.kp-auto > .kp-chip {\r\n  align-self: flex-start;\r\n}\r\n\r\n.kp-toasts {\r\n  position: fixed;\r\n  right: 16px;\r\n  bottom: 16px;\r\n  z-index: 2147483647;\r\n  display: flex;\r\n  flex-direction: column;\r\n  gap: var(--s-2);\r\n}\r\n\r\n.kp-toast {\r\n  max-width: 360px;\r\n  padding: 10px 14px;\r\n  border: 1px solid var(--line2);\r\n  border-radius: var(--r-md);\r\n  background: var(--raise);\r\n  box-shadow: var(--sh-1);\r\n  color: var(--fg);\r\n  font-size: var(--t-sm);\r\n}\r\n\r\n.kp-toast--success {\r\n  border-color: var(--ok);\r\n}\r\n\r\n.kp-toast--error {\r\n  border-color: var(--danger);\r\n}\r\n\r\n.kp-replaced {\r\n  display: none !important;\r\n}\r\n\r\n.tcg.kp-ghost {\r\n  filter: saturate(0.45) brightness(0.8);\r\n}\r\n\r\n.tcg.kp-ghost .art img {\r\n  filter: grayscale(1) brightness(0.7);\r\n}\r\n\r\n.kp-filtered-out {\r\n  display: none !important;\r\n}\r\n\r\n.kp-album-filters {\r\n  display: flex;\r\n  flex-wrap: wrap;\r\n  align-items: center;\r\n  gap: var(--s-3);\r\n  margin: var(--s-3) 0;\r\n}\r\n\r\n.kp-input--short {\r\n  flex: 0 0 72px;\r\n  width: 72px;\r\n}\r\n\r\n.kp-gem-chip {\r\n  display: inline-grid;\r\n  place-items: center;\r\n  width: 26px;\r\n  height: 26px;\r\n  padding: 0;\r\n  border: 2px solid var(--kp-rarity);\r\n  border-radius: 50%;\r\n  background: transparent;\r\n  color: var(--kp-rarity);\r\n  font: 900 11px var(--body);\r\n  cursor: pointer;\r\n}\r\n\r\n.kp-gem-chip[aria-pressed='true'] {\r\n  background: var(--kp-rarity);\r\n  box-shadow: 0 0 12px color-mix(in srgb, var(--kp-rarity) 60%, transparent);\r\n  color: var(--bg);\r\n}\r\n\r\n.kp-btn:disabled {\r\n  opacity: 0.5;\r\n  cursor: progress;\r\n}\r\n\r\n.kp-lock-host {\r\n  position: relative;\r\n}\r\n\r\n.kp-lock-host .pin {\r\n  display: none !important;\r\n}\r\n\r\n.kp-lock {\r\n  position: absolute;\r\n  top: 2px;\r\n  left: 0;\r\n  z-index: 6;\r\n  display: grid;\r\n  place-items: center;\r\n  width: 30px;\r\n  height: 30px;\r\n  padding: 0;\r\n  border: 1px solid var(--line2);\r\n  border-radius: 50%;\r\n  background: var(--panel2);\r\n  color: var(--dim);\r\n  font-size: 13px;\r\n  cursor: pointer;\r\n  opacity: 0;\r\n  transition: opacity 0.15s, color 0.15s;\r\n}\r\n\r\n.kp-lock-host:hover .kp-lock,\r\n.kp-lock.is-locked,\r\n.kp-lock:focus-visible {\r\n  opacity: 1;\r\n}\r\n\r\n.kp-lock.is-locked {\r\n  color: var(--warn);\r\n}\r\n\r\n.kp-lock:hover {\r\n  color: var(--fg);\r\n}\r\n\r\n.kp-pick-host {\r\n  position: relative;\r\n}\r\n\r\n.kp-pick {\r\n  position: absolute;\r\n  top: 2px;\r\n  left: 34px;\r\n  z-index: 6;\r\n  display: grid;\r\n  place-items: center;\r\n  min-width: 30px;\r\n  height: 30px;\r\n  padding: 0 6px;\r\n  border: 1px solid var(--line2);\r\n  border-radius: var(--r-pill);\r\n  background: var(--panel2);\r\n  color: var(--dim);\r\n  font: 700 12px var(--mono);\r\n  cursor: pointer;\r\n  opacity: 0;\r\n  transition: opacity 0.15s, color 0.15s;\r\n}\r\n\r\n.kp-pick-host:hover .kp-pick,\r\n.kp-pick.is-picked,\r\n.kp-pick:focus-visible {\r\n  opacity: 1;\r\n}\r\n\r\n.kp-pick:hover {\r\n  color: var(--fg);\r\n}\r\n\r\n.kp-pick.is-picked {\r\n  border-color: var(--acc);\r\n  background: var(--acc);\r\n  color: #fff;\r\n}\r\n\r\n.kp-picked .slot {\r\n  outline: 2px solid var(--acc);\r\n  outline-offset: 2px;\r\n  border-radius: var(--r-md);\r\n}\r\n\r\n.kp-pick-bar {\r\n  position: fixed;\r\n  bottom: 16px;\r\n  left: 50%;\r\n  z-index: 1000;\r\n  display: flex;\r\n  align-items: center;\r\n  gap: var(--s-3);\r\n  padding: 8px 8px 8px 16px;\r\n  border: 1px solid var(--acc);\r\n  border-radius: var(--r-pill);\r\n  background: var(--raise);\r\n  box-shadow: var(--sh-1);\r\n  color: var(--fg);\r\n  font-size: var(--t-sm);\r\n  transform: translateX(-50%);\r\n}\r\n\r\n.kp-pick-bar[hidden] {\r\n  display: none;\r\n}\r\n\r\n.kp-fair {\r\n  display: flex;\r\n  flex-direction: column;\r\n  gap: 2px;\r\n  padding: var(--s-2) var(--s-3);\r\n  border: 1px solid var(--line2);\r\n  border-radius: var(--r-md);\r\n  background: var(--panel2);\r\n  font-size: var(--t-sm);\r\n}\r\n\r\n.kp-releases {\r\n  display: flex;\r\n  flex-direction: column;\r\n  gap: 2px;\r\n  margin: 0;\r\n  padding: 0;\r\n  list-style: none;\r\n  font-size: var(--t-meta);\r\n}\r\n\r\n.kp-release__time {\r\n  display: inline-block;\r\n  min-width: 82px;\r\n  color: var(--fg2);\r\n  font-family: var(--mono);\r\n}\r\n\r\n\r\n.kp-pc__completion {\r\n  font-weight: 600;\r\n}\r\n\r\n.kp-lock:disabled {\r\n  cursor: progress;\r\n}\r\n\r\nbody[data-kp-trades-tab] main [role='tabpanel'] > h2[data-kp-section],\r\nbody[data-kp-trades-tab='board'] main [data-kp-section]:not([data-kp-section='board']),\r\nbody[data-kp-trades-tab='received'] main [data-kp-section]:not([data-kp-section='received']),\r\nbody[data-kp-trades-tab='sent'] main [data-kp-section]:not([data-kp-section='sent']) {\r\n  display: none !important;\r\n}\r\n\r\n.kp-trade-tabs {\r\n  margin: var(--s-3) 0;\r\n}\r\n\r\n.kp-trade-host > .compact,\r\n.kp-trade-host > .trays,\r\n.kp-trade-host > .verdict,\r\n.kp-trade-host > .more,\r\n.kp-trade-host > .sides {\r\n  display: none !important;\r\n}\r\n\r\n.kp-badge--new {\r\n  color: var(--ok);\r\n}\r\n\r\n[data-kp-section='board'] .kp-trade-host {\r\n  text-align: center;\r\n}\r\n\r\n[data-kp-section='board'] .kp-trade-host > .th {\r\n  justify-content: center;\r\n  gap: var(--s-2);\r\n}\r\n\r\nbody[data-kp-trades-tab] main [role='tabpanel'] ul.trades[data-kp-section='board'] {\r\n  display: grid;\r\n  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));\r\n  align-items: start;\r\n  gap: var(--s-3);\r\n}\r\n\r\n.kp-trade {\r\n  display: grid;\r\n  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);\r\n  align-items: start;\r\n  gap: var(--s-2);\r\n  margin: var(--s-2) 0;\r\n}\r\n\r\n.kp-trade > .kp-swap {\r\n  align-self: center;\r\n  color: var(--acc);\r\n  font-size: 14px;\r\n}\r\n\r\n.kp-trade__side {\r\n  display: flex;\r\n  flex-direction: column;\r\n  align-items: center;\r\n  gap: var(--s-2);\r\n  min-width: 0;\r\n}\r\n\r\n.kp-trade__cards {\r\n  display: flex;\r\n  flex-wrap: wrap;\r\n  justify-content: center;\r\n  gap: var(--s-2);\r\n}\r\n\r\n.kp-tcard {\r\n  display: flex;\r\n  flex-direction: column;\r\n  align-items: center;\r\n  gap: 2px;\r\n  width: 92px;\r\n  min-width: 0;\r\n}\r\n\r\n.kp-tcard .kp-name {\r\n  max-width: 100%;\r\n}\r\n\r\n.kp-trade__cards:has(> .kp-tcard:nth-child(2)) .kp-tcard {\r\n  width: 60px;\r\n}\r\n\r\n.kp-trade__total {\r\n  color: var(--mut);\r\n}\r\n\r\n.kp-trade__net {\r\n  grid-column: 1 / -1;\r\n  justify-self: center;\r\n  font-family: var(--mono);\r\n  font-size: var(--t-base);\r\n  font-weight: 700;\r\n}\r\n\r\n.kp-trade__net--up {\r\n  color: var(--ok);\r\n}\r\n\r\n.kp-trade__net--down {\r\n  color: var(--danger);\r\n}\r\n\r\n.kp-trade__net--flat {\r\n  color: var(--mut);\r\n}\r\n\r\n.kp-trade--wide {\r\n  display: grid;\r\n  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);\r\n  align-items: stretch;\r\n  gap: var(--s-3);\r\n}\r\n\r\n.kp-trade--wide > .kp-swap {\r\n  align-self: center;\r\n  color: var(--acc);\r\n}\r\n\r\n.kp-trade__summary {\r\n  display: inline-flex;\r\n  align-items: center;\r\n  gap: var(--s-3);\r\n  margin-left: auto;\r\n  margin-right: var(--s-2);\r\n}\r\n\r\n.kp-pill {\r\n  padding: 2px 10px;\r\n  border: 1px solid currentColor;\r\n  border-radius: var(--r-pill);\r\n  font-family: var(--mono);\r\n  font-size: var(--t-sm);\r\n  font-weight: 700;\r\n}\r\n\r\n.kp-pill--up {\r\n  color: var(--ok);\r\n}\r\n\r\n.kp-pill--down {\r\n  color: var(--danger);\r\n}\r\n\r\n.kp-pill--flat {\r\n  color: var(--mut);\r\n}\r\n\r\n.kp-trade__box {\r\n  container-type: inline-size;\r\n  display: flex;\r\n  flex-direction: column;\r\n  gap: var(--s-2);\r\n  padding: var(--s-2) var(--s-3) var(--s-3);\r\n  border: 1px solid var(--line);\r\n  border-radius: var(--r-lg);\r\n  background: var(--panel2);\r\n}\r\n\r\n.kp-trade__box-head {\r\n  display: flex;\r\n  flex-wrap: wrap;\r\n  align-items: center;\r\n  gap: var(--s-1) var(--s-3);\r\n}\r\n\r\n.kp-trade__box-total {\r\n  margin-left: auto;\r\n}\r\n\r\n.kp-trade__grid {\r\n  display: grid;\r\n  grid-template-columns: repeat(10, minmax(0, 1fr));\r\n  gap: 6px;\r\n}\r\n\r\n@container (max-width: 480px) {\r\n  .kp-trade__grid {\r\n    grid-template-columns: repeat(5, minmax(0, 1fr));\r\n  }\r\n}\r\n\r\n.kp-trade__grid .kp-tcard {\r\n  width: auto;\r\n}\r\n\r\n.kp-trade__box .kp-badge {\r\n  right: 2px;\r\n  bottom: 2px;\r\n  padding: 0 4px;\r\n  font-size: 9px;\r\n}\r\n\r\n.kp-trade__note {\r\n  font-size: var(--t-meta);\r\n  font-weight: 600;\r\n}\r\n\r\n.kp-trade__note--warn {\r\n  color: var(--warn);\r\n}\r\n\r\n.kp-trade__note--new {\r\n  color: var(--ok);\r\n}\r\n\r\n.kp-trade__note--muted {\r\n  color: var(--fg2);\r\n}\r\n\r\n.kp-trade-host .tact .talk {\r\n  display: none !important;\r\n}\r\n\r\n.kp-trade-host .tact:not(:has(> :not(.talk))) {\r\n  display: none !important;\r\n}\r\n\r\n.kp-talk {\r\n  display: inline-grid;\r\n  place-items: center;\r\n  width: 22px;\r\n  height: 22px;\r\n  margin-left: 6px;\r\n  padding: 0;\r\n  border: none;\r\n  border-radius: 50%;\r\n  background: transparent;\r\n  color: var(--mut);\r\n  font-size: 13px;\r\n  vertical-align: middle;\r\n  cursor: pointer;\r\n}\r\n\r\n.kp-talk:hover {\r\n  background: var(--raise);\r\n  color: var(--fg);\r\n}\r\n\r\n.kp-count-host {\r\n  container-type: inline-size;\r\n}\r\n\r\n/* The tile image spans the tile width with a 5:7 ratio, so its bottom edge sits at 140% of that width. */\r\n.kp-count {\r\n  position: absolute;\r\n  top: calc(140cqw - 22px);\r\n  right: 5px;\r\n  padding: 0 6px;\r\n  border-radius: var(--r-pill);\r\n  background: #0a090ed9;\r\n  color: var(--fg2);\r\n  font: 700 11px var(--mono);\r\n  line-height: 18px;\r\n  pointer-events: none;\r\n}\r\n\r\n.kp-count--dupe {\r\n  color: var(--ok);\r\n}\r\n\r\n.kp-site-only {\r\n  display: none !important;\r\n}\r\n\r\n.kp-native-hidden {\r\n  display: none !important;\r\n}\r\n\r\nbody.kp-modal-open {\r\n  overflow: hidden;\r\n}\r\n\r\n.kp-modal {\r\n  position: fixed;\r\n  inset: 0;\r\n  z-index: 1000;\r\n  display: grid;\r\n  place-items: center;\r\n  padding: var(--s-4);\r\n  background: color-mix(in srgb, var(--bg) 70%, transparent);\r\n  backdrop-filter: blur(4px);\r\n}\r\n\r\n.kp-pc {\r\n  display: flex;\r\n  flex-direction: column;\r\n  width: min(1200px, 100%);\r\n  height: min(900px, 100%);\r\n  overflow: hidden;\r\n  border: 1px solid var(--line2);\r\n  border-radius: var(--r-lg);\r\n  background: var(--panel);\r\n  box-shadow: var(--sh-1);\r\n}\r\n\r\n.kp-pc__head {\r\n  display: flex;\r\n  align-items: center;\r\n  gap: var(--s-3);\r\n  padding: var(--s-3) var(--s-4);\r\n  border-bottom: 1px solid var(--line);\r\n}\r\n\r\n.kp-pc__close {\r\n  margin-left: auto;\r\n}\r\n\r\n.kp-pc__filters {\r\n  display: flex;\r\n  flex-wrap: wrap;\r\n  align-items: center;\r\n  gap: var(--s-2) var(--s-3);\r\n  padding: var(--s-3) var(--s-4);\r\n  border-bottom: 1px solid var(--line);\r\n}\r\n\r\n.kp-pc__filters .kp-input {\r\n  flex: 0 1 200px;\r\n}\r\n\r\n.kp-pc__body {\r\n  flex: 1;\r\n  overflow-y: auto;\r\n  padding: var(--s-4);\r\n}\r\n\r\n.kp-pc__grid {\r\n  display: grid;\r\n  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));\r\n  gap: var(--s-3);\r\n}\r\n\r\n.kp-pc__grid .kp-empty {\r\n  grid-column: 1 / -1;\r\n}\r\n\r\n.kp-pc__sentinel {\r\n  height: 1px;\r\n}\r\n\r\n.kp-pcard {\r\n  display: flex;\r\n  flex-direction: column;\r\n  gap: 2px;\r\n  min-width: 0;\r\n}\r\n\r\n.kp-badge--dupe {\r\n  color: var(--ok);\r\n}\r\n\r\n.kp-badge--corner {\r\n  top: 4px;\r\n  right: auto;\r\n  bottom: auto;\r\n  left: 4px;\r\n}\r\n\r\n.kp-pc__total {\r\n  padding: 2px 10px;\r\n  border: 1px solid var(--line2);\r\n  border-radius: var(--r-pill);\r\n  color: var(--fg);\r\n  font: 700 var(--t-sm) var(--mono);\r\n}\r\n\r\n.kp-friend-search {\r\n  display: block;\r\n  width: 100%;\r\n  max-width: 880px;\r\n  margin-bottom: var(--s-3);\r\n}\r\n\r\nbody.kp-friends main ul.people {\r\n  display: flex;\r\n  flex-direction: column;\r\n}\r\n\r\nbody.kp-friends main ul.people > li.kp-pinned {\r\n  order: -1;\r\n  box-shadow: inset 3px 0 0 var(--gold);\r\n}\r\n\r\n.kp-pin,\r\n.kp-friend-act {\r\n  display: inline-flex !important;\r\n  flex: none;\r\n  align-items: center;\r\n  justify-content: center;\r\n  gap: 0 !important;\r\n  box-sizing: border-box;\r\n  width: 32px;\r\n  height: 32px;\r\n  min-width: 0 !important;\r\n  min-height: 0 !important;\r\n  margin: 0 !important;\r\n  padding: 0 !important;\r\n  line-height: 0 !important;\r\n  vertical-align: middle;\r\n  border: 1px solid var(--line2) !important;\r\n  border-radius: 50% !important;\r\n  background: var(--panel2) !important;\r\n  color: var(--mut) !important;\r\n  font-size: 0 !important;\r\n  text-decoration: none !important;\r\n  cursor: pointer;\r\n  transition: color 0.15s, background 0.15s;\r\n}\r\n\r\n.kp-pin i,\r\n.kp-friend-act i {\r\n  width: 1.25em;\r\n  font-size: 13px;\r\n  line-height: 1;\r\n  text-align: center;\r\n}\r\n\r\n.kp-pin:hover,\r\n.kp-friend-act:hover {\r\n  background: var(--raise) !important;\r\n  color: var(--fg) !important;\r\n}\r\n\r\n.kp-friend-act[data-kp-icon='Retirer']:hover,\r\n.kp-friend-act[data-kp-icon='Bloquer']:hover {\r\n  color: var(--danger) !important;\r\n}\r\n\r\n.kp-pin.is-pinned {\r\n  border-color: var(--gold) !important;\r\n  color: var(--gold) !important;\r\n}\r\n\r\n.kp-pin.is-pinned i {\r\n  transform: rotate(-45deg);\r\n}\r\n\r\n.kp-friend-act--confirm {\r\n  gap: 6px !important;\r\n  width: auto;\r\n  padding: 0 12px !important;\r\n  border-color: var(--danger) !important;\r\n  border-radius: var(--r-pill) !important;\r\n  color: var(--danger) !important;\r\n  font-size: var(--t-sm) !important;\r\n  line-height: 1 !important;\r\n}\r\n\r\n.kp-series-collapsed > ul.quests {\r\n  display: none !important;\r\n}\r\n\r\n.kp-series-toggle {\r\n  display: inline-flex;\r\n  align-items: center;\r\n  gap: var(--s-2);\r\n  margin-left: auto;\r\n  padding: 4px 12px;\r\n  border: 1px solid var(--line2);\r\n  border-radius: var(--r-pill);\r\n  background: var(--panel2);\r\n  color: var(--fg2);\r\n  font: 600 var(--t-sm) var(--body);\r\n  cursor: pointer;\r\n}\r\n\r\n.kp-series-toggle:hover {\r\n  background: var(--raise);\r\n  color: var(--fg);\r\n}\r\n\r\n.kp-series-summary.has-claim {\r\n  color: var(--ok);\r\n}\r\n\r\n.kp-series-chevron {\r\n  display: inline-flex;\r\n  font-size: 11px;\r\n  transition: transform 0.15s;\r\n}\r\n\r\n.kp-series-toggle[aria-expanded='true'] .kp-series-chevron {\r\n  transform: rotate(180deg);\r\n}\r\n\r\nhtml:has(body.kp-video-bg),\r\nbody.kp-video-bg,\r\nbody.kp-video-bg main section.band,\r\nbody.kp-video-bg main .box.coll {\r\n  background: transparent !important;\r\n}\r\n\r\n.kp-bg-video {\r\n  position: fixed;\r\n  inset: 0;\r\n  z-index: -1;\r\n  width: 100vw;\r\n  height: 100vh;\r\n  object-fit: cover;\r\n  filter: brightness(0.45);\r\n  pointer-events: none;\r\n}\r\n\r\n.kp-filters__rarities {\r\n  margin-left: auto;\r\n}\r\n\r\n.kp-free-count[hidden] {\r\n  display: none !important;\r\n}\r\n\r\n/* The site's own label still describes its largest batch, so it is swapped for the free count while selected. */\r\nbody.kp-free-mode main .under .btn-open[data-kp-label] {\r\n  font-size: 0 !important;\r\n}\r\n\r\nbody.kp-free-mode main .under .btn-open[data-kp-label] > * {\r\n  display: none !important;\r\n}\r\n\r\nbody.kp-free-mode main .under .btn-open[data-kp-label]::after {\r\n  content: attr(data-kp-label);\r\n  font-size: var(--t-base, 1rem);\r\n}\r\n";
+  var styles_default = `body.kp-market main aside.chat-side > :not(.kp-side) {\r
+  display: none !important;\r
+}\r
+\r
+body.kp-market:not(.kp-offers) main aside.chat-side {\r
+  display: none !important;\r
+}\r
+\r
+body.kp-market:not(.kp-offers) main .layout {\r
+  grid-template-columns: minmax(0, 1fr) !important;\r
+}\r
+\r
+body.kp-offers main .wrap {\r
+  --wrap: 1320px;\r
+}\r
+\r
+body.kp-offers main .layout {\r
+  grid-template-columns: minmax(0, 1fr) 400px !important;\r
+}\r
+\r
+/* The site may render its offer dialogs inside the board, so only the board's own content is hidden. */\r
+body.kp-offers main section.board {\r
+  display: contents !important;\r
+}\r
+\r
+body.kp-offers main section.board > :not([role='dialog']):not(:has([role='dialog'])) {\r
+  display: none !important;\r
+}\r
+\r
+.kp-tab-link {\r
+  display: inline-flex;\r
+  align-items: center;\r
+  color: inherit;\r
+  text-decoration: none;\r
+}\r
+\r
+.kp-filters {\r
+  display: flex;\r
+  flex-wrap: wrap;\r
+  gap: var(--s-2);\r
+}\r
+\r
+.kp-chip {\r
+  padding: 5px 12px;\r
+  border: 1px solid var(--line2);\r
+  border-radius: var(--r-pill);\r
+  background: transparent;\r
+  color: var(--fg2);\r
+  font: 500 var(--t-sm) var(--body);\r
+  cursor: pointer;\r
+}\r
+\r
+.kp-chip:hover {\r
+  background: var(--raise);\r
+}\r
+\r
+.kp-chip[aria-pressed='true'] {\r
+  border-color: var(--acc);\r
+  background: var(--acc-soft);\r
+  color: var(--fg);\r
+}\r
+\r
+.kp-title {\r
+  margin: 0;\r
+  font-family: var(--disp);\r
+  font-size: var(--t-h3);\r
+}\r
+\r
+.kp-title--sm {\r
+  font-size: var(--t-base);\r
+}\r
+\r
+.kp-muted,\r
+.kp-empty {\r
+  margin: 0;\r
+  color: var(--mut);\r
+  font-size: var(--t-sm);\r
+}\r
+\r
+.kp-empty {\r
+  padding: var(--s-6) 0;\r
+  text-align: center;\r
+}\r
+\r
+.kp-label {\r
+  color: var(--mut);\r
+  font-size: var(--t-meta);\r
+  letter-spacing: 0.06em;\r
+  text-transform: uppercase;\r
+}\r
+\r
+.kp-name {\r
+  overflow: hidden;\r
+  font-size: var(--t-sm);\r
+  text-overflow: ellipsis;\r
+  white-space: nowrap;\r
+}\r
+\r
+.kp-price {\r
+  color: var(--fg2);\r
+  font-family: var(--mono);\r
+  font-size: var(--t-meta);\r
+}\r
+\r
+.kp-note {\r
+  overflow: hidden;\r
+  color: var(--mut);\r
+  font-size: var(--t-meta);\r
+  text-overflow: ellipsis;\r
+  white-space: nowrap;\r
+}\r
+\r
+.kp-note--warn {\r
+  color: var(--warn);\r
+}\r
+\r
+.kp-note--new {\r
+  color: var(--ok);\r
+}\r
+\r
+.kp-note--wish {\r
+  color: var(--wish);\r
+}\r
+\r
+.kp-tag {\r
+  align-self: flex-start;\r
+  padding: 2px 8px;\r
+  border: 1px solid var(--line2);\r
+  border-radius: var(--r-pill);\r
+  color: var(--fg2);\r
+  font-size: var(--t-meta);\r
+}\r
+\r
+.kp-art {\r
+  position: relative;\r
+  display: block;\r
+  overflow: hidden;\r
+  aspect-ratio: 2 / 3;\r
+  border: 3px solid var(--kp-rarity);\r
+  border-radius: var(--r-md);\r
+  background: var(--bg2);\r
+  box-shadow: 0 0 14px color-mix(in srgb, var(--kp-rarity) 30%, transparent);\r
+}\r
+\r
+.kp-art img {\r
+  display: block;\r
+  width: 100%;\r
+  height: 100%;\r
+  object-fit: cover;\r
+}\r
+\r
+.kp-art--md {\r
+  width: 100%;\r
+}\r
+\r
+.kp-art--lg {\r
+  width: 120px;\r
+}\r
+\r
+.kp-art--sm {\r
+  width: 44px;\r
+  border-width: 2px;\r
+  border-radius: var(--r-sm);\r
+}\r
+\r
+.kp-badge {\r
+  position: absolute;\r
+  right: 4px;\r
+  bottom: 4px;\r
+  padding: 1px 6px;\r
+  border-radius: var(--r-pill);\r
+  background: color-mix(in srgb, var(--bg) 85%, transparent);\r
+  color: var(--fg);\r
+  font-family: var(--mono);\r
+  font-size: var(--t-meta);\r
+  line-height: 1.4;\r
+}\r
+\r
+.kp-badge--lock {\r
+  top: 4px;\r
+  bottom: auto;\r
+  color: var(--warn);\r
+}\r
+\r
+.kp-art--sm .kp-badge {\r
+  right: 1px;\r
+  bottom: 1px;\r
+  padding: 0 3px;\r
+  font-size: 9px;\r
+}\r
+\r
+.kp-art--sm .kp-badge--lock {\r
+  top: 1px;\r
+  bottom: auto;\r
+}\r
+\r
+.kp-swap {\r
+  align-self: center;\r
+  color: var(--mut);\r
+  font-size: 18px;\r
+  text-align: center;\r
+}\r
+\r
+.kp-btn {\r
+  display: inline-flex;\r
+  align-items: center;\r
+  justify-content: center;\r
+  gap: 6px;\r
+  padding: 6px 10px;\r
+  border: 1px solid transparent;\r
+  border-radius: var(--r-md);\r
+  background: var(--acc);\r
+  color: #fff;\r
+  font: 600 var(--t-sm) var(--body);\r
+  cursor: pointer;\r
+  transition: background 0.15s, opacity 0.15s;\r
+}\r
+\r
+.kp-btn[hidden] {\r
+  display: none;\r
+}\r
+\r
+.kp-btn:hover {\r
+  background: var(--acc2);\r
+}\r
+\r
+.kp-btn--ghost {\r
+  border-color: var(--line2);\r
+  background: transparent;\r
+  color: var(--fg);\r
+}\r
+\r
+.kp-btn--ghost:hover {\r
+  background: var(--raise);\r
+}\r
+\r
+.kp-btn--warn {\r
+  background: var(--warn);\r
+  color: var(--bg);\r
+}\r
+\r
+.kp-btn--double {\r
+  background: #ff5f1f;\r
+  color: var(--bg);\r
+}\r
+\r
+.kp-btn--double:hover {\r
+  background: #ff7a45;\r
+}\r
+\r
+.kp-btn--single {\r
+  background: var(--gold);\r
+  color: var(--bg);\r
+}\r
+\r
+.kp-btn--single:hover {\r
+  background: #ffd84d;\r
+}\r
+\r
+.kp-btn--sm {\r
+  padding: 4px 8px;\r
+  font-size: var(--t-meta);\r
+}\r
+\r
+.kp-gain {\r
+  padding: 1px 6px;\r
+  border-radius: var(--r-pill);\r
+  font-family: var(--mono);\r
+  font-size: var(--t-meta);\r
+  white-space: nowrap;\r
+}\r
+\r
+.kp-gain--up {\r
+  background: color-mix(in srgb, var(--ok) 18%, transparent);\r
+  color: var(--ok);\r
+}\r
+\r
+.kp-gain--down {\r
+  background: color-mix(in srgb, var(--danger) 18%, transparent);\r
+  color: var(--danger);\r
+}\r
+\r
+.kp-gain--flat {\r
+  background: var(--raise);\r
+  color: var(--mut);\r
+}\r
+\r
+.kp-btn .kp-gain {\r
+  background: var(--bg);\r
+}\r
+\r
+.kp-board {\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: var(--s-4);\r
+}\r
+\r
+.kp-board__bar {\r
+  display: flex;\r
+  flex-wrap: wrap;\r
+  align-items: flex-end;\r
+  justify-content: space-between;\r
+  gap: var(--s-3);\r
+}\r
+\r
+.kp-board__actions {\r
+  display: flex;\r
+  gap: var(--s-2);\r
+}\r
+\r
+.kp-board__list {\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: var(--s-5);\r
+}\r
+\r
+.kp-group {\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: var(--s-3);\r
+}\r
+\r
+.kp-group__title {\r
+  margin: 0;\r
+  padding-bottom: var(--s-2);\r
+  border-bottom: 1px solid color-mix(in srgb, var(--kp-rarity) 40%, transparent);\r
+  color: var(--kp-rarity);\r
+  font-family: var(--disp);\r
+  font-size: var(--t-base);\r
+}\r
+\r
+.kp-offer {\r
+  position: relative;\r
+  display: grid;\r
+  grid-template-columns: 132px 24px minmax(0, 1fr);\r
+  gap: var(--s-4);\r
+  padding: var(--s-3);\r
+  border: 1px solid var(--line);\r
+  border-radius: var(--r-lg);\r
+  background: var(--panel);\r
+  transition: opacity 0.15s;\r
+}\r
+\r
+.kp-offer__get,\r
+.kp-option {\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: 4px;\r
+  min-width: 0;\r
+}\r
+\r
+.kp-offer__give {\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: var(--s-2);\r
+  min-width: 0;\r
+}\r
+\r
+.kp-options {\r
+  display: grid;\r
+  grid-template-columns: repeat(5, 112px);\r
+  justify-content: start;\r
+  gap: var(--s-3);\r
+}\r
+\r
+.kp-option--missing {\r
+  opacity: 0.35;\r
+}\r
+\r
+.kp-option .kp-btn {\r
+  width: 100%;\r
+  margin-top: auto;\r
+  padding: 4px 6px;\r
+  font-size: var(--t-meta);\r
+}\r
+\r
+.kp-hide {\r
+  display: inline-flex;\r
+  align-items: center;\r
+  justify-content: center;\r
+  width: 26px;\r
+  height: 26px;\r
+  padding: 0;\r
+  border: 1px solid var(--line2);\r
+  border-radius: var(--r-pill);\r
+  background: var(--panel2);\r
+  color: var(--mut);\r
+  cursor: pointer;\r
+}\r
+\r
+.kp-hide:hover {\r
+  background: var(--raise);\r
+  color: var(--fg);\r
+}\r
+\r
+.kp-offer > .kp-hide {\r
+  position: absolute;\r
+  top: var(--s-2);\r
+  right: var(--s-2);\r
+}\r
+\r
+.kp-deal .kp-hide {\r
+  width: 22px;\r
+  height: 22px;\r
+  margin-left: auto;\r
+  font-size: 11px;\r
+}\r
+\r
+.kp-more {\r
+  align-self: center;\r
+}\r
+\r
+.is-busy {\r
+  opacity: 0.45;\r
+  pointer-events: none;\r
+}\r
+\r
+.kp-side {\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: var(--s-5);\r
+  height: 100%;\r
+  overflow-y: auto;\r
+  padding: var(--s-4);\r
+  border: 1px solid var(--line);\r
+  border-radius: var(--r-lg);\r
+  background: var(--panel);\r
+}\r
+\r
+.kp-side__controls {\r
+  position: sticky;\r
+  top: calc(-1 * var(--s-4));\r
+  z-index: 1;\r
+  margin: calc(-1 * var(--s-4)) calc(-1 * var(--s-4)) 0;\r
+  padding: var(--s-3) var(--s-4);\r
+  border-bottom: 1px solid var(--line);\r
+  background: var(--panel);\r
+}\r
+\r
+.kp-side__block {\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: var(--s-3);\r
+}\r
+\r
+.kp-field {\r
+  display: flex;\r
+  align-items: center;\r
+  gap: var(--s-2);\r
+}\r
+\r
+.kp-input {\r
+  flex: 1;\r
+  min-width: 0;\r
+  padding: 6px 10px;\r
+  border: 1px solid var(--line2);\r
+  border-radius: var(--r-md);\r
+  background: var(--bg2);\r
+  color: var(--fg);\r
+  font-family: var(--mono);\r
+}\r
+\r
+.kp-input:focus {\r
+  border-color: var(--acc);\r
+  outline: none;\r
+}\r
+\r
+.kp-board__search {\r
+  flex-basis: 100%;\r
+  max-width: 420px;\r
+}\r
+\r
+.kp-deals {\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: var(--s-2);\r
+}\r
+\r
+.kp-deal {\r
+  display: grid;\r
+  grid-template-columns: 44px auto 44px minmax(0, 1fr);\r
+  align-items: center;\r
+  gap: var(--s-2);\r
+  padding: var(--s-2);\r
+  border: 1px solid var(--line);\r
+  border-radius: var(--r-md);\r
+  background: var(--panel2);\r
+}\r
+\r
+.kp-deal .kp-swap {\r
+  font-size: 12px;\r
+}\r
+\r
+.kp-deal__info {\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: 2px;\r
+  min-width: 0;\r
+}\r
+\r
+.kp-deal__actions {\r
+  display: flex;\r
+  align-items: center;\r
+  justify-content: space-between;\r
+  gap: var(--s-2);\r
+  margin-top: 2px;\r
+}\r
+\r
+.kp-deal.is-new {\r
+  border-color: var(--acc);\r
+  box-shadow: 0 0 0 1px var(--acc-soft);\r
+}\r
+\r
+.kp-new {\r
+  margin-right: 6px;\r
+  padding: 1px 6px;\r
+  border-radius: var(--r-pill);\r
+  background: var(--acc);\r
+  color: #fff;\r
+  font-size: var(--t-meta);\r
+  font-weight: 700;\r
+}\r
+\r
+.kp-auto {\r
+  padding: var(--s-3);\r
+  border: 1px solid var(--line2);\r
+  border-radius: var(--r-md);\r
+  background: var(--panel2);\r
+}\r
+\r
+.kp-auto__head {\r
+  display: flex;\r
+  align-items: center;\r
+  justify-content: space-between;\r
+  gap: var(--s-2);\r
+}\r
+\r
+.kp-rules {\r
+  border-spacing: 4px;\r
+  margin: 0 -4px;\r
+}\r
+\r
+.kp-rules th {\r
+  font-weight: 400;\r
+  text-align: center;\r
+}\r
+\r
+.kp-rules thead th:first-child {\r
+  max-width: 90px;\r
+  text-align: left;\r
+}\r
+\r
+.kp-gem {\r
+  display: inline-grid;\r
+  place-items: center;\r
+  width: 22px;\r
+  height: 22px;\r
+  border: 2px solid var(--kp-rarity);\r
+  border-radius: 50%;\r
+  color: var(--kp-rarity);\r
+  font: 900 10px var(--body);\r
+}\r
+\r
+.kp-rule {\r
+  display: block;\r
+  width: 28px;\r
+  height: 28px;\r
+  margin: auto;\r
+  border: 1px solid var(--line2);\r
+  border-radius: var(--r-sm, 6px);\r
+  background: transparent;\r
+  cursor: pointer;\r
+}\r
+\r
+.kp-rule:hover {\r
+  border-color: var(--kp-rarity);\r
+}\r
+\r
+.kp-rule[aria-pressed='true'] {\r
+  border-color: var(--kp-rarity);\r
+  background: var(--kp-rarity);\r
+  box-shadow: 0 0 10px color-mix(in srgb, var(--kp-rarity) 50%, transparent);\r
+}\r
+\r
+.kp-side__tabs {\r
+  display: flex;\r
+  gap: var(--s-2);\r
+}\r
+\r
+.kp-side__view {\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: var(--s-5);\r
+}\r
+\r
+.kp-side__view[hidden] {\r
+  display: none;\r
+}\r
+\r
+/* A dot on the Auto-accept tab while it runs, so it stays visible from the Offres tab. */\r
+.kp-side__tabs .kp-chip.is-live::after {\r
+  content: '';\r
+  display: inline-block;\r
+  width: 7px;\r
+  height: 7px;\r
+  margin-left: 6px;\r
+  border-radius: 50%;\r
+  background: var(--ok);\r
+  box-shadow: 0 0 6px var(--ok);\r
+  vertical-align: middle;\r
+}\r
+\r
+.kp-auto__head .kp-btn:disabled {\r
+  cursor: not-allowed;\r
+}\r
+\r
+.kp-auto > .kp-chip {\r
+  align-self: flex-start;\r
+}\r
+\r
+.kp-toasts {\r
+  position: fixed;\r
+  right: 16px;\r
+  bottom: 16px;\r
+  z-index: 2147483647;\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: var(--s-2);\r
+}\r
+\r
+.kp-toast {\r
+  max-width: 360px;\r
+  padding: 10px 14px;\r
+  border: 1px solid var(--line2);\r
+  border-radius: var(--r-md);\r
+  background: var(--raise);\r
+  box-shadow: var(--sh-1);\r
+  color: var(--fg);\r
+  font-size: var(--t-sm);\r
+}\r
+\r
+.kp-toast--success {\r
+  border-color: var(--ok);\r
+}\r
+\r
+.kp-toast--error {\r
+  border-color: var(--danger);\r
+}\r
+\r
+.kp-replaced {\r
+  display: none !important;\r
+}\r
+\r
+.tcg.kp-ghost {\r
+  filter: saturate(0.45) brightness(0.8);\r
+}\r
+\r
+.tcg.kp-ghost .art img {\r
+  filter: grayscale(1) brightness(0.7);\r
+}\r
+\r
+.kp-filtered-out {\r
+  display: none !important;\r
+}\r
+\r
+.kp-album-filters {\r
+  display: flex;\r
+  flex-wrap: wrap;\r
+  align-items: center;\r
+  gap: var(--s-3);\r
+  margin: var(--s-3) 0;\r
+}\r
+\r
+.kp-input--short {\r
+  flex: 0 0 72px;\r
+  width: 72px;\r
+}\r
+\r
+.kp-gem-chip {\r
+  display: inline-grid;\r
+  place-items: center;\r
+  width: 26px;\r
+  height: 26px;\r
+  padding: 0;\r
+  border: 2px solid var(--kp-rarity);\r
+  border-radius: 50%;\r
+  background: transparent;\r
+  color: var(--kp-rarity);\r
+  font: 900 11px var(--body);\r
+  cursor: pointer;\r
+}\r
+\r
+.kp-gem-chip[aria-pressed='true'] {\r
+  background: var(--kp-rarity);\r
+  box-shadow: 0 0 12px color-mix(in srgb, var(--kp-rarity) 60%, transparent);\r
+  color: var(--bg);\r
+}\r
+\r
+.kp-btn:disabled {\r
+  opacity: 0.5;\r
+  cursor: progress;\r
+}\r
+\r
+.kp-lock-host {\r
+  position: relative;\r
+}\r
+\r
+.kp-lock-host .pin {\r
+  display: none !important;\r
+}\r
+\r
+.kp-lock {\r
+  position: absolute;\r
+  top: 2px;\r
+  left: 0;\r
+  z-index: 6;\r
+  display: grid;\r
+  place-items: center;\r
+  width: 30px;\r
+  height: 30px;\r
+  padding: 0;\r
+  border: 1px solid var(--line2);\r
+  border-radius: 50%;\r
+  background: var(--panel2);\r
+  color: var(--dim);\r
+  font-size: 13px;\r
+  cursor: pointer;\r
+  opacity: 0;\r
+  transition: opacity 0.15s, color 0.15s;\r
+}\r
+\r
+.kp-lock-host:hover .kp-lock,\r
+.kp-lock.is-locked,\r
+.kp-lock:focus-visible {\r
+  opacity: 1;\r
+}\r
+\r
+.kp-lock.is-locked {\r
+  color: var(--warn);\r
+}\r
+\r
+.kp-lock:hover {\r
+  color: var(--fg);\r
+}\r
+\r
+.kp-pick-host {\r
+  position: relative;\r
+}\r
+\r
+.kp-pick {\r
+  position: absolute;\r
+  top: 2px;\r
+  left: 34px;\r
+  z-index: 6;\r
+  display: grid;\r
+  place-items: center;\r
+  min-width: 30px;\r
+  height: 30px;\r
+  padding: 0 6px;\r
+  border: 1px solid var(--line2);\r
+  border-radius: var(--r-pill);\r
+  background: var(--panel2);\r
+  color: var(--dim);\r
+  font: 700 12px var(--mono);\r
+  cursor: pointer;\r
+  opacity: 0;\r
+  transition: opacity 0.15s, color 0.15s;\r
+}\r
+\r
+.kp-pick-host:hover .kp-pick,\r
+.kp-pick.is-picked,\r
+.kp-pick:focus-visible {\r
+  opacity: 1;\r
+}\r
+\r
+.kp-pick:hover {\r
+  color: var(--fg);\r
+}\r
+\r
+.kp-pick.is-picked {\r
+  border-color: var(--acc);\r
+  background: var(--acc);\r
+  color: #fff;\r
+}\r
+\r
+.kp-picked .slot {\r
+  outline: 2px solid var(--acc);\r
+  outline-offset: 2px;\r
+  border-radius: var(--r-md);\r
+}\r
+\r
+.kp-pick-bar {\r
+  position: fixed;\r
+  bottom: 16px;\r
+  left: 50%;\r
+  z-index: 1000;\r
+  display: flex;\r
+  align-items: center;\r
+  gap: var(--s-3);\r
+  padding: 8px 8px 8px 16px;\r
+  border: 1px solid var(--acc);\r
+  border-radius: var(--r-pill);\r
+  background: var(--raise);\r
+  box-shadow: var(--sh-1);\r
+  color: var(--fg);\r
+  font-size: var(--t-sm);\r
+  transform: translateX(-50%);\r
+}\r
+\r
+.kp-pick-bar[hidden] {\r
+  display: none;\r
+}\r
+\r
+.kp-fair {\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: 2px;\r
+  padding: var(--s-2) var(--s-3);\r
+  border: 1px solid var(--line2);\r
+  border-radius: var(--r-md);\r
+  background: var(--panel2);\r
+  font-size: var(--t-sm);\r
+}\r
+\r
+.kp-releases {\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: 2px;\r
+  margin: 0;\r
+  padding: 0;\r
+  list-style: none;\r
+  font-size: var(--t-meta);\r
+}\r
+\r
+.kp-release__time {\r
+  display: inline-block;\r
+  min-width: 82px;\r
+  color: var(--fg2);\r
+  font-family: var(--mono);\r
+}\r
+\r
+\r
+.kp-pc__completion {\r
+  font-weight: 600;\r
+}\r
+\r
+.kp-lock:disabled {\r
+  cursor: progress;\r
+}\r
+\r
+body[data-kp-trades-tab] main [role='tabpanel'] > h2[data-kp-section],\r
+body[data-kp-trades-tab='board'] main [data-kp-section]:not([data-kp-section='board']),\r
+body[data-kp-trades-tab='received'] main [data-kp-section]:not([data-kp-section='received']),\r
+body[data-kp-trades-tab='sent'] main [data-kp-section]:not([data-kp-section='sent']) {\r
+  display: none !important;\r
+}\r
+\r
+.kp-trade-tabs {\r
+  margin: var(--s-3) 0;\r
+}\r
+\r
+.kp-trade-host > .compact,\r
+.kp-trade-host > .trays,\r
+.kp-trade-host > .verdict,\r
+.kp-trade-host > .more,\r
+.kp-trade-host > .sides {\r
+  display: none !important;\r
+}\r
+\r
+.kp-badge--new {\r
+  color: var(--ok);\r
+}\r
+\r
+[data-kp-section='board'] .kp-trade-host {\r
+  text-align: center;\r
+}\r
+\r
+[data-kp-section='board'] .kp-trade-host > .th {\r
+  justify-content: center;\r
+  gap: var(--s-2);\r
+}\r
+\r
+body[data-kp-trades-tab] main [role='tabpanel'] ul.trades[data-kp-section='board'] {\r
+  display: grid;\r
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));\r
+  align-items: start;\r
+  gap: var(--s-3);\r
+}\r
+\r
+.kp-trade {\r
+  display: grid;\r
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);\r
+  align-items: start;\r
+  gap: var(--s-2);\r
+  margin: var(--s-2) 0;\r
+}\r
+\r
+.kp-trade > .kp-swap {\r
+  align-self: center;\r
+  color: var(--acc);\r
+  font-size: 14px;\r
+}\r
+\r
+.kp-trade__side {\r
+  display: flex;\r
+  flex-direction: column;\r
+  align-items: center;\r
+  gap: var(--s-2);\r
+  min-width: 0;\r
+}\r
+\r
+.kp-trade__cards {\r
+  display: flex;\r
+  flex-wrap: wrap;\r
+  justify-content: center;\r
+  gap: var(--s-2);\r
+}\r
+\r
+.kp-tcard {\r
+  display: flex;\r
+  flex-direction: column;\r
+  align-items: center;\r
+  gap: 2px;\r
+  width: 92px;\r
+  min-width: 0;\r
+}\r
+\r
+.kp-tcard .kp-name {\r
+  max-width: 100%;\r
+}\r
+\r
+.kp-trade__cards:has(> .kp-tcard:nth-child(2)) .kp-tcard {\r
+  width: 60px;\r
+}\r
+\r
+.kp-trade__total {\r
+  color: var(--mut);\r
+}\r
+\r
+.kp-trade__net {\r
+  grid-column: 1 / -1;\r
+  justify-self: center;\r
+  font-family: var(--mono);\r
+  font-size: var(--t-base);\r
+  font-weight: 700;\r
+}\r
+\r
+.kp-trade__net--up {\r
+  color: var(--ok);\r
+}\r
+\r
+.kp-trade__net--down {\r
+  color: var(--danger);\r
+}\r
+\r
+.kp-trade__net--flat {\r
+  color: var(--mut);\r
+}\r
+\r
+.kp-trade--wide {\r
+  display: grid;\r
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);\r
+  align-items: stretch;\r
+  gap: var(--s-3);\r
+}\r
+\r
+.kp-trade--wide > .kp-swap {\r
+  align-self: center;\r
+  color: var(--acc);\r
+}\r
+\r
+.kp-trade__summary {\r
+  display: inline-flex;\r
+  align-items: center;\r
+  gap: var(--s-3);\r
+  margin-left: auto;\r
+  margin-right: var(--s-2);\r
+}\r
+\r
+.kp-pill {\r
+  padding: 2px 10px;\r
+  border: 1px solid currentColor;\r
+  border-radius: var(--r-pill);\r
+  font-family: var(--mono);\r
+  font-size: var(--t-sm);\r
+  font-weight: 700;\r
+}\r
+\r
+.kp-pill--up {\r
+  color: var(--ok);\r
+}\r
+\r
+.kp-pill--down {\r
+  color: var(--danger);\r
+}\r
+\r
+.kp-pill--flat {\r
+  color: var(--mut);\r
+}\r
+\r
+.kp-trade__box {\r
+  container-type: inline-size;\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: var(--s-2);\r
+  padding: var(--s-2) var(--s-3) var(--s-3);\r
+  border: 1px solid var(--line);\r
+  border-radius: var(--r-lg);\r
+  background: var(--panel2);\r
+}\r
+\r
+.kp-trade__box-head {\r
+  display: flex;\r
+  flex-wrap: wrap;\r
+  align-items: center;\r
+  gap: var(--s-1) var(--s-3);\r
+}\r
+\r
+.kp-trade__box-total {\r
+  margin-left: auto;\r
+}\r
+\r
+.kp-trade__grid {\r
+  display: grid;\r
+  grid-template-columns: repeat(10, minmax(0, 1fr));\r
+  gap: 6px;\r
+}\r
+\r
+@container (max-width: 480px) {\r
+  .kp-trade__grid {\r
+    grid-template-columns: repeat(5, minmax(0, 1fr));\r
+  }\r
+}\r
+\r
+.kp-trade__grid .kp-tcard {\r
+  width: auto;\r
+}\r
+\r
+.kp-trade__box .kp-badge {\r
+  right: 2px;\r
+  bottom: 2px;\r
+  padding: 0 4px;\r
+  font-size: 9px;\r
+}\r
+\r
+.kp-trade__note {\r
+  font-size: var(--t-meta);\r
+  font-weight: 600;\r
+}\r
+\r
+.kp-trade__note--warn {\r
+  color: var(--warn);\r
+}\r
+\r
+.kp-trade__note--new {\r
+  color: var(--ok);\r
+}\r
+\r
+.kp-trade__note--muted {\r
+  color: var(--fg2);\r
+}\r
+\r
+.kp-trade-host .tact .talk {\r
+  display: none !important;\r
+}\r
+\r
+.kp-trade-host .tact:not(:has(> :not(.talk))) {\r
+  display: none !important;\r
+}\r
+\r
+.kp-talk {\r
+  display: inline-grid;\r
+  place-items: center;\r
+  width: 22px;\r
+  height: 22px;\r
+  margin-left: 6px;\r
+  padding: 0;\r
+  border: none;\r
+  border-radius: 50%;\r
+  background: transparent;\r
+  color: var(--mut);\r
+  font-size: 13px;\r
+  vertical-align: middle;\r
+  cursor: pointer;\r
+}\r
+\r
+.kp-talk:hover {\r
+  background: var(--raise);\r
+  color: var(--fg);\r
+}\r
+\r
+.kp-count-host {\r
+  container-type: inline-size;\r
+}\r
+\r
+/* The tile image spans the tile width with a 5:7 ratio, so its bottom edge sits at 140% of that width. */\r
+.kp-count {\r
+  position: absolute;\r
+  top: calc(140cqw - 22px);\r
+  right: 5px;\r
+  padding: 0 6px;\r
+  border-radius: var(--r-pill);\r
+  background: #0a090ed9;\r
+  color: var(--fg2);\r
+  font: 700 11px var(--mono);\r
+  line-height: 18px;\r
+  pointer-events: none;\r
+}\r
+\r
+.kp-count--dupe {\r
+  color: var(--ok);\r
+}\r
+\r
+.kp-site-only {\r
+  display: none !important;\r
+}\r
+\r
+.kp-native-hidden {\r
+  display: none !important;\r
+}\r
+\r
+body.kp-modal-open {\r
+  overflow: hidden;\r
+}\r
+\r
+.kp-modal {\r
+  position: fixed;\r
+  inset: 0;\r
+  z-index: 1000;\r
+  display: grid;\r
+  place-items: center;\r
+  padding: var(--s-4);\r
+  background: color-mix(in srgb, var(--bg) 70%, transparent);\r
+  backdrop-filter: blur(4px);\r
+}\r
+\r
+.kp-pc {\r
+  display: flex;\r
+  flex-direction: column;\r
+  width: min(1200px, 100%);\r
+  height: min(900px, 100%);\r
+  overflow: hidden;\r
+  border: 1px solid var(--line2);\r
+  border-radius: var(--r-lg);\r
+  background: var(--panel);\r
+  box-shadow: var(--sh-1);\r
+}\r
+\r
+.kp-pc__head {\r
+  display: flex;\r
+  align-items: center;\r
+  gap: var(--s-3);\r
+  padding: var(--s-3) var(--s-4);\r
+  border-bottom: 1px solid var(--line);\r
+}\r
+\r
+.kp-pc__close {\r
+  margin-left: auto;\r
+}\r
+\r
+.kp-pc__filters {\r
+  display: flex;\r
+  flex-wrap: wrap;\r
+  align-items: center;\r
+  gap: var(--s-2) var(--s-3);\r
+  padding: var(--s-3) var(--s-4);\r
+  border-bottom: 1px solid var(--line);\r
+}\r
+\r
+.kp-pc__filters .kp-input {\r
+  flex: 0 1 200px;\r
+}\r
+\r
+.kp-pc__body {\r
+  flex: 1;\r
+  overflow-y: auto;\r
+  padding: var(--s-4);\r
+}\r
+\r
+.kp-pc__grid {\r
+  display: grid;\r
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));\r
+  gap: var(--s-3);\r
+}\r
+\r
+.kp-pc__grid .kp-empty {\r
+  grid-column: 1 / -1;\r
+}\r
+\r
+.kp-pc__sentinel {\r
+  height: 1px;\r
+}\r
+\r
+.kp-pcard {\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: 2px;\r
+  min-width: 0;\r
+}\r
+\r
+.kp-badge--dupe {\r
+  color: var(--ok);\r
+}\r
+\r
+.kp-badge--corner {\r
+  top: 4px;\r
+  right: auto;\r
+  bottom: auto;\r
+  left: 4px;\r
+}\r
+\r
+.kp-pc__total {\r
+  padding: 2px 10px;\r
+  border: 1px solid var(--line2);\r
+  border-radius: var(--r-pill);\r
+  color: var(--fg);\r
+  font: 700 var(--t-sm) var(--mono);\r
+}\r
+\r
+.kp-friend-search {\r
+  display: block;\r
+  width: 100%;\r
+  max-width: 880px;\r
+  margin-bottom: var(--s-3);\r
+}\r
+\r
+body.kp-friends main ul.people {\r
+  display: flex;\r
+  flex-direction: column;\r
+}\r
+\r
+body.kp-friends main ul.people > li.kp-pinned {\r
+  order: -1;\r
+  box-shadow: inset 3px 0 0 var(--gold);\r
+}\r
+\r
+.kp-pin,\r
+.kp-friend-act {\r
+  display: inline-flex !important;\r
+  flex: none;\r
+  align-items: center;\r
+  justify-content: center;\r
+  gap: 0 !important;\r
+  box-sizing: border-box;\r
+  width: 32px;\r
+  height: 32px;\r
+  min-width: 0 !important;\r
+  min-height: 0 !important;\r
+  margin: 0 !important;\r
+  padding: 0 !important;\r
+  line-height: 0 !important;\r
+  vertical-align: middle;\r
+  border: 1px solid var(--line2) !important;\r
+  border-radius: 50% !important;\r
+  background: var(--panel2) !important;\r
+  color: var(--mut) !important;\r
+  font-size: 0 !important;\r
+  text-decoration: none !important;\r
+  cursor: pointer;\r
+  transition: color 0.15s, background 0.15s;\r
+}\r
+\r
+.kp-pin i,\r
+.kp-friend-act i {\r
+  width: 1.25em;\r
+  font-size: 13px;\r
+  line-height: 1;\r
+  text-align: center;\r
+}\r
+\r
+.kp-pin:hover,\r
+.kp-friend-act:hover {\r
+  background: var(--raise) !important;\r
+  color: var(--fg) !important;\r
+}\r
+\r
+.kp-friend-act[data-kp-icon='Retirer']:hover,\r
+.kp-friend-act[data-kp-icon='Bloquer']:hover {\r
+  color: var(--danger) !important;\r
+}\r
+\r
+.kp-pin.is-pinned {\r
+  border-color: var(--gold) !important;\r
+  color: var(--gold) !important;\r
+}\r
+\r
+.kp-pin.is-pinned i {\r
+  transform: rotate(-45deg);\r
+}\r
+\r
+.kp-friend-act--confirm {\r
+  gap: 6px !important;\r
+  width: auto;\r
+  padding: 0 12px !important;\r
+  border-color: var(--danger) !important;\r
+  border-radius: var(--r-pill) !important;\r
+  color: var(--danger) !important;\r
+  font-size: var(--t-sm) !important;\r
+  line-height: 1 !important;\r
+}\r
+\r
+.kp-series-collapsed > ul.quests {\r
+  display: none !important;\r
+}\r
+\r
+.kp-series-toggle {\r
+  display: inline-flex;\r
+  align-items: center;\r
+  gap: var(--s-2);\r
+  margin-left: auto;\r
+  padding: 4px 12px;\r
+  border: 1px solid var(--line2);\r
+  border-radius: var(--r-pill);\r
+  background: var(--panel2);\r
+  color: var(--fg2);\r
+  font: 600 var(--t-sm) var(--body);\r
+  cursor: pointer;\r
+}\r
+\r
+.kp-series-toggle:hover {\r
+  background: var(--raise);\r
+  color: var(--fg);\r
+}\r
+\r
+.kp-series-summary.has-claim {\r
+  color: var(--ok);\r
+}\r
+\r
+.kp-series-chevron {\r
+  display: inline-flex;\r
+  font-size: 11px;\r
+  transition: transform 0.15s;\r
+}\r
+\r
+.kp-series-toggle[aria-expanded='true'] .kp-series-chevron {\r
+  transform: rotate(180deg);\r
+}\r
+\r
+html:has(body.kp-video-bg),\r
+body.kp-video-bg,\r
+body.kp-video-bg main section.band,\r
+body.kp-video-bg main .box.coll {\r
+  background: transparent !important;\r
+}\r
+\r
+.kp-bg-video {\r
+  position: fixed;\r
+  inset: 0;\r
+  z-index: -1;\r
+  width: 100vw;\r
+  height: 100vh;\r
+  object-fit: cover;\r
+  filter: brightness(0.45);\r
+  pointer-events: none;\r
+}\r
+\r
+.kp-filters__rarities {\r
+  margin-left: auto;\r
+}\r
+\r
+.kp-free-count[hidden] {\r
+  display: none !important;\r
+}\r
+\r
+/* The site's own label still describes its largest batch, so it is swapped for the free count while selected. */\r
+body.kp-free-mode main .under .btn-open[data-kp-label] {\r
+  font-size: 0 !important;\r
+}\r
+\r
+body.kp-free-mode main .under .btn-open[data-kp-label] > * {\r
+  display: none !important;\r
+}\r
+\r
+body.kp-free-mode main .under .btn-open[data-kp-label]::after {\r
+  content: attr(data-kp-label);\r
+  font-size: var(--t-base, 1rem);\r
+}\r
+
+.kp-auto-open__trigger {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  font-size: 18px;
+}
+
+.kp-auto-open__trigger.is-live::after {
+  content: '';
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 6px var(--ok);
+}
+
+.kp-auto-open {
+  position: fixed;
+  top: 72px;
+  right: 16px;
+  z-index: 900;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  width: min(380px, calc(100vw - 32px));
+  padding: var(--s-4);
+  border: 1px solid var(--line2);
+  border-radius: var(--r-lg);
+  background: var(--panel);
+  box-shadow: var(--sh-1);
+  color: var(--fg);
+}
+
+.kp-auto-open[hidden] {
+  display: none;
+}
+
+.kp-auto-open__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.kp-auto-open__status {
+  margin: 0;
+  font-size: var(--t-sm);
+  font-weight: 600;
+}
+
+.kp-auto-open .kp-field {
+  flex-wrap: wrap;
+}
+
+.kp-auto-open .kp-field .kp-label {
+  flex: 1 0 100%;
+}
+
+.kp-auto-open__log {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+}
+
+.kp-auto-open__log-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  font-size: var(--t-sm);
+}
+
+.kp-auto-open__gems {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  font-family: var(--mono);
+}
+
+/* The site's "Tu es toujours là ?" prompt is a browser-only idle pause (nothing is sent to the server); the
+   auto-open runs on its own requests, so the prompt would only cover the page while it works. */
+body.kp-auto-open-on [role='dialog'][aria-labelledby='idle-t'] {
+  display: none !important;
+}
+`;
 
   // src/main.js
   var features = [
@@ -3263,7 +5186,8 @@ ${lines.join("\n")}`;
     missions_series_default,
     profile_background_default,
     offer_dialog_default,
-    free_packs_default
+    free_packs_default,
+    auto_open_default
   ];
   var mounted = /* @__PURE__ */ new Map();
   function syncFeatures() {
