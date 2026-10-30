@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kyara Plus
 // @namespace    https://github.com/Mxyuki/Kyara-Script
-// @version      2.31.0
+// @version      2.34.3
 // @description  Améliore kyara.games : rareté et exemplaires possédés sur les offres d’échange, bouton « Donner » sous chaque carte, wishlist en premier, offres cachées par le site, verrouillage depuis la collection, comptoir masquable, offres bangers et rentables en direct, auto-accept par rareté ou par gain.
 // @author       Myuki
 // @homepageURL  https://github.com/Mxyuki/Kyara-Script
@@ -87,6 +87,22 @@
       backoffMs: 6e4,
       uiTickMs: 1e3,
       logLimit: 8
+    },
+    market: {
+      // GET /config does not carry them; they are constants of the site's client (chunk CV6oCC-s.js)
+      saleTaxPct: 5,
+      listingFeePct: 2,
+      listingFeeMin: 1
+    },
+    activity: {
+      refreshMs: 6e4,
+      renderStep: 30,
+      historyPageSize: 50,
+      historyMaxPages: 60,
+      loadingRenderMs: 800,
+      compactThumbLimit: 2,
+      focusMs: 2600,
+      withdrawConfirmMs: 4e3
     },
     prices: {
       batchSize: 300,
@@ -247,6 +263,13 @@
       headers: { "x-request-id": requestId }
     })
   };
+  var marketApi = {
+    mine: () => request("/me/market"),
+    history: (kind, page, size) => request(`/me/market/history${query({ kind, page, size })}`),
+    cancelListing: (listingId) => request(`/market/listings/${encodeURIComponent(listingId)}/cancel`, { method: "POST" }),
+    cancelOrder: (orderId) => request(`/market/buy-orders/${encodeURIComponent(orderId)}/cancel`, { method: "POST" }),
+    withdrawAll: () => request("/me/market/withdraw-all", { method: "POST" })
+  };
   var collectionApi = {
     mine: () => request("/me/collection?lean=1"),
     prices: (ids) => request(`/me/collection/prices?ids=${ids.join(",")}`),
@@ -265,6 +288,7 @@
     mine: () => request("/me/trades"),
     // Board offers you posted or took, with closedAt, taker and takenWith once accepted.
     offersMine: () => request("/trades/offers/mine"),
+    cancelOffer: (offerId) => request(`/trades/offers/${encodeURIComponent(offerId)}/cancel`, { method: "POST" }),
     propose: (body) => request("/trades", { method: "POST", body, withPass: true }),
     // Only accept is pass-protected on the site; decline and cancel are plain POSTs without a body.
     act: (tradeId, action) => request(`/trades/${encodeURIComponent(tradeId)}/${action}`, { method: "POST", withPass: action === "accept" }),
@@ -324,6 +348,9 @@
     element.append(...children.flat().filter((child) => child != null && child !== false));
     return element;
   }
+  function fill(parent, ...children) {
+    parent.replaceChildren(...children.flat().filter((child) => child != null && child !== false));
+  }
   function keepAttached(node, anchorSelector, place) {
     let anchor = null;
     const check = () => {
@@ -345,8 +372,8 @@
   }
 
   // src/lib/store.js
-  function createStore(initialState3) {
-    const state = { ...initialState3 };
+  function createStore(initialState4) {
+    const state = { ...initialState4 };
     const listeners = /* @__PURE__ */ new Set();
     return {
       get: () => state,
@@ -363,31 +390,31 @@
 
   // src/lib/site.js
   var profileIdFromPath = () => location.pathname.match(/^\/profil\/([^/]+)/)?.[1];
-  var cardIdFromLink = (link) => Number(link?.getAttribute("href")?.match(/\/wiki\/(\d+)/)?.[1]);
+  var cardIdFromLink = (link2) => Number(link2?.getAttribute("href")?.match(/\/wiki\/(\d+)/)?.[1]);
   var cardImageUrl = (cardId) => `/cards/sm/${cardId}.webp`;
   var packIdFromPath = () => location.pathname.match(/^\/ouvrir\/([^/]+)/)?.[1];
 
   // src/lib/toast.js
   var container = null;
-  function toast(message, tone = "info") {
+  function toast(message, tone2 = "info") {
     if (!container?.isConnected) {
       container = h("div", { class: "kp-toasts", role: "status" });
       document.body.append(container);
     }
-    const item = h("div", { class: `kp-toast kp-toast--${tone}` }, message);
+    const item = h("div", { class: `kp-toast kp-toast--${tone2}` }, message);
     container.append(item);
     setTimeout(() => item.remove(), config_default.ui.toastMs);
   }
   var FLASH_KEY = "kyara-plus:flash";
-  function flashToast(message, tone = "info") {
-    sessionStorage.setItem(FLASH_KEY, JSON.stringify({ message, tone }));
+  function flashToast(message, tone2 = "info") {
+    sessionStorage.setItem(FLASH_KEY, JSON.stringify({ message, tone: tone2 }));
   }
   function showFlashToast() {
     const stored = sessionStorage.getItem(FLASH_KEY);
     if (!stored) return;
     sessionStorage.removeItem(FLASH_KEY);
-    const { message, tone } = JSON.parse(stored);
-    toast(message, tone);
+    const { message, tone: tone2 } = JSON.parse(stored);
+    toast(message, tone2);
   }
 
   // src/lib/format.js
@@ -528,7 +555,7 @@
     stopReason: null,
     settings: readAutoOpenSettings()
   });
-  function createAutoOpen({ store, api: api2, clock, notify: notify2, currentPackId }) {
+  function createAutoOpen({ store, api: api3, clock, notify: notify3, currentPackId }) {
     let pack = null;
     let regenMs = 0;
     let runId = 0;
@@ -537,7 +564,7 @@
     const isCurrent = (id) => id === runId && state().enabled;
     async function load() {
       const packId = currentPackId();
-      const [packs, serverConfig, me] = await Promise.all([api2.listPacks(), api2.getConfig(), api2.loadMe()]);
+      const [packs, serverConfig, me] = await Promise.all([api3.listPacks(), api3.getConfig(), api3.loadMe()]);
       pack = packs.find((candidate) => candidate.id === packId) ?? null;
       regenMs = Math.round(serverConfig.freePacks.regenHours * SECONDS_PER_HOUR) * SECOND_MS2;
       const unavailable = !pack ? "Booster introuvable." : !usesFreePacks(pack) ? "Ce booster n’utilise pas les boosters gratuits." : null;
@@ -553,7 +580,7 @@
     function stop(reason = null) {
       runId++;
       patch({ enabled: false, phase: Phase.IDLE, openAt: null, stopReason: reason });
-      if (reason) notify2.error(`Auto-ouverture arrêtée : ${reason}`);
+      if (reason) notify3.error(`Auto-ouverture arrêtée : ${reason}`);
     }
     function record(opened, cards) {
       if (opened === 0) return;
@@ -561,7 +588,7 @@
       const entry = { at: clock.now(), opened, rarities };
       patch({ opened: state().opened + opened, log: [entry, ...state().log].slice(0, config_default.autoOpen.logLimit) });
       const summary = rarities.map(([rarity, count]) => `${rarity}×${count}`).join(" ");
-      notify2.success(`Auto-ouverture : ${plural(opened, "booster")} (${summary}).`);
+      notify3.success(`Auto-ouverture : ${plural(opened, "booster")} (${summary}).`);
     }
     async function openAll(id, known) {
       let me = known;
@@ -570,13 +597,13 @@
       const cards = [];
       while (left > 0 && isCurrent(id)) {
         const count = Math.min(left, config_default.packs.maxPerOpen);
-        const { results = [], stopped = null } = await api2.openMany(pack.id, count);
+        const { results = [], stopped = null } = await api3.openMany(pack.id, count);
         if (results.length === 0) {
           stop(stopped?.message ?? stopped?.code ?? "Le serveur n’a ouvert aucun booster.");
           break;
         }
         me = results.at(-1).user;
-        notify2.pulled(results.at(-1));
+        notify3.pulled(results.at(-1));
         opened += results.length;
         cards.push(...pulledCards(results));
         left = stopped || results.length < count ? 0 : freeOpensLeft(pack, me);
@@ -586,14 +613,14 @@
       return me;
     }
     async function cycleOnce(id, cycle, known) {
-      const me = known ?? await api2.loadMe();
+      const me = known ?? await api3.loadMe();
       if (!isCurrent(id)) return { me };
       const plan = planOpening({ pack, me, now: clock.now(), regenMs, cycle });
       patch({ phase: Phase.WAITING, target: plan.target, openAt: plan.openAt, leftNow: plan.leftNow });
       await sleepUntil(plan.openAt, id, config_default.autoOpen.resyncMs * rush());
       if (!isCurrent(id)) return { me };
       if (clock.now() < plan.openAt) return { me: null };
-      const fresh = await api2.loadMe();
+      const fresh = await api3.loadMe();
       if (freeOpensLeft(pack, fresh) < plan.target) {
         await sleepUntil(clock.now() + config_default.autoOpen.recheckMs, id, config_default.autoOpen.recheckMs);
         return { me: null };
@@ -699,14 +726,14 @@
   var hideButton = (onClick) => h("button", { class: "kp-hide", type: "button", title: "Masquer cette offre", onClick }, icon("eye-slash"));
   var swapIcon = () => h("span", { class: "kp-swap" }, icon("arrow-right-arrow-left"));
   function gainBadge(gain) {
-    const tone = !gain ? "flat" : gain > 0 ? "up" : "down";
-    return h("span", { class: `kp-gain kp-gain--${tone}`, title: "Écart de prix moyen" }, formatGain(gain));
+    const tone2 = !gain ? "flat" : gain > 0 ? "up" : "down";
+    return h("span", { class: `kp-gain kp-gain--${tone2}`, title: "Écart de prix moyen" }, formatGain(gain));
   }
   function giveButton(option, onClick, className = "") {
-    const tone = option.entry.qty >= 2 ? "double" : "single";
+    const tone2 = option.entry.qty >= 2 ? "double" : "single";
     return h(
       "button",
-      { class: `kp-btn kp-btn--${tone} ${className}`, type: "button", onClick },
+      { class: `kp-btn kp-btn--${tone2} ${className}`, type: "button", onClick },
       "Donner",
       gainBadge(option.gain)
     );
@@ -1702,23 +1729,54 @@ Continuer ?`);
     }
   };
 
+  // src/features/header-nav.js
+  var MARKET_LINK = 'header.hdr nav.nav a.navlink[href="/marche"]';
+  var FRIENDS_PATH = "/amis";
+  var ACTIVE_SYNC_MS = 500;
+  var header_nav_default = {
+    id: "header-nav",
+    matches: () => true,
+    mount() {
+      const link2 = h("a", { href: FRIENDS_PATH, title: "Liste d’amis" }, "Amis");
+      const syncCurrent = () => {
+        const current = location.pathname.startsWith(FRIENDS_PATH);
+        link2.classList.toggle("on", current);
+        if (current) link2.setAttribute("aria-current", "page");
+        else link2.removeAttribute("aria-current");
+      };
+      document.body.classList.add("kp-header");
+      const detach = keepAttached(link2, MARKET_LINK, (market, node) => {
+        node.className = `${market.className.replace(/\bon\b/, "").trim()} kp-nav-friends`;
+        market.after(node);
+        syncCurrent();
+      });
+      const timer = setInterval(syncCurrent, ACTIVE_SYNC_MS);
+      return () => {
+        detach();
+        clearInterval(timer);
+        link2.remove();
+        document.body.classList.remove("kp-header");
+      };
+    }
+  };
+
   // src/features/market-counter.js
   var TAB_LIST = 'main [role="tablist"]';
-  function placeLink(tabList, link) {
+  function placeLink(tabList, link2) {
     const tabClass = tabList.querySelector('[role="tab"]')?.className.replace(/\bon\b/, "") ?? "";
-    link.className = `${tabClass} kp-tab-link`;
-    tabList.append(link);
+    link2.className = `${tabClass} kp-tab-link`;
+    tabList.append(link2);
   }
   var market_counter_default = {
     id: "market-counter",
     matches: (url) => url.pathname === "/marche",
     mount() {
-      const link = h("a", { href: "/marche/chat", title: "Ouvrir le comptoir" }, "Comptoir ↗");
+      const link2 = h("a", { href: "/marche/chat", title: "Ouvrir le comptoir" }, "Comptoir ↗");
       document.body.classList.add("kp-market");
-      const detach = keepAttached(link, TAB_LIST, placeLink);
+      const detach = keepAttached(link2, TAB_LIST, placeLink);
       return () => {
         detach();
-        link.remove();
+        link2.remove();
         document.body.classList.remove("kp-market");
       };
     }
@@ -1783,11 +1841,11 @@ Continuer ?`);
     return prices;
   }
   var sideValue = ({ cards, chakra = 0 }, prices) => cards.reduce((sum, card) => sum + (prices[card.characterId] ?? 0) * (card.qty ?? 1), chakra);
-  async function syncTradeLedger(myId) {
+  async function syncTradeLedger(myId, loaded = {}) {
     const now = Date.now();
     const [offers, trades, notifications] = await Promise.all([
-      tradesApi.offersMine(),
-      tradesApi.mine(),
+      loaded.offers ?? tradesApi.offersMine(),
+      loaded.trades ?? tradesApi.mine(),
       notificationsApi.list()
     ]);
     const kept = readEntries().filter((entry) => now - entry.at < config_default.ledger.keepMs);
@@ -1849,296 +1907,1474 @@ Continuer ?`);
     };
   }
 
-  // src/features/market-trades/analysis.js
-  var difference = (incoming, outgoing) => incoming == null || outgoing == null ? null : incoming - outgoing;
-  function describeSide({ cards, chakra = 0 }, { catalog, collection, priceOf: priceOf2 }) {
-    const items = cards.map(({ characterId, qty = 1 }) => ({
-      card: catalog.get(characterId),
-      qty,
-      price: priceOf2(characterId),
-      owned: collection.get(characterId)?.qty ?? 0
-    })).filter((item) => item.card);
-    const prices = items.map((item) => item.price == null ? null : item.price * item.qty);
-    const total = prices.includes(null) ? null : prices.reduce((sum, price) => sum + price, chakra);
-    return { cards: items, chakra, total };
+  // src/features/market-activity/model.js
+  var Category = {
+    TRADES_IN: "recus",
+    TRADES_OUT: "envoyes",
+    BOARD: "tableau",
+    SALES: "ventes",
+    BIDS: "mises",
+    ORDERS: "ordres"
+  };
+  var CATEGORIES = [
+    {
+      id: Category.TRADES_IN,
+      label: "Échanges reçus",
+      short: "Reçus",
+      icon: "inbox"
+    },
+    {
+      id: Category.TRADES_OUT,
+      label: "Échanges envoyés",
+      short: "Envoyés",
+      icon: "paper-plane"
+    },
+    {
+      id: Category.BOARD,
+      label: "Offres du tableau",
+      short: "Tableau",
+      icon: "bullhorn"
+    },
+    { id: Category.SALES, label: "Ventes", short: "Ventes", icon: "tag" },
+    { id: Category.BIDS, label: "Mes mises", short: "Mises", icon: "gavel" },
+    {
+      id: Category.ORDERS,
+      label: "Ordres d’achat",
+      short: "Ordres",
+      icon: "cart-shopping"
+    }
+  ];
+  var State = { TODO: "todo", LIVE: "live", DONE: "done" };
+  var Sort = {
+    SOON: "soon",
+    RECENT: "recent",
+    OLD: "old",
+    VALUE: "value",
+    GAIN: "gain"
+  };
+  var HISTORY_KINDS = ["ventes", "mises", "echanges"];
+  var DAY_MS = 864e5;
+  var WEEK_DAYS = 7;
+  var time = (iso) => iso ? Date.parse(iso) : null;
+  var sideOf = (side) => ({
+    cards: (side?.cards ?? []).map(({ characterId, qty }) => ({
+      characterId,
+      qty: qty ?? 1
+    })),
+    chakra: side?.chakra ?? 0
+  });
+  var cardSide = (characterId, qty = 1) => ({
+    cards: [{ characterId, qty }],
+    chakra: 0
+  });
+  var chakraSide = (chakra) => ({ cards: [], chakra });
+  function searchText(item, ctx) {
+    const names = [
+      ...item.give.cards,
+      ...item.receive.cards,
+      ...(item.choice ?? []).map((characterId) => ({ characterId }))
+    ].map(({ characterId }) => ctx.cardOf(characterId)?.name ?? "").join(" ");
+    return searchKey(`${item.who?.pseudo ?? ""} ${names}`);
   }
-  var tradeCardIds = (trade) => [...trade.give.cards, ...trade.want.cards].map((card) => card.characterId);
-  function directTrade(trade, incoming, context) {
-    const give = describeSide(incoming ? trade.want : trade.give, context);
-    const receive = describeSide(incoming ? trade.give : trade.want, context);
-    return { give, receive, net: difference(receive.total, give.total) };
+  function finish(item, ctx) {
+    return { ...item, search: searchText(item, ctx) };
   }
-  function boardOffer(receiveIds, giveIds, context) {
-    const toSide = (ids) => describeSide({ cards: ids.map((characterId) => ({ characterId })) }, context);
-    const give = toSide(giveIds);
-    const receive = toSide(receiveIds);
-    if (give.cards.length === 1 && receive.cards.length === 1) {
-      return { give, receive, net: difference(receive.total, give.total) };
+  function saleItem(listing, ctx) {
+    const active = listing.status === "active";
+    return finish(
+      {
+        key: `l:${listing.id}`,
+        category: Category.SALES,
+        kind: listing.type === "auction" ? "auction" : "sale",
+        state: active ? State.LIVE : State.DONE,
+        outcome: listing.status,
+        createdAt: time(listing.createdAt),
+        endsAt: time(listing.endsAt),
+        at: time(listing.endsAt),
+        who: null,
+        give: cardSide(listing.character.id),
+        receive: chakraSide(listing.finalPrice ?? listing.currentBid ?? listing.price),
+        listing
+      },
+      ctx
+    );
+  }
+  function bidItem(listing, ctx) {
+    const active = listing.status === "active";
+    const state = !active ? State.DONE : listing.leading ? State.LIVE : State.TODO;
+    return finish(
+      {
+        key: `b:${listing.id}`,
+        category: Category.BIDS,
+        kind: "bid",
+        state,
+        outcome: listing.status,
+        createdAt: time(listing.createdAt),
+        endsAt: time(listing.endsAt),
+        at: time(listing.endsAt),
+        who: listing.seller,
+        give: chakraSide(listing.myMaxBid ?? listing.currentBid ?? 0),
+        receive: cardSide(listing.character.id),
+        listing
+      },
+      ctx
+    );
+  }
+  function orderItem(order, ctx) {
+    const open = order.status === "open";
+    return finish(
+      {
+        key: `o:${order.id}`,
+        category: Category.ORDERS,
+        kind: "order",
+        state: open ? State.LIVE : State.DONE,
+        outcome: order.status,
+        createdAt: time(order.createdAt),
+        endsAt: time(order.expiresAt),
+        at: time(open ? order.expiresAt : order.createdAt),
+        who: null,
+        give: chakraSide(order.price * (open ? order.qty - order.filled : order.filled)),
+        receive: cardSide(order.characterId, order.qty),
+        order
+      },
+      ctx
+    );
+  }
+  function tradeItem(trade, ctx) {
+    const incoming = trade.to.id === ctx.myId;
+    const pending3 = trade.status === "pending";
+    return finish(
+      {
+        key: `t:${trade.id}`,
+        category: incoming ? Category.TRADES_IN : Category.TRADES_OUT,
+        kind: incoming ? "tradeIn" : "tradeOut",
+        state: pending3 ? incoming ? State.TODO : State.LIVE : State.DONE,
+        outcome: trade.status,
+        createdAt: time(trade.createdAt),
+        endsAt: time(trade.expiresAt),
+        at: time(pending3 ? trade.expiresAt : trade.createdAt),
+        who: incoming ? trade.from : trade.to,
+        give: sideOf(incoming ? trade.want : trade.give),
+        receive: sideOf(incoming ? trade.give : trade.want),
+        message: trade.message,
+        messages: trade.messages ?? 0,
+        trade
+      },
+      ctx
+    );
+  }
+  function boardItem(offer, ctx) {
+    const posted = offer.user.id === ctx.myId;
+    const open = offer.status === "open";
+    const choice = posted && open ? offer.wantIds : null;
+    let give = cardSide(offer.characterId);
+    let receive = choice ? { cards: [], chakra: 0 } : cardSide(offer.takenWith);
+    if (!posted) [give, receive] = [receive, give];
+    return finish(
+      {
+        key: `c:${offer.id}`,
+        category: Category.BOARD,
+        kind: "counter",
+        state: open && posted ? State.LIVE : State.DONE,
+        outcome: offer.status,
+        posted,
+        createdAt: time(offer.createdAt),
+        endsAt: time(offer.expiresAt),
+        at: time(open ? offer.expiresAt : offer.closedAt ?? offer.createdAt),
+        who: posted ? offer.taker ?? null : offer.user,
+        give,
+        receive,
+        choice,
+        offer
+      },
+      ctx
+    );
+  }
+  function buildItems({ mine, trades, offers }, ctx) {
+    return [
+      ...mine.listings.map((listing) => saleItem(listing, ctx)),
+      ...mine.bids.map((listing) => bidItem(listing, ctx)),
+      ...mine.buyOrders.map((order) => orderItem(order, ctx)),
+      ...trades.incoming.map((trade) => tradeItem(trade, ctx)),
+      ...trades.outgoing.map((trade) => tradeItem(trade, ctx)),
+      ...offers.map((offer) => boardItem(offer, ctx))
+    ];
+  }
+  function historyItems(kind, page, ctx) {
+    if (kind === "echanges") {
+      return [...page.trades.map((trade) => tradeItem(trade, ctx)), ...page.offers.map((offer) => boardItem(offer, ctx))];
     }
-    if (receive.cards.length > 1 && give.cards.length === 1) {
-      receive.total = void 0;
-      receive.cards.forEach((item) => item.gain = difference(item.price, give.cards[0].price));
+    return page.items.map((listing) => kind === "ventes" ? saleItem(listing, ctx) : bidItem(listing, ctx));
+  }
+  var isActive = (item) => item.state !== State.DONE;
+  function categoryStats(items) {
+    const empty = () => ({ total: 0, open: 0, todo: 0 });
+    const stats = Object.fromEntries([["all", empty()], ...CATEGORIES.map(({ id }) => [id, empty()])]);
+    for (const item of items) {
+      for (const entry of [stats.all, stats[item.category]]) {
+        entry.total++;
+        if (isActive(item)) entry.open++;
+        if (item.state === State.TODO) entry.todo++;
+      }
     }
-    if (give.cards.length > 1 && receive.cards.length === 1) {
-      give.total = void 0;
-      give.cards.forEach((item) => item.gain = difference(receive.cards[0].price, item.price));
+    return stats;
+  }
+  function filterItems(items, { category, query: query2 }) {
+    const needle = searchKey(query2.trim());
+    return items.filter(
+      (item) => (category === "all" || item.category === category) && (!needle || item.search.includes(needle))
+    );
+  }
+  function sideValue2(side, priceOf2) {
+    let total = side.chakra;
+    for (const { characterId, qty } of side.cards) {
+      const price = priceOf2(characterId);
+      if (price == null) return null;
+      total += price * qty;
     }
-    return { give, receive };
+    return total;
+  }
+  var BOTH_SIDES_TRADES = /* @__PURE__ */ new Set(["tradeIn", "tradeOut", "counter"]);
+  function netOf(item, priceOf2) {
+    if (!BOTH_SIDES_TRADES.has(item.kind) || item.choice) return null;
+    const given = sideValue2(item.give, priceOf2);
+    const received = sideValue2(item.receive, priceOf2);
+    return given == null || received == null ? null : received - given;
+  }
+  function valueOf(item, priceOf2) {
+    return Math.max(sideValue2(item.give, priceOf2) ?? -1, sideValue2(item.receive, priceOf2) ?? -1);
+  }
+  var byNumber = (pick, direction) => (a, b) => direction * ((pick(a) ?? -Infinity) - (pick(b) ?? -Infinity));
+  var momentOf = (item) => item.state === State.DONE ? item.at : item.createdAt;
+  function sortItems(items, sort, priceOf2) {
+    const comparators = {
+      [Sort.SOON]: byNumber((item) => item.endsAt, 1),
+      [Sort.RECENT]: byNumber(momentOf, -1),
+      [Sort.OLD]: byNumber(momentOf, 1),
+      [Sort.VALUE]: byNumber((item) => valueOf(item, priceOf2), -1),
+      [Sort.GAIN]: byNumber((item) => netOf(item, priceOf2), -1)
+    };
+    return [...items].sort(comparators[sort]);
+  }
+  function finishedGroups(items, sort, now) {
+    if (sort !== Sort.RECENT && sort !== Sort.OLD) return items.length ? [{ id: "done", items }] : [];
+    const startOfToday = new Date(now).setHours(0, 0, 0, 0);
+    const bucketOf = (item) => {
+      if (item.at >= startOfToday) return "today";
+      if (Math.floor((startOfToday - item.at) / DAY_MS) < 1) return "yesterday";
+      return Math.floor((startOfToday - item.at) / DAY_MS) < WEEK_DAYS ? "week" : "older";
+    };
+    return ["today", "yesterday", "week", "older"].map((id) => ({
+      id: `done:${id}`,
+      items: items.filter((item) => bucketOf(item) === id)
+    }));
+  }
+  function organize(items, { sort, now, priceOf: priceOf2 }) {
+    const running = sortItems(items.filter(isActive), sort, priceOf2);
+    const finished = sortItems(
+      items.filter((item) => !isActive(item)),
+      sort === Sort.SOON ? Sort.RECENT : sort,
+      priceOf2
+    );
+    return [
+      {
+        id: State.TODO,
+        items: running.filter((item) => item.state === State.TODO)
+      },
+      {
+        id: State.LIVE,
+        items: running.filter((item) => item.state === State.LIVE)
+      },
+      ...finishedGroups(finished, sort === Sort.SOON ? Sort.RECENT : sort, now)
+    ].filter((group) => group.items.length);
+  }
+  function cardIds(items) {
+    const ids = /* @__PURE__ */ new Set();
+    for (const item of items) {
+      for (const { characterId } of [...item.give.cards, ...item.receive.cards]) ids.add(characterId);
+      for (const characterId of item.choice ?? []) ids.add(characterId);
+    }
+    return [...ids];
+  }
+  function netSale(price) {
+    const { saleTaxPct, listingFeePct, listingFeeMin } = config_default.market;
+    const tax = Math.ceil(price * saleTaxPct / 100);
+    const fee = Math.max(listingFeeMin, Math.ceil(price * listingFeePct / 100));
+    return price - tax - fee;
+  }
+  var sumOf = (list, pick) => list.reduce((sum, entry) => sum + pick(entry), 0);
+  function engagedSummary({ mine, trades, offers }, { myId, chakraHeld = 0 }) {
+    const orders = sumOf(
+      mine.buyOrders.filter((order) => order.status === "open"),
+      (order) => order.price * (order.qty - order.filled)
+    );
+    const pendingOut = trades.outgoing.filter((trade) => trade.status === "pending");
+    const tradesChakra = sumOf(pendingOut, (trade) => trade.give.chakra);
+    const bids = sumOf(
+      mine.bids.filter((listing) => listing.status === "active" && listing.leading),
+      (listing) => listing.myMaxBid ?? listing.currentBid ?? 0
+    );
+    const held = Math.max(chakraHeld, orders + tradesChakra + bids);
+    return {
+      held,
+      orders,
+      tradesChakra,
+      bids,
+      other: Math.max(0, held - orders - tradesChakra - bids),
+      cardsHeld: sumOf(mine.holds, (hold) => hold.qty),
+      inbox: trades.incoming.filter((trade) => trade.status === "pending").length,
+      outbid: mine.bids.filter((listing) => listing.status === "active" && !listing.leading).length,
+      selling: mine.listings.filter((listing) => listing.status === "active").length,
+      offersOpen: offers.filter((offer) => offer.status === "open" && offer.user.id === myId).length
+    };
+  }
+  function salesStats(listings) {
+    const sold = listings.filter((listing) => listing.status === "sold" && listing.finalPrice != null);
+    if (!sold.length) return null;
+    const withMedian = sold.filter((listing) => listing.prices?.median7d);
+    const gaps = withMedian.map((listing) => listing.finalPrice / listing.prices.median7d - 1);
+    return {
+      sold: sold.length,
+      net: sumOf(sold, (listing) => netSale(listing.finalPrice)),
+      vsMedian: gaps.length ? Math.round(sumOf(gaps, (gap) => gap) / gaps.length * 100) : null,
+      best: sold.reduce((best, listing) => listing.finalPrice > best.finalPrice ? listing : best)
+    };
   }
 
-  // src/features/market-trades/trade-panel.js
-  var CLOSED_STATUSES = /* @__PURE__ */ new Set(["accepted", "declined", "cancelled", "expired"]);
-  var gainTone = (gain) => gain == null || gain === 0 ? "flat" : gain > 0 ? "up" : "down";
-  var cardCount = (side) => side.cards.reduce((count, item) => count + item.qty, 0);
-  function ownedBadge(owned) {
-    return owned > 0 ? h("span", { class: "kp-badge", title: "Exemplaires que tu as" }, `x${owned}`) : h("span", { class: "kp-badge kp-badge--new" }, "Nouveau");
+  // src/features/market-activity/controller.js
+  var HistoryPhase = {
+    IDLE: "idle",
+    LOADING: "loading",
+    DONE: "done",
+    ERROR: "error"
+  };
+  var BAD_REQUEST = 400;
+  function reportUnexpected(error) {
+    if (!(error instanceof ApiError)) console.error("[Kyara Plus] Mon activité", error);
   }
-  function tradeCard({ card, qty, price, owned, gain }, { showName }) {
+  var initialState2 = () => ({
+    phase: "loading",
+    error: null,
+    items: [],
+    summary: null,
+    stats: null,
+    history: { phase: HistoryPhase.IDLE, error: null },
+    busy: /* @__PURE__ */ new Set(),
+    version: 0,
+    focus: null,
+    withdrawArmed: false,
+    view: {
+      category: "all",
+      sort: readSetting("activitySort", Sort.SOON),
+      query: "",
+      open: /* @__PURE__ */ new Set(),
+      shown: config_default.activity.renderStep,
+      native: false,
+      ledgerOpen: readSetting("activityLedger", false)
+    }
+  });
+  function createActivityController({ store, api: api3, notify: notify3, clock = { now: Date.now } }) {
+    let ctx = null;
+    let live = null;
+    let collection = /* @__PURE__ */ new Map();
+    let historyRun = null;
+    let withdrawTimer = 0;
+    let ledgerWarned = false;
+    const extras = /* @__PURE__ */ new Map();
+    const history2 = /* @__PURE__ */ new Map();
+    const state = () => store.get();
+    const patch = (changes) => store.set(changes);
+    const patchView = (changes) => patch({ view: { ...state().view, ...changes } });
+    const patchHistory = (changes) => patch({ history: { ...state().history, ...changes } });
+    const bump = () => patch({ version: state().version + 1 });
+    const cardOf = (id) => ctx.catalog.get(id) ?? extras.get(id);
+    function setLive(next) {
+      live = next;
+      ctx.chakraHeld = next.chakraHeld;
+      for (const listing of [...next.mine.listings, ...next.mine.bids])
+        extras.set(listing.character.id, listing.character);
+    }
+    function republish() {
+      const liveItems = buildItems(live, ctx);
+      const known = new Set(liveItems.map((item) => item.key));
+      const items = [...liveItems, ...[...history2.values()].filter((item) => !known.has(item.key))];
+      patch({
+        items,
+        summary: engagedSummary(live, ctx),
+        stats: salesStats(live.mine.listings)
+      });
+      return items;
+    }
+    async function loadPrices2(items) {
+      try {
+        await api3.prices(cardIds(items));
+        bump();
+      } catch (error) {
+        notify3.error(describeError(error));
+      }
+    }
+    function syncLedger() {
+      api3.syncLedger(live).catch((error) => {
+        if (ledgerWarned) return;
+        ledgerWarned = true;
+        notify3.error(describeError(error));
+      });
+    }
+    async function refreshLive() {
+      setLive(await api3.live());
+      loadPrices2(republish());
+      syncLedger();
+    }
+    async function load() {
+      patch({ phase: "loading", error: null });
+      try {
+        const base = await api3.context();
+        collection = base.collection;
+        ctx = { myId: base.myId, catalog: base.catalog, chakraHeld: 0, cardOf };
+        setLive(await api3.live());
+        patch({ phase: "ready" });
+        loadPrices2(republish());
+        syncLedger();
+        loadHistory();
+      } catch (error) {
+        reportUnexpected(error);
+        patch({ phase: "error", error: describeError(error) });
+      }
+    }
+    let historyPageSize = config_default.activity.historyPageSize;
+    async function fetchHistoryPage(kind, page) {
+      try {
+        return await api3.history(kind, page, historyPageSize);
+      } catch (error) {
+        if (historyPageSize === void 0 || !(error instanceof ApiError) || error.status !== BAD_REQUEST) throw error;
+        historyPageSize = void 0;
+        return api3.history(kind, page);
+      }
+    }
+    async function loadHistoryKind(kind) {
+      const loaded = [];
+      for (let page = 1; page <= config_default.activity.historyMaxPages; page++) {
+        const result = await fetchHistoryPage(kind, page);
+        const items = historyItems(kind, result, ctx);
+        for (const item of items) history2.set(item.key, item);
+        loaded.push(...items);
+        republish();
+        if (!result.more) break;
+      }
+      loadPrices2(loaded);
+    }
+    async function runHistory() {
+      patchHistory({ phase: HistoryPhase.LOADING, error: null });
+      try {
+        for (const kind of HISTORY_KINDS) await loadHistoryKind(kind);
+        patchHistory({ phase: HistoryPhase.DONE });
+      } catch (error) {
+        reportUnexpected(error);
+        patchHistory({ phase: HistoryPhase.ERROR, error: describeError(error) });
+      }
+    }
+    function loadHistory() {
+      if (state().history.phase === HistoryPhase.DONE) return Promise.resolve();
+      historyRun ??= runHistory().finally(() => {
+        historyRun = null;
+      });
+      return historyRun;
+    }
+    function setCategory(category) {
+      patchView({ category, shown: config_default.activity.renderStep });
+    }
+    function setSort(sort) {
+      writeSetting("activitySort", sort);
+      patchView({ sort });
+    }
+    function setQuery(query2) {
+      patchView({ query: query2, shown: config_default.activity.renderStep });
+    }
+    function toggleOpen(key) {
+      const open = new Set(state().view.open);
+      if (!open.delete(key)) open.add(key);
+      patchView({ open });
+    }
+    function showMore() {
+      patchView({ shown: state().view.shown + config_default.activity.renderStep });
+    }
+    function setNative(native) {
+      patchView({ native });
+    }
+    function toggleLedger() {
+      const ledgerOpen = !state().view.ledgerOpen;
+      writeSetting("activityLedger", ledgerOpen);
+      patchView({ ledgerOpen });
+    }
+    async function focusTrade(tradeId) {
+      const key = `t:${tradeId}`;
+      const find = () => state().items.find((item2) => item2.key === key);
+      let item = find();
+      if (!item) {
+        await loadHistory();
+        item = find();
+      }
+      if (!item) return;
+      const open = new Set(state().view.open).add(key);
+      patchView({
+        category: "all",
+        query: "",
+        open,
+        shown: Math.max(state().view.shown, state().items.length)
+      });
+      patch({ focus: { key, until: clock.now() + config_default.activity.focusMs } });
+    }
+    function setBusy(key, busy) {
+      const next = new Set(state().busy);
+      if (busy) next.add(key);
+      else next.delete(key);
+      patch({ busy: next });
+    }
+    async function reloadAfterChange() {
+      try {
+        const [, owned] = await Promise.all([refreshLive(), api3.reloadCollection()]);
+        collection = owned;
+        bump();
+      } catch (error) {
+        notify3.error(describeError(error));
+      }
+    }
+    async function run(key, task, success) {
+      setBusy(key, true);
+      try {
+        const result = await task();
+        notify3.success(typeof success === "function" ? success(result) : success);
+      } catch (error) {
+        notify3.error(describeError(error));
+      }
+      await reloadAfterChange();
+      setBusy(key, false);
+    }
+    const forTrade = (action, success) => (item) => run(item.key, () => api3.tradeAction(item.trade.id, action), success);
+    const actions2 = {
+      accept: forTrade("accept", "Échange accepté."),
+      decline: forTrade("decline", "Échange refusé."),
+      cancelTrade: forTrade("cancel", "Proposition annulée."),
+      cancelOffer: (item) => run(item.key, () => api3.cancelOffer(item.offer.id), "Offre retirée."),
+      cancelListing: (item) => run(item.key, () => api3.cancelListing(item.listing.id), "Vente retirée, la carte t’est revenue."),
+      cancelOrder: (item) => run(item.key, () => api3.cancelOrder(item.order.id), "Ordre annulé, chakra débloqué.")
+    };
+    function withdrawSummary(result) {
+      const total = result.listings + result.orders + result.trades + result.offers;
+      if (!total) return "Rien à retirer : tu n’as rien en cours sur le marché.";
+      const counts = [
+        `${result.listings} ventes`,
+        `${result.orders} ordres`,
+        `${result.trades} échanges`,
+        `${result.offers} offres`
+      ].join(", ");
+      const bids = result.auctionsWithBids;
+      const kept = bids ? ` ${bids} enchère(s) avec mises vont jusqu’au bout.` : "";
+      return `Retiré : ${counts}.${kept}`;
+    }
+    function withdrawAll() {
+      if (!state().withdrawArmed) {
+        patch({ withdrawArmed: true });
+        withdrawTimer = setTimeout(() => patch({ withdrawArmed: false }), config_default.activity.withdrawConfirmMs);
+        return Promise.resolve();
+      }
+      clearTimeout(withdrawTimer);
+      patch({ withdrawArmed: false });
+      return run(
+        "withdraw-all",
+        async () => withdrawSummary(await api3.withdrawAll()),
+        (message) => message
+      );
+    }
+    return {
+      load,
+      refreshLive,
+      loadHistory,
+      setCategory,
+      setSort,
+      setQuery,
+      toggleOpen,
+      showMore,
+      setNative,
+      toggleLedger,
+      focusTrade,
+      withdrawAll,
+      actions: actions2,
+      cardOf: (id) => ctx ? cardOf(id) : void 0,
+      ownedOf: (id) => collection.get(id)?.qty ?? 0,
+      dispose: () => clearTimeout(withdrawTimer)
+    };
+  }
+
+  // src/features/market-activity/labels.js
+  var KINDS = {
+    sale: { kanji: "売", label: "Vente" },
+    auction: { kanji: "競", label: "Enchère" },
+    bid: { kanji: "札", label: "Ma mise" },
+    order: { kanji: "注", label: "Ordre d’achat" },
+    tradeIn: { kanji: "換", label: "Échange reçu" },
+    tradeOut: { kanji: "換", label: "Échange envoyé" },
+    counter: { kanji: "台", label: "Offre du tableau" }
+  };
+  var dayFormat = new Intl.DateTimeFormat("fr-FR", {
+    day: "numeric",
+    month: "short"
+  });
+  var clockFormat2 = new Intl.DateTimeFormat("fr-FR", {
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+  var tone = (text, kind) => ({ text, tone: kind });
+  var TRADE_OUTCOMES = {
+    accepted: tone("Accepté", "good"),
+    declined: tone("Refusé", "bad"),
+    cancelled: tone("Annulé", "muted"),
+    expired: tone("Expiré", "muted")
+  };
+  function tradeStatus(item) {
+    if (item.state === State.TODO) return tone("Attend ta réponse", "warn");
+    if (item.state === State.LIVE) return tone(`En attente de ${item.who.pseudo}`, "muted");
+    return TRADE_OUTCOMES[item.outcome] ?? tone(item.outcome, "muted");
+  }
+  function boardStatus(item) {
+    const names = { cancelled: "Retirée", expired: "Expirée" };
+    if (item.outcome === "open") return tone("Proposée à tous", "accent");
+    if (item.outcome !== "accepted") return tone(names[item.outcome] ?? item.outcome, "muted");
+    return tone(item.posted ? `Prise par ${item.who?.pseudo ?? "?"}` : "Acceptée", "good");
+  }
+  function listingStatus(item) {
+    const { listing } = item;
+    if (listing.status === "active") {
+      if (item.kind === "sale") return tone("En vente", "accent");
+      return tone(
+        listing.bidCount ? `${plural(listing.bidCount, "mise")} · ${formatChakra(listing.currentBid)}` : "Aucune mise",
+        "accent"
+      );
+    }
+    const names = {
+      sold: "Vendue",
+      expired: "Expirée, carte rendue",
+      cancelled: "Retirée, carte rendue"
+    };
+    return tone(names[listing.status] ?? listing.status, listing.status === "sold" ? "good" : "muted");
+  }
+  function bidStatus(item) {
+    if (item.state === State.TODO) return tone("Enchère dépassée", "warn");
+    if (item.state === State.LIVE) return tone("Tu es en tête", "good");
+    const won = item.listing.leading && item.listing.status === "sold";
+    return won ? tone("Remportée", "good") : tone("Terminée", "muted");
+  }
+  function orderStatus(item) {
+    const { order } = item;
+    if (order.status === "open") return tone(`Achetées : ${order.filled} sur ${order.qty}`, "accent");
+    const names = {
+      filled: "Achetée",
+      cancelled: "Annulé, chakra rendu",
+      expired: "Expiré, chakra rendu"
+    };
+    return tone(names[order.status] ?? order.status, order.status === "filled" ? "good" : "muted");
+  }
+  function statusOf(item) {
+    switch (item.kind) {
+      case "tradeIn":
+      case "tradeOut":
+        return tradeStatus(item);
+      case "counter":
+        return boardStatus(item);
+      case "bid":
+        return bidStatus(item);
+      case "order":
+        return orderStatus(item);
+      default:
+        return listingStatus(item);
+    }
+  }
+  function titleOf(item, cardOf) {
+    const cardName = (id) => cardOf(id)?.name ?? `Carte ${id}`;
+    switch (item.kind) {
+      case "tradeIn":
+      case "tradeOut":
+        return `Avec ${item.who.pseudo}`;
+      case "counter":
+        return item.posted ? "Ton offre" : `Offre de ${item.who.pseudo}`;
+      case "order": {
+        const { qty } = item.receive.cards[0];
+        return `${cardName(item.receive.cards[0].characterId)}${qty > 1 ? ` ×${qty}` : ""}`;
+      }
+      case "bid":
+        return `${cardName(item.receive.cards[0].characterId)} · ${item.who.pseudo}`;
+      default:
+        return cardName(item.give.cards[0].characterId);
+    }
+  }
+  function formatWhen(ms, now) {
+    const date = new Date(ms);
+    const sameDay = new Date(now).toDateString() === date.toDateString();
+    const clock = clockFormat2.format(date);
+    return sameDay ? `aujourd’hui ${clock}` : `${dayFormat.format(date)} ${clock}`;
+  }
+  function timeOf(item, now) {
+    if (item.state !== State.DONE) return item.endsAt ? `expire dans ${formatRemaining(item.endsAt)}` : "";
+    return item.at ? formatWhen(item.at, now) : "";
+  }
+
+  // src/features/market-activity/rows.js
+  var gainTone = (net) => net > 0 ? "up" : net < 0 ? "down" : "flat";
+  var missingTile = () => h("span", { class: "kp-art kp-art--md kp-art--missing", title: "Carte inconnue" }, "?");
+  function ownedBadge(owned) {
+    return owned > 0 ? h("span", { class: "kp-badge", title: "Exemplaires que tu as" }, `×${owned}`) : h("span", { class: "kp-badge kp-badge--new" }, "Nouveau");
+  }
+  function tile({ characterId, qty }, view, { name = true } = {}) {
+    const card = view.cardOf(characterId);
+    if (!card) return missingTile();
+    const price = view.priceOf(characterId);
     return h(
       "div",
       { class: "kp-tcard", title: card.name },
-      cardArt(card, "md", [ownedBadge(owned)]),
-      showName ? h("strong", { class: "kp-name" }, qty > 1 ? `${card.name} ×${qty}` : card.name) : null,
-      h("span", { class: "kp-price" }, qty > 1 && !showName ? `${formatChakra(price)} ×${qty}` : formatChakra(price)),
-      gain === void 0 ? null : gainBadge(gain)
+      cardArt(card, "md", [ownedBadge(view.ownedOf(characterId))]),
+      name ? h("strong", { class: "kp-name" }, qty > 1 ? `${card.name} ×${qty}` : card.name) : null,
+      h("span", { class: "kp-price" }, price == null ? "? ◆" : formatChakra(price * qty))
     );
   }
-  var chakraTag = (side) => side.chakra ? h("span", { class: "kp-tag" }, `+ ${formatChakra(side.chakra)}`) : null;
-  function compactSide(label, side) {
-    const showTotal = side.total !== void 0 && (side.cards.length > 1 || side.chakra > 0);
-    return h(
-      "div",
-      { class: "kp-trade__side" },
-      h("span", { class: "kp-label" }, label),
-      h("div", { class: "kp-trade__cards" }, side.cards.map((item) => tradeCard(item, { showName: true })), chakraTag(side)),
-      showTotal ? h("span", { class: "kp-price kp-trade__total" }, `Total ${formatChakra(side.total)}`) : null
-    );
-  }
-  function netLine(net) {
-    if (net === void 0) return null;
-    if (net == null) return h("div", { class: "kp-trade__net kp-trade__net--flat" }, "Bilan inconnu");
-    if (net === 0) return h("div", { class: "kp-trade__net kp-trade__net--flat" }, "Échange équilibré");
-    return h("div", { class: `kp-trade__net kp-trade__net--${gainTone(net)}` }, `${formatGain(net)} ◆ ${net > 0 ? "gagnés" : "perdus"}`);
-  }
-  function boardOfferPanel({ give, receive, net }) {
-    return {
-      body: h("div", { class: "kp-trade" }, compactSide("Tu reçois", receive), swapIcon(), compactSide("Tu donnes", give), netLine(net))
-    };
-  }
-  function ownershipSummary(side, giving) {
-    const items = side.cards;
-    const notes = giving ? [[items.filter((item) => item.owned <= item.qty).length, "dernier exemplaire", "derniers exemplaires", "warn"]] : [
-      [items.filter((item) => item.owned === 0).length, "nouvelle", "nouvelles", "new"],
-      [items.filter((item) => item.owned > 0).length, "déjà possédée", "déjà possédées", "muted"]
-    ];
-    return notes.filter(([count]) => count > 0).map(([count, one, many, tone]) => h("span", { class: `kp-trade__note kp-trade__note--${tone}` }, `${count} ${count > 1 ? many : one}`));
-  }
-  function wideBox(label, side, { giving, open }) {
+  function sideBlock(label, side, choice, view, { all = false } = {}) {
+    const entries = choice ? choice.map((characterId) => ({ characterId, qty: 1 })) : side.cards;
+    const limit = all ? entries.length : config_default.activity.compactThumbLimit;
+    const hidden = entries.length - limit;
+    const total = choice ? null : sideValue2(side, view.priceOf);
     return h(
       "section",
-      { class: "kp-trade__box" },
+      { class: "kp-act__side" },
+      h("span", { class: "kp-label" }, choice ? `${label} · une au choix` : label),
       h(
-        "header",
-        { class: "kp-trade__box-head" },
-        h("span", { class: "kp-label" }, `${label} · ${cardCount(side)}`),
-        open ? ownershipSummary(side, giving) : null,
-        chakraTag(side),
-        h("span", { class: "kp-price kp-trade__box-total" }, `≈ ${formatChakra(side.total)}`)
+        "div",
+        { class: "kp-act__tiles" },
+        entries.slice(0, limit).map((entry) => tile(entry, view)),
+        hidden > 0 ? h("span", { class: "kp-act__more" }, `+${hidden}`) : null,
+        side.chakra ? h("span", { class: "kp-act__chakra" }, formatChakra(side.chakra)) : null,
+        !entries.length && !side.chakra ? h("span", { class: "kp-muted" }, "—") : null
       ),
-      h("div", { class: "kp-trade__grid" }, side.cards.map((item) => tradeCard(item, { showName: false })))
+      all && total != null ? h("span", { class: "kp-price" }, `≈ ${formatChakra(total)}`) : null
     );
   }
-  function netPill(net) {
-    const text = net == null ? "Bilan inconnu" : net === 0 ? "Équilibré" : `${formatGain(net)} ◆ pour toi`;
-    return h("span", { class: `kp-pill kp-pill--${gainTone(net)}` }, text);
+  function netPill(item, view) {
+    const net = netOf(item, view.priceOf);
+    if (net == null) return null;
+    const given = sideValue2(item.give, view.priceOf);
+    const received = sideValue2(item.receive, view.priceOf);
+    const text = net === 0 ? "Équilibré" : `${formatGain(net)} ◆ ${net > 0 ? "gagnés" : "perdus"}`;
+    return h(
+      "span",
+      {
+        class: `kp-gain kp-gain--${gainTone(net)} kp-act__net`,
+        title: `Tu reçois ≈ ${formatChakra(received)}, tu donnes ≈ ${formatChakra(given)}`
+      },
+      text
+    );
   }
-  function directTradePanel({ give, receive, net }, trade) {
-    const open = !CLOSED_STATUSES.has(trade.status) && new Date(trade.expiresAt) > Date.now();
-    return {
-      header: h(
-        "span",
-        { class: "kp-trade__summary" },
-        open ? h("span", { class: "kp-muted" }, `expire dans ${formatRemaining(trade.expiresAt)}`) : null,
-        netPill(net)
-      ),
-      body: h(
+  function salePill(item) {
+    if (item.kind !== "sale" && item.kind !== "auction") return null;
+    const { listing } = item;
+    const median = listing.prices?.median7d;
+    if (!median) return null;
+    const price = listing.finalPrice ?? listing.currentBid ?? listing.price;
+    const gap = Math.round((price / median - 1) * 100);
+    return h(
+      "span",
+      {
+        class: `kp-gain kp-gain--${gainTone(gap)} kp-act__net`,
+        title: `Prix face à la médiane des 7 derniers jours (${formatChakra(median)})`
+      },
+      `${gap > 0 ? "+" : ""}${gap} % face à la médiane`
+    );
+  }
+  var link = (href, text) => h("a", { class: "kp-act__link", href }, text);
+  function listingFacts(item) {
+    const { listing } = item;
+    const price = listing.finalPrice ?? listing.currentBid ?? listing.price;
+    const facts = [[item.kind === "auction" ? "Mise de départ" : "Prix demandé", formatChakra(listing.price)]];
+    if (listing.buyoutPrice) facts.push(["Achat immédiat", formatChakra(listing.buyoutPrice)]);
+    if (item.kind !== "bid") {
+      const label = listing.status === "sold" ? "Tu as touché" : "Tu toucheras";
+      facts.push([label, `${formatChakra(netSale(price))} (taxe et frais déduits)`]);
+    }
+    if (listing.bidCount) {
+      facts.push(["Mises", `${listing.bidCount}, la meilleure à ${formatChakra(listing.currentBid)}`]);
+    }
+    if (item.kind === "bid") {
+      facts.push(["Ta mise maximale", formatChakra(listing.myMaxBid)]);
+    }
+    if (listing.prices?.median7d) {
+      const sales = plural(listing.prices.sales7d, "vente");
+      facts.push(["Médiane sur 7 jours", `${formatChakra(listing.prices.median7d)} · ${sales}`]);
+    }
+    facts.push(["Annonce", link(`/marche?annonce=${listing.id}`, "Ouvrir l’annonce")]);
+    return facts;
+  }
+  function detailFacts(item, view) {
+    const created = item.createdAt ? formatWhen(item.createdAt, view.now) : null;
+    const base = [created ? ["Créé", created] : null];
+    if (item.listing) return [...base, ...listingFacts(item)];
+    if (item.order) {
+      const { order } = item;
+      return [
+        ...base,
+        ["Prix à l’unité", formatChakra(order.price)],
+        ["Achetées", `${order.filled} sur ${order.qty}`],
+        ["Chakra mis de côté", formatChakra(order.price * (order.qty - order.filled))]
+      ];
+    }
+    const message = item.message ? ["Message", `« ${item.message} »`] : null;
+    const talkHref = item.trade && `/marche?onglet=echanges&echange=${item.trade.id}&discussion=1`;
+    const talk = item.trade ? ["Discussion", link(talkHref, `Ouvrir (${item.messages})`)] : null;
+    return [message, talk];
+  }
+  function hasOverflow(item) {
+    const limit = config_default.activity.compactThumbLimit;
+    return [item.give.cards, item.receive.cards, item.choice ?? []].some((list) => list.length > limit);
+  }
+  var hasDetail = (item, view) => detailFacts(item, view).some(Boolean) || variantOf(item) === "compact" && hasOverflow(item);
+  function detail(item, view) {
+    const facts = detailFacts(item, view).filter(Boolean);
+    return h(
+      "div",
+      { class: "kp-act__detail" },
+      variantOf(item) === "compact" && hasOverflow(item) ? h(
         "div",
-        { class: "kp-trade kp-trade--wide" },
-        wideBox("Tu donnes", give, { giving: true, open }),
-        swapIcon(),
-        wideBox("Tu reçois", receive, { giving: false, open })
+        { class: "kp-act__full" },
+        sideBlock("Tu reçois", item.receive, item.choice, view, {
+          all: true
+        }),
+        sideBlock("Tu donnes", item.give, null, view, { all: true })
+      ) : null,
+      h(
+        "dl",
+        { class: "kp-act__facts" },
+        facts.flatMap(([label, value]) => [h("dt", {}, label), h("dd", {}, value ?? "—")])
       )
+    );
+  }
+  function actionButtons(item, view) {
+    const { actions: actions2 } = view.controller;
+    const button = (label, onClick, { ghost = true, attrs = {} } = {}) => h(
+      "button",
+      {
+        class: `kp-btn kp-btn--sm${ghost ? " kp-btn--ghost" : ""}`,
+        type: "button",
+        onClick: () => onClick(item),
+        ...attrs
+      },
+      label
+    );
+    const open = (label, href) => h("a", { class: "kp-btn kp-btn--sm kp-btn--ghost", href }, label);
+    switch (item.kind) {
+      case "tradeIn":
+        return item.state === State.TODO ? [button("Accepter", actions2.accept, { ghost: false }), button("Refuser", actions2.decline)] : [];
+      case "tradeOut":
+        return item.state === State.LIVE ? [button("Annuler", actions2.cancelTrade)] : [];
+      case "counter":
+        return item.state === State.LIVE ? [button("Retirer", actions2.cancelOffer)] : [];
+      case "order":
+        return item.state === State.LIVE ? [button("Annuler", actions2.cancelOrder)] : [];
+      case "bid": {
+        const href = `/marche?onglet=encheres&annonce=${item.listing.id}`;
+        return item.state === State.DONE ? [] : [open(item.state === State.TODO ? "Surenchérir" : "Voir", href)];
+      }
+      default: {
+        if (item.state !== State.LIVE) return [];
+        const locked = item.kind === "auction" && item.listing.bidCount > 0;
+        const attrs = locked ? {
+          disabled: true,
+          title: "Une enchère qui a des mises va jusqu’au bout."
+        } : {};
+        return [button("Retirer", actions2.cancelListing, { attrs })];
+      }
+    }
+  }
+  var VARIANTS = { tradeIn: "wide", tradeOut: "wide", counter: "compact" };
+  function variantOf(item) {
+    return VARIANTS[item.kind] ?? "mini";
+  }
+  function actions(item, view, open) {
+    return h(
+      "div",
+      { class: "kp-act__acts" },
+      actionButtons(item, view),
+      hasDetail(item, view) ? h(
+        "button",
+        {
+          class: "kp-hide kp-act__chev",
+          type: "button",
+          "aria-expanded": String(open),
+          title: open ? "Replier" : "Détails",
+          onClick: () => view.controller.toggleOpen(item.key)
+        },
+        icon(open ? "chevron-up" : "chevron-down")
+      ) : null
+    );
+  }
+  function toggleOnClick(item, view) {
+    return (event) => {
+      if (hasDetail(item, view) && !event.target.closest("a, button")) view.controller.toggleOpen(item.key);
+    };
+  }
+  function header(item, view, ...extra) {
+    const status = statusOf(item);
+    const kind = KINDS[item.kind];
+    const title = titleOf(item, view.cardOf);
+    return h(
+      "div",
+      { class: "kp-act__head", onClick: toggleOnClick(item, view) },
+      view.showKind ? h("span", { class: "kp-act__kind", "data-kind": item.kind, title: kind.label }, kind.kanji) : null,
+      h(
+        "div",
+        { class: "kp-act__txt" },
+        h("strong", { class: "kp-name", title }, title),
+        view.showKind ? h("span", { class: "kp-label" }, kind.label) : null
+      ),
+      h(
+        "div",
+        { class: "kp-act__state" },
+        h("span", { class: `kp-act__status kp-act__status--${status.tone}` }, status.text),
+        h("span", { class: "kp-note" }, timeOf(item, view.now))
+      ),
+      extra
+    );
+  }
+  function ownershipNotes(side, giving, view) {
+    const owned = ({ characterId }) => view.ownedOf(characterId);
+    const notes = giving ? [[side.cards.filter((entry) => owned(entry) <= entry.qty).length, "dernier exemplaire", "warn"]] : [
+      [side.cards.filter((entry) => owned(entry) === 0).length, "nouvelle", "new"],
+      [side.cards.filter((entry) => owned(entry) > 0).length, "déjà possédée", "muted"]
+    ];
+    return notes.filter(([count]) => count > 0).map(([count, word, tone2]) => h("span", { class: `kp-act__note kp-act__note--${tone2}` }, plural(count, word)));
+  }
+  function wideBox(label, side, view, { giving, live }) {
+    const count = side.cards.reduce((sum, entry) => sum + entry.qty, 0);
+    const total = sideValue2(side, view.priceOf);
+    return h(
+      "section",
+      { class: "kp-act__box" },
+      h(
+        "header",
+        { class: "kp-act__box-head" },
+        h("span", { class: "kp-label" }, `${label} · ${count}`),
+        live ? ownershipNotes(side, giving, view) : null,
+        side.chakra ? h("span", { class: "kp-tag" }, `+ ${formatChakra(side.chakra)}`) : null,
+        h("span", { class: "kp-price kp-act__box-total" }, `≈ ${formatChakra(total)}`)
+      ),
+      h(
+        "div",
+        { class: "kp-act__grid" },
+        side.cards.map((entry) => tile(entry, view, { name: false }))
+      )
+    );
+  }
+  function wideBody(item, view, open) {
+    const live = item.state !== State.DONE;
+    return [
+      header(item, view, netPill(item, view), actions(item, view, open)),
+      h(
+        "div",
+        { class: "kp-act__boxes" },
+        wideBox("Tu donnes", item.give, view, { giving: true, live }),
+        h("span", { class: "kp-swap" }, icon("arrow-right-arrow-left")),
+        wideBox("Tu reçois", item.receive, view, { giving: false, live })
+      )
+    ];
+  }
+  function compactBody(item, view, open) {
+    return [
+      header(item, view),
+      h(
+        "div",
+        { class: "kp-act__cards" },
+        sideBlock("Tu reçois", item.receive, item.choice, view),
+        h("span", { class: "kp-swap" }, icon("arrow-right-arrow-left")),
+        sideBlock("Tu donnes", item.give, null, view)
+      ),
+      h(
+        "div",
+        { class: "kp-act__foot" },
+        h("div", { class: "kp-act__meta" }, netPill(item, view)),
+        actions(item, view, open)
+      )
+    ];
+  }
+  function miniBody(item, view, open) {
+    const entry = [...item.give.cards, ...item.receive.cards][0];
+    const card = view.cardOf(entry.characterId);
+    const status = statusOf(item);
+    const title = titleOf(item, view.cardOf);
+    const amount = item.give.chakra || item.receive.chakra;
+    return [
+      h(
+        "div",
+        { class: "kp-act__mini", onClick: toggleOnClick(item, view) },
+        card ? cardArt(card, "sm", []) : missingTile(),
+        h(
+          "div",
+          { class: "kp-act__txt" },
+          h("strong", { class: "kp-name", title }, title),
+          h(
+            "span",
+            { class: "kp-note" },
+            view.showKind ? `${KINDS[item.kind].label} · ` : null,
+            h("span", { class: `kp-act__status kp-act__status--${status.tone}` }, status.text),
+            ` · ${timeOf(item, view.now)}`
+          )
+        ),
+        h(
+          "div",
+          { class: "kp-act__money" },
+          h("strong", { class: "kp-act__amount" }, formatChakra(amount)),
+          salePill(item)
+        ),
+        actions(item, view, open)
+      )
+    ];
+  }
+  var BODIES = { wide: wideBody, compact: compactBody, mini: miniBody };
+  function activityRow(item, view) {
+    const { state } = view;
+    const open = state.view.open.has(item.key);
+    const focused = state.focus?.key === item.key && view.now < state.focus.until;
+    const variant = variantOf(item);
+    const classes = ["kp-act__row", `kp-act__row--${item.state}`, `kp-act__row--${variant}`];
+    if (open) classes.push("is-open");
+    if (focused) classes.push("is-focus");
+    if (state.busy.has(item.key)) classes.push("is-busy");
+    return h(
+      "li",
+      { class: classes.join(" "), id: `kp-act-${item.key}`, "data-kind": item.kind },
+      BODIES[variant](item, view, open),
+      open && hasDetail(item, view) ? detail(item, view) : null
+    );
+  }
+
+  // src/features/market-activity/summary.js
+  var SEGMENTS = [
+    ["orders", "Ordres d’achat", "var(--cyan)"],
+    ["tradesChakra", "Échanges envoyés", "color-mix(in srgb, var(--cyan) 62%, var(--panel))"],
+    ["bids", "Enchères en tête", "color-mix(in srgb, var(--cyan) 34%, var(--panel))"],
+    ["other", "En cours de règlement", "var(--line3)"]
+  ];
+  var signed = (value) => value > 0 ? `+${value}` : String(value);
+  function lede(summary) {
+    const todo = [];
+    if (summary.inbox) {
+      todo.push(`${plural(summary.inbox, "échange")} ${summary.inbox > 1 ? "attendent" : "attend"} ta réponse`);
+    }
+    if (summary.outbid) todo.push(`${plural(summary.outbid, "enchère")} dépassée${summary.outbid > 1 ? "s" : ""}`);
+    return todo.length ? todo.join(" · ") : "Rien n’attend ta réponse.";
+  }
+  function stat(label, value, { onClick, active = false, title } = {}) {
+    return h(
+      onClick ? "button" : "span",
+      {
+        class: `kp-act__stat${active ? " is-on" : ""}`,
+        type: onClick ? "button" : void 0,
+        onClick,
+        title
+      },
+      label,
+      h("strong", {}, value)
+    );
+  }
+  function ledgerBar(summary) {
+    const total = SEGMENTS.reduce((sum, [key]) => sum + summary[key], 0);
+    if (!total) return h("p", { class: "kp-muted" }, "Rien n’est mis de côté : tout ton chakra est disponible.");
+    const used = SEGMENTS.filter(([key]) => summary[key] > 0);
+    return h(
+      "div",
+      { class: "kp-act__ledger-bar" },
+      h(
+        "div",
+        { class: "kp-act__bar-track" },
+        used.map(
+          ([key, label, color]) => h("span", {
+            style: {
+              width: `${summary[key] / total * 100}%`,
+              background: color
+            },
+            title: label
+          })
+        )
+      ),
+      h(
+        "ul",
+        { class: "kp-act__legend" },
+        used.map(
+          ([key, label, color]) => h("li", {}, h("i", { style: { background: color } }), `${label} : ${formatChakra(summary[key])}`)
+        )
+      )
+    );
+  }
+  function salesLine(stats) {
+    if (!stats) return null;
+    const parts = [
+      `${plural(stats.sold, "vente")} conclues`,
+      `${formatChakra(stats.net)} gagnés, taxes et frais déduits`,
+      stats.vsMedian == null ? null : `prix moyen ${signed(stats.vsMedian)} % face à la médiane`,
+      `meilleure vente : ${formatChakra(stats.best.finalPrice)}`
+    ];
+    return h("p", { class: "kp-act__sales" }, icon("chart-line"), parts.filter(Boolean).join(" · "));
+  }
+  function createSummary(controller) {
+    const heading = h("span", { class: "kp-act__lede" });
+    const stats = h("div", { class: "kp-act__stats" });
+    const inline = h("div", { class: "kp-act__summary" }, heading, stats);
+    const ledger = h("div", { class: "kp-act__ledger" });
+    return {
+      inline,
+      ledger,
+      render(state) {
+        const { summary, items, view } = state;
+        inline.hidden = !summary;
+        ledger.hidden = !summary || !view.ledgerOpen;
+        if (!summary) return;
+        const todo = items.filter((item) => item.state === State.TODO).length;
+        heading.textContent = lede(summary);
+        heading.classList.toggle("is-calm", !todo);
+        fill(
+          stats,
+          stat("Chakra engagé", formatChakra(summary.held), {
+            onClick: () => controller.toggleLedger(),
+            active: view.ledgerOpen,
+            title: "Détail du chakra mis de côté"
+          }),
+          stat("Cartes bloquées 48 h", String(summary.cardsHeld), {
+            title: "Cartes reçues ou achetées il y a moins de 48 h : elles ne peuvent pas encore être revendues"
+          })
+        );
+        if (view.ledgerOpen) fill(ledger, ledgerBar(summary), salesLine(state.stats));
+      }
     };
   }
 
-  // src/features/market-trades/index.js
-  var TAB_PANEL = 'main [role="tabpanel"]';
-  var SECTIONS = [
-    ["received", "Reçues"],
-    ["sent", "Envoyées"],
-    ["board", "Offres du tableau"]
-  ];
-  var SECTION_BY_TITLE = new Map(SECTIONS.map(([key, title]) => [title, key]));
-  var DIRECT_TRADE_PREFIX = "echange-";
-  function indexTrades({ incoming = [], outgoing = [] }) {
-    return new Map([
-      ...incoming.map((trade) => [trade.id, { trade, incoming: true }]),
-      ...outgoing.map((trade) => [trade.id, { trade, incoming: false }])
-    ]);
+  // src/features/market-activity/panel.js
+  var SORT_LABELS = {
+    [Sort.SOON]: "Échéance",
+    [Sort.RECENT]: "Plus récents",
+    [Sort.OLD]: "Plus anciens",
+    [Sort.VALUE]: "Plus de valeur",
+    [Sort.GAIN]: "Plus de gain"
+  };
+  var TABS = [{ id: "all", label: "Tout", short: "Tout", icon: "layer-group" }, ...CATEGORIES];
+  var GROUP_TITLES = {
+    [State.TODO]: "À traiter",
+    [State.LIVE]: "En cours",
+    done: "Terminés",
+    "done:today": "Terminés · aujourd’hui",
+    "done:yesterday": "Terminés · hier",
+    "done:week": "Terminés · cette semaine",
+    "done:older": "Terminés · plus ancien"
+  };
+  var LAYOUTS = {
+    [Category.BOARD]: "board",
+    [Category.SALES]: "minis",
+    [Category.BIDS]: "minis",
+    [Category.ORDERS]: "minis"
+  };
+  var WITHDRAWABLE = /* @__PURE__ */ new Set([Category.SALES, Category.ORDERS, Category.TRADES_OUT, Category.BOARD]);
+  function createTab(controller, tab) {
+    const count = h("span", { class: "n" });
+    const button = h(
+      "button",
+      {
+        class: "kp-act__tab",
+        type: "button",
+        role: "tab",
+        title: tab.label,
+        onClick: () => controller.setCategory(tab.id)
+      },
+      icon(tab.icon),
+      h("span", { class: "kp-act__tab-label" }, tab.short),
+      count
+    );
+    return { id: tab.id, button, count };
   }
-  function tagSections(panel) {
-    let key = null;
-    for (const child of panel.children) {
-      if (child.matches("h2")) key = SECTION_BY_TITLE.get(child.textContent.trim()) ?? null;
-      if (key) child.dataset.kpSection = key;
+  function createActivityPanel(controller, { onSell }) {
+    let lastFocus = null;
+    let current = null;
+    const summary = createSummary(controller);
+    const tabs = TABS.map((tab) => createTab(controller, tab));
+    const sortSelect = h(
+      "select",
+      {
+        class: "kp-input kp-act__sort",
+        "aria-label": "Trier",
+        onChange: (event) => controller.setSort(event.target.value)
+      },
+      Object.entries(SORT_LABELS).map(([sort, label]) => h("option", { value: sort }, label))
+    );
+    const search = h("input", {
+      class: "kp-input kp-act__search",
+      type: "search",
+      placeholder: "Carte ou joueur",
+      "aria-label": "Chercher dans mon activité",
+      onInput: (event) => controller.setQuery(event.target.value)
+    });
+    const sellButton = h("button", { class: "kp-btn kp-btn--sm", type: "button", onClick: onSell }, "Vendre une carte");
+    const withdrawButton = h("button", {
+      class: "kp-btn kp-btn--sm kp-btn--ghost",
+      type: "button",
+      onClick: () => controller.withdrawAll()
+    });
+    const nativeButton = h("button", {
+      class: "kp-btn kp-btn--sm kp-btn--ghost",
+      type: "button",
+      title: "Basculer entre cette vue et celle du site",
+      onClick: () => controller.setNative(!current.view.native)
+    });
+    const toolbar = h(
+      "div",
+      { class: "kp-act__toolbar" },
+      h(
+        "div",
+        { class: "kp-act__tabs", role: "tablist", "aria-label": "Catégories" },
+        tabs.map(({ button }) => button)
+      ),
+      h("div", { class: "kp-act__tools" }, sortSelect, search, sellButton, withdrawButton)
+    );
+    const body = h("div", { class: "kp-act__body" });
+    const bar = h(
+      "div",
+      { class: "kp-act__bar" },
+      h("h2", { class: "kp-title" }, "Mon activité"),
+      summary.inline,
+      nativeButton
+    );
+    const content = h("div", { class: "kp-act__content" }, summary.ledger, toolbar, body);
+    const root = h("section", { class: "kp-act", "aria-label": "Mon activité" }, bar, content);
+    function renderToolbar(state) {
+      const { view, items } = state;
+      const stats = categoryStats(items);
+      for (const { id, button, count } of tabs) {
+        const { total, todo } = stats[id];
+        button.setAttribute("aria-selected", String(view.category === id));
+        button.classList.toggle("on", view.category === id);
+        button.classList.toggle("is-empty", total === 0);
+        button.classList.toggle("has-todo", todo > 0);
+        count.textContent = String(total);
+      }
+      sortSelect.value = view.sort;
+      if (document.activeElement !== search && search.value !== view.query) search.value = view.query;
+      const withdrawable = items.filter((item) => item.state === State.LIVE && WITHDRAWABLE.has(item.category)).length;
+      withdrawButton.hidden = withdrawable === 0;
+      withdrawButton.classList.toggle("kp-btn--warn", state.withdrawArmed);
+      withdrawButton.disabled = state.busy.has("withdraw-all");
+      withdrawButton.textContent = state.withdrawArmed ? `Confirmer : retirer ${withdrawable} éléments ?` : "Tout retirer du marché";
     }
-  }
-  function boardOfferIds(item) {
-    const ids = { receive: [], give: [] };
-    for (const side of item.querySelectorAll(".sides .side")) {
-      const target = side.querySelector(".sk")?.textContent.trim().startsWith("Tu reçois") ? ids.receive : ids.give;
-      side.querySelectorAll("a.thumb").forEach((link) => target.push(cardIdFromLink(link)));
+    function historyNotice({ history: history2 }) {
+      if (history2.phase === HistoryPhase.DONE) return null;
+      if (history2.phase === HistoryPhase.ERROR) {
+        return h(
+          "p",
+          { class: "kp-act__notice kp-act__notice--error" },
+          `Historique incomplet : ${history2.error} `,
+          h(
+            "button",
+            {
+              class: "kp-btn kp-btn--sm kp-btn--ghost",
+              type: "button",
+              onClick: () => controller.loadHistory()
+            },
+            "Réessayer"
+          )
+        );
+      }
+      return h("p", { class: "kp-act__notice" }, "Chargement de tout l’historique…");
     }
-    return ids;
-  }
-  function placePanel(item, { body, header: headerExtra }) {
-    item.querySelector(":scope > .kp-trade")?.remove();
-    item.querySelector(".kp-trade__summary")?.remove();
-    item.classList.add("kp-trade-host");
-    const header = item.querySelector(":scope > .th");
-    if (header) header.after(body);
-    else item.prepend(body);
-    if (!headerExtra) return;
-    const status = header?.querySelector(".st");
-    if (status) status.before(headerExtra);
-    else (header ?? item).append(headerExtra);
-  }
-  function placeTalkIcon(item) {
-    item.querySelector(".kp-talk")?.remove();
-    const talk = item.querySelector(".tact .talk");
-    const player = item.querySelector(":scope > .th a");
-    if (!talk || !player) return;
-    const button = h("button", { class: "kp-talk", type: "button", title: "Discuter" }, icon("comment"));
-    button.addEventListener("click", () => talk.click());
-    player.after(button);
-  }
-  var market_trades_default = {
-    id: "market-trades",
-    matches: (url) => url.pathname === "/marche" && url.searchParams.get("onglet") === "echanges",
-    mount() {
-      let context = null;
-      let trades = /* @__PURE__ */ new Map();
-      let version = 0;
-      let frame = 0;
-      let active = readSetting("tradesTab", "received");
-      const requestedTradeIds = /* @__PURE__ */ new Set();
-      const requestedPriceIds = /* @__PURE__ */ new Set();
-      const tabButtons = SECTIONS.map(([key, title]) => {
-        const button = h("button", { class: "kp-chip", type: "button", "data-section": key }, title);
-        button.addEventListener("click", () => {
-          active = key;
-          writeSetting("tradesTab", key);
-          schedule();
-        });
-        return button;
+    function visibleGroups(state) {
+      const { view } = state;
+      const filtered = filterItems(state.items, {
+        category: view.category,
+        query: view.query
       });
-      const tabs = h("div", { class: "kp-filters kp-trade-tabs", role: "tablist" }, tabButtons);
-      const refresh = () => {
-        version++;
-        schedule();
+      const groups = organize(filtered, {
+        sort: view.sort,
+        now: Date.now(),
+        priceOf
+      });
+      let room = view.shown;
+      const shown = groups.map((group) => {
+        const slice = group.items.slice(0, Math.max(0, room));
+        room -= slice.length;
+        return { ...group, slice };
+      });
+      return {
+        shown: shown.filter((group) => group.slice.length),
+        total: filtered.length
       };
-      function fetchMissingPrices(ids) {
-        const missing = ids.filter((id) => !requestedPriceIds.has(id));
-        if (!missing.length) return;
-        missing.forEach((id) => requestedPriceIds.add(id));
-        loadPrices(missing).then(refresh).catch((error) => toast(describeError(error), "error"));
+    }
+    function renderBody(state) {
+      if (state.phase === "loading") return fill(body, h("p", { class: "kp-empty" }, "Chargement de ton activité…"));
+      if (state.phase === "error") {
+        return fill(
+          body,
+          h("p", { class: "kp-empty" }, state.error),
+          h("button", { class: "kp-btn", type: "button", onClick: () => controller.load() }, "Réessayer")
+        );
       }
-      function fetchTrades(tradeId) {
-        if (requestedTradeIds.has(tradeId)) return;
-        requestedTradeIds.add(tradeId);
-        tradesApi.mine().then((data) => {
-          trades = indexTrades(data);
-          fetchMissingPrices([...trades.values()].flatMap(({ trade }) => tradeCardIds(trade)));
-          refresh();
-        }).catch((error) => toast(describeError(error), "error"));
+      const rowView = {
+        state,
+        controller,
+        cardOf: controller.cardOf,
+        priceOf,
+        ownedOf: controller.ownedOf,
+        showKind: state.view.category === "all",
+        now: Date.now()
+      };
+      const { shown, total } = visibleGroups(state);
+      const shownCount = shown.reduce((sum, group) => sum + group.slice.length, 0);
+      const empty = !shown.length && state.history.phase === HistoryPhase.DONE;
+      fill(
+        body,
+        empty ? h("p", { class: "kp-empty" }, state.view.query ? "Rien ne correspond à cette recherche." : "Rien ici.") : null,
+        shown.map(
+          (group) => h(
+            "section",
+            { class: "kp-act__group" },
+            h(
+              "h3",
+              { class: "kp-act__group-title" },
+              GROUP_TITLES[group.id],
+              h("span", { class: "mono" }, String(group.items.length))
+            ),
+            h(
+              "ul",
+              { class: `kp-act__list kp-act__list--${LAYOUTS[state.view.category] ?? "rows"}` },
+              group.slice.map((item) => activityRow(item, rowView))
+            )
+          )
+        ),
+        total > shownCount ? h(
+          "button",
+          {
+            class: "kp-btn kp-btn--ghost kp-more",
+            type: "button",
+            onClick: () => controller.showMore()
+          },
+          `Voir plus (${plural(total - shownCount, "élément")})`
+        ) : null,
+        historyNotice(state)
+      );
+    }
+    function scrollToFocus(state) {
+      if (!state.focus || state.focus.key === lastFocus) return;
+      const row = document.getElementById(`kp-act-${state.focus.key}`);
+      if (!row) return;
+      lastFocus = state.focus.key;
+      row.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+    return {
+      root,
+      render(state) {
+        current = state;
+        root.classList.toggle("is-native", state.view.native);
+        nativeButton.textContent = state.view.native ? "Vue Kyara Plus" : "Vue du site";
+        if (state.view.native) return;
+        summary.render(state);
+        renderToolbar(state);
+        renderBody(state);
+        scrollToFocus(state);
       }
-      function renderTabs(panel) {
-        document.body.dataset.kpTradesTab = active;
-        for (const button of tabButtons) {
-          const key = button.dataset.section;
-          const count = panel.querySelectorAll(`[data-kp-section="${key}"] li.trade`).length;
-          const label = `${SECTIONS.find(([section]) => section === key)[1]} (${count})`;
-          button.setAttribute("aria-pressed", String(key === active));
-          if (button.textContent !== label) button.textContent = label;
-        }
-      }
-      function enhance(item) {
-        if (item.dataset.kpVersion === String(version)) {
-          if (!item.querySelector(".kp-talk")) placeTalkIcon(item);
-          return;
-        }
-        let panel;
-        if (item.id.startsWith(DIRECT_TRADE_PREFIX)) {
-          const tradeId = item.id.slice(DIRECT_TRADE_PREFIX.length);
-          const entry = trades.get(tradeId);
-          if (!entry) return fetchTrades(tradeId);
-          panel = directTradePanel(directTrade(entry.trade, entry.incoming, context), entry.trade);
-        } else {
-          const ids = boardOfferIds(item);
-          fetchMissingPrices([...ids.receive, ...ids.give]);
-          panel = boardOfferPanel(boardOffer(ids.receive, ids.give, context));
-        }
-        item.dataset.kpVersion = String(version);
-        placePanel(item, panel);
-        placeTalkIcon(item);
-      }
-      function decorate2() {
-        const panel = document.querySelector(TAB_PANEL);
-        if (!panel) return;
-        tagSections(panel);
-        renderTabs(panel);
-        if (context) panel.querySelectorAll("li.trade").forEach(enhance);
-      }
-      function schedule() {
-        if (frame) return;
-        frame = requestAnimationFrame(() => {
-          frame = 0;
-          decorate2();
-        });
-      }
-      const detach = keepAttached(tabs, TAB_PANEL, (panel, node) => {
-        const intro = panel.querySelector(":scope > p.sub");
-        if (intro) intro.after(node);
-        else panel.prepend(node);
+    };
+  }
+
+  // src/features/market-activity/index.js
+  var ACTIVITY_PANEL = 'main [role="tabpanel"]';
+  var SECTIONS_TABLIST = '[role="tablist"][aria-label="Sections du marché"] [role="tab"]';
+  var URL_WATCH_MS = 1e3;
+  var NATIVE_CLASS = "kp-activity--native";
+  var FIRST_CATEGORY = {
+    ventes: Category.SALES,
+    mises: Category.BIDS,
+    ordres: Category.ORDERS,
+    echanges: "all"
+  };
+  var notify2 = {
+    success: (message) => toast(message, "success"),
+    error: (message) => toast(message, "error")
+  };
+  var offersWarned = false;
+  var boardOffers = () => tradesApi.offersMine().catch((error) => {
+    if (!offersWarned) {
+      offersWarned = true;
+      notify2.error(`Offres du tableau indisponibles : ${describeError(error)}`);
+    }
+    return [];
+  });
+  var api2 = {
+    context: async () => {
+      const [{ me }, catalog, collection] = await Promise.all([meApi.bootstrap(), loadCatalog(), loadCollection()]);
+      return { myId: me.id, catalog, collection };
+    },
+    live: async () => {
+      const [mine, trades, offers, { me }] = await Promise.all([
+        marketApi.mine(),
+        tradesApi.mine(),
+        boardOffers(),
+        meApi.bootstrap()
+      ]);
+      return { mine, trades, offers, chakraHeld: me.chakraHeld ?? 0 };
+    },
+    history: (kind, page, size) => marketApi.history(kind, page, size),
+    prices: (ids) => loadPrices(ids),
+    tradeAction: (tradeId, action) => tradesApi.act(tradeId, action),
+    cancelOffer: (offerId) => tradesApi.cancelOffer(offerId),
+    cancelListing: (listingId) => marketApi.cancelListing(listingId),
+    cancelOrder: (orderId) => marketApi.cancelOrder(orderId),
+    withdrawAll: () => marketApi.withdrawAll(),
+    reloadCollection: () => loadCollection(),
+    syncLedger: (live) => loadMyId().then((myId) => syncTradeLedger(myId, { offers: live.offers, trades: live.trades }))
+  };
+  var openSellTab = () => [...document.querySelectorAll(SECTIONS_TABLIST)].find((tab) => tab.textContent.trim().startsWith("Vendre"))?.click();
+  var market_activity_default = {
+    id: "market-activity",
+    matches: (url) => url.pathname === "/marche" && Object.hasOwn(FIRST_CATEGORY, url.searchParams.get("onglet")),
+    mount() {
+      const store = createStore(initialState2());
+      const controller = createActivityController({ store, api: api2, notify: notify2 });
+      const panel = createActivityPanel(controller, { onSell: openSellTab });
+      let focusedTrade = null;
+      document.body.classList.add("kp-activity");
+      let renderTimer = 0;
+      const renderNow = () => {
+        clearTimeout(renderTimer);
+        renderTimer = 0;
+        panel.render(store.get());
+      };
+      const unsubscribe = store.subscribe((state) => {
+        document.body.classList.toggle(NATIVE_CLASS, state.view.native);
+        if (state.history.phase !== HistoryPhase.LOADING) return renderNow();
+        renderTimer ||= setTimeout(renderNow, config_default.activity.loadingRenderMs);
       });
-      const observer = new MutationObserver(schedule);
-      observer.observe(document.body, { childList: true, subtree: true });
-      schedule();
-      Promise.all([loadCatalog(), loadCollection(), tradesApi.mine()]).then(([catalog, collection, data]) => {
-        context = { catalog, collection, priceOf };
-        trades = indexTrades(data);
-        fetchMissingPrices([...trades.values()].flatMap(({ trade }) => tradeCardIds(trade)));
-        refresh();
-      }).catch((error) => toast(describeError(error), "error"));
-      const syncLedger = () => loadMyId().then(syncTradeLedger);
-      syncLedger().catch((error) => toast(describeError(error), "error"));
-      const stopLedgerSync = startPolling(
-        syncLedger,
-        () => config_default.ledger.syncMs,
-        (error) => toast(`Suivi des échanges arrêté : ${describeError(error)}`, "error")
+      const detach = keepAttached(panel.root, ACTIVITY_PANEL, (tabpanel, node) => tabpanel.prepend(node));
+      const watchUrl = () => {
+        const tradeId = new URLSearchParams(location.search).get("echange");
+        if (tradeId === focusedTrade) return;
+        focusedTrade = tradeId;
+        if (tradeId && !store.get().view.native) controller.focusTrade(tradeId);
+      };
+      const urlTimer = setInterval(watchUrl, URL_WATCH_MS);
+      controller.setCategory(FIRST_CATEGORY[new URLSearchParams(location.search).get("onglet")]);
+      panel.render(store.get());
+      controller.load().then(watchUrl);
+      const stopPolling = startPolling(
+        () => controller.refreshLive(),
+        () => config_default.activity.refreshMs,
+        (error) => toast(`Mise à jour de Mon activité arrêtée : ${describeError(error)}`, "error")
       );
       return () => {
-        stopLedgerSync();
+        stopPolling();
+        clearInterval(urlTimer);
+        controller.dispose();
+        unsubscribe();
+        clearTimeout(renderTimer);
         detach();
-        observer.disconnect();
-        cancelAnimationFrame(frame);
-        tabs.remove();
-        delete document.body.dataset.kpTradesTab;
-        document.querySelectorAll(".kp-trade, .kp-trade__summary, .kp-talk").forEach((node) => node.remove());
-        document.querySelectorAll(".kp-trade-host").forEach((item) => {
-          item.classList.remove("kp-trade-host");
-          delete item.dataset.kpVersion;
-        });
+        panel.root.remove();
+        document.body.classList.remove("kp-activity", NATIVE_CLASS);
       };
     }
   };
@@ -2179,14 +3415,14 @@ Continuer ?`);
   }
 
   // src/features/shelf-tiles.js
-  var tileCardId = (tile) => Number(tile.querySelector("img")?.getAttribute("src")?.match(/\/cards\/\w+\/(\d+)\./)?.[1]);
-  function renderCount(tile, count) {
-    let badge = tile.querySelector(":scope > .kp-count");
+  var tileCardId = (tile2) => Number(tile2.querySelector("img")?.getAttribute("src")?.match(/\/cards\/\w+\/(\d+)\./)?.[1]);
+  function renderCount(tile2, count) {
+    let badge = tile2.querySelector(":scope > .kp-count");
     if (count == null) return badge?.remove();
     if (!badge) {
       badge = h("span", { class: "kp-count" });
-      tile.classList.add("kp-count-host");
-      tile.append(badge);
+      tile2.classList.add("kp-count-host");
+      tile2.append(badge);
     }
     const text = `×${count}`;
     if (badge.textContent !== text) badge.textContent = text;
@@ -2194,7 +3430,7 @@ Continuer ?`);
   }
   function clearCounts() {
     document.querySelectorAll(".kp-count").forEach((badge) => badge.remove());
-    document.querySelectorAll(".kp-count-host").forEach((tile) => tile.classList.remove("kp-count-host"));
+    document.querySelectorAll(".kp-count-host").forEach((tile2) => tile2.classList.remove("kp-count-host"));
   }
 
   // src/features/trade-dialog.js
@@ -2222,11 +3458,11 @@ Continuer ?`);
         }
       );
       function orderTiles(shelf, tiles) {
-        const items = tiles.map((tile) => ({ tile, card: catalog?.get(tileCardId(tile)) })).filter((item) => item.card && item.tile.closest("li"));
+        const items = tiles.map((tile2) => ({ tile: tile2, card: catalog?.get(tileCardId(tile2)) })).filter((item) => item.card && item.tile.closest("li"));
         requestPrices(items.map((item) => item.card.id));
         const allLoaded = Boolean(catalog) && !shelf.querySelector("button.more");
         const ready = allLoaded && (pricesFailed || items.every((item) => isPriceLoaded(item.card.id)));
-        const ordered = items.map(({ tile, card }) => ({ element: tile.closest("li"), card, price: priceOf(card.id) }));
+        const ordered = items.map(({ tile: tile2, card }) => ({ element: tile2.closest("li"), card, price: priceOf(card.id) }));
         sorter.apply(ordered, ready);
       }
       const schedule = () => {
@@ -2257,7 +3493,7 @@ Continuer ?`);
       const filters = {
         mine: [
           { key: "myDuplicates", label: "Mes doubles", keep: ({ id }) => mySpares(id) > 0 },
-          { key: "theyLack", label: "Il lui manque", keep: ({ tile }) => Boolean(tile.querySelector(".lack")) }
+          { key: "theyLack", label: "Il lui manque", keep: ({ tile: tile2 }) => Boolean(tile2.querySelector(".lack")) }
         ],
         theirs: [
           { key: "theirDuplicates", label: "Ses doubles", keep: ({ count }) => count >= DUPLICATE_MIN },
@@ -2302,12 +3538,12 @@ Continuer ?`);
         placeChips(shelf, tab);
         shelf.querySelector("button.more")?.click();
         const tiles = [...shelf.querySelectorAll(TILE)];
-        for (const tile of tiles) {
-          const id = tileCardId(tile);
+        for (const tile2 of tiles) {
+          const id = tileCardId(tile2);
           const count = counts ? counts.get(id) ?? 0 : null;
-          renderCount(tile, count);
-          const hidden = count != null && activeFilters.some((filter) => !filter.keep({ id, tile, count }));
-          tile.closest("li")?.classList.toggle("kp-filtered-out", hidden);
+          renderCount(tile2, count);
+          const hidden = count != null && activeFilters.some((filter) => !filter.keep({ id, tile: tile2, count }));
+          tile2.closest("li")?.classList.toggle("kp-filtered-out", hidden);
         }
         orderTiles(shelf, tiles);
       }
@@ -2376,7 +3612,7 @@ Continuer ?`);
   var byBoardPriority = (a, b) => Number(b.wished) - Number(a.wished) || rarityRank(a.received.rarity) - rarityRank(b.received.rarity) || descending(gainKey(a.bestAvailable?.gain), gainKey(b.bestAvailable?.gain));
   var cardMatches = (card, query2) => searchKey(card.name).includes(query2) || searchKey(card.series ?? "").includes(query2);
   var matchesSearch = (analysis, query2) => !query2 || cardMatches(analysis.received, query2) || analysis.options.some((option) => cardMatches(option.card, query2));
-  function boardOffers(analyses, activeFilters, rarities, search = "") {
+  function boardOffers2(analyses, activeFilters, rarities, search = "") {
     const tests = [...activeFilters].map((filter) => FILTER_TESTS[filter]);
     const query2 = searchKey(search.trim());
     return analyses.filter(
@@ -2568,7 +3804,7 @@ Continuer ?`);
     READY: "ready",
     ERROR: "error"
   };
-  var initialState2 = () => ({
+  var initialState3 = () => ({
     phase: Phase2.IDLE,
     scanned: 0,
     error: null,
@@ -2974,7 +4210,7 @@ Continuer ?`);
     };
     function render(state) {
       lastState = state;
-      const offers = boardOffers(state.analyses, activeFilters, activeRarities, search);
+      const offers = boardOffers2(state.analyses, activeFilters, activeRarities, search);
       const visible = offers.slice(0, visibleCount);
       status.textContent = statusText2(state, offers.length);
       showHiddenButton.hidden = state.hiddenCount === 0;
@@ -3105,7 +4341,7 @@ Continuer ?`);
     OFFERS: "offers",
     AUTO: "auto"
   };
-  var TABS = [
+  var TABS2 = [
     [Tab.OFFERS, "Offres"],
     [Tab.AUTO, "Auto-accept"]
   ];
@@ -3179,7 +4415,7 @@ ${lines.join("\n")}`;
       if (lastState) render(lastState);
     };
     let tab = readSetting("sideTab", Tab.OFFERS);
-    const tabButtons = TABS.map(([key, label]) => {
+    const tabButtons = TABS2.map(([key, label]) => {
       const button = h("button", { class: "kp-chip", type: "button", role: "tab" }, label);
       button.addEventListener("click", () => {
         tab = key;
@@ -3241,7 +4477,7 @@ ${lines.join("\n")}`;
       offersView.hidden = tab !== Tab.OFFERS;
       autoView.hidden = tab !== Tab.AUTO;
     }
-    function fill(list, deals, emptyText, state) {
+    function fill2(list, deals, emptyText, state) {
       if (state.phase !== Phase2.READY && deals.length === 0) {
         list.replaceChildren(h("p", { class: "kp-muted" }, "Chargement…"));
         return;
@@ -3254,8 +4490,8 @@ ${lines.join("\n")}`;
       renderTabs(state);
       renderFairPlay(fairBox, state.fair);
       autoPanel.render(state);
-      fill(gainList, gainDeals(state.analyses, minGain), "Aucune offre à ce gain.", state);
-      fill(bangerList, bangerDeals(state.analyses), "Aucune offre banger pour le moment.", state);
+      fill2(gainList, gainDeals(state.analyses, minGain), "Aucune offre à ce gain.", state);
+      fill2(bangerList, bangerDeals(state.analyses), "Aucune offre banger pour le moment.", state);
     }
     return { root, render };
   }
@@ -3268,7 +4504,7 @@ ${lines.join("\n")}`;
     id: "market-offers",
     matches: (url) => url.pathname === "/marche" && url.searchParams.get("onglet") === "offres",
     mount() {
-      const store = createStore(initialState2());
+      const store = createStore(initialState3());
       const controller = createOffersController(store);
       const board = createBoard(controller, { onPropose: () => document.querySelector(NATIVE_PROPOSE)?.click() });
       const side = createSidePanel(controller);
@@ -3302,8 +4538,8 @@ ${lines.join("\n")}`;
       let collection = null;
       let frame = 0;
       function decorate2() {
-        for (const tile of document.querySelectorAll(OFFER_TILES)) {
-          renderCount(tile, collection.get(tileCardId(tile))?.qty ?? 0);
+        for (const tile2 of document.querySelectorAll(OFFER_TILES)) {
+          renderCount(tile2, collection.get(tileCardId(tile2))?.qty ?? 0);
         }
       }
       const schedule = () => {
@@ -3357,8 +4593,8 @@ ${lines.join("\n")}`;
       function decorate2() {
         const section = document.querySelector(SERIES_SECTION);
         if (!section) return;
-        const header = section.querySelector(":scope > header");
-        if (header && toggle.parentElement !== header) header.append(toggle);
+        const header2 = section.querySelector(":scope > header");
+        if (header2 && toggle.parentElement !== header2) header2.append(toggle);
         render(section);
       }
       function schedule() {
@@ -3618,9 +4854,9 @@ ${lines.join("\n")}`;
   var PROFILE_ACTIONS = "main .acts";
   var PLAYER_NAME = "main h1";
   var COPY_LINK_LABEL = "Copier le lien";
-  function placeButton(actions, button) {
-    const copyLink = [...actions.querySelectorAll("button")].find((node) => node.textContent.trim() === COPY_LINK_LABEL);
-    if (!copyLink) return actions.append(button);
+  function placeButton(actions2, button) {
+    const copyLink = [...actions2.querySelectorAll("button")].find((node) => node.textContent.trim() === COPY_LINK_LABEL);
+    if (!copyLink) return actions2.append(button);
     copyLink.classList.add("kp-native-hidden");
     button.className = copyLink.className.replace(/\bkp-native-hidden\b/, "").trim();
     copyLink.before(button);
@@ -4555,72 +5791,8 @@ body.kp-offers main section.board > :not([role='dialog']):not(:has([role='dialog
   cursor: progress;\r
 }\r
 \r
-body[data-kp-trades-tab] main [role='tabpanel'] > h2[data-kp-section],\r
-body[data-kp-trades-tab='board'] main [data-kp-section]:not([data-kp-section='board']),\r
-body[data-kp-trades-tab='received'] main [data-kp-section]:not([data-kp-section='received']),\r
-body[data-kp-trades-tab='sent'] main [data-kp-section]:not([data-kp-section='sent']) {\r
-  display: none !important;\r
-}\r
-\r
-.kp-trade-tabs {\r
-  margin: var(--s-3) 0;\r
-}\r
-\r
-.kp-trade-host > .compact,\r
-.kp-trade-host > .trays,\r
-.kp-trade-host > .verdict,\r
-.kp-trade-host > .more,\r
-.kp-trade-host > .sides {\r
-  display: none !important;\r
-}\r
-\r
 .kp-badge--new {\r
   color: var(--ok);\r
-}\r
-\r
-[data-kp-section='board'] .kp-trade-host {\r
-  text-align: center;\r
-}\r
-\r
-[data-kp-section='board'] .kp-trade-host > .th {\r
-  justify-content: center;\r
-  gap: var(--s-2);\r
-}\r
-\r
-body[data-kp-trades-tab] main [role='tabpanel'] ul.trades[data-kp-section='board'] {\r
-  display: grid;\r
-  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));\r
-  align-items: start;\r
-  gap: var(--s-3);\r
-}\r
-\r
-.kp-trade {\r
-  display: grid;\r
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);\r
-  align-items: start;\r
-  gap: var(--s-2);\r
-  margin: var(--s-2) 0;\r
-}\r
-\r
-.kp-trade > .kp-swap {\r
-  align-self: center;\r
-  color: var(--acc);\r
-  font-size: 14px;\r
-}\r
-\r
-.kp-trade__side {\r
-  display: flex;\r
-  flex-direction: column;\r
-  align-items: center;\r
-  gap: var(--s-2);\r
-  min-width: 0;\r
-}\r
-\r
-.kp-trade__cards {\r
-  display: flex;\r
-  flex-wrap: wrap;\r
-  justify-content: center;\r
-  gap: var(--s-2);\r
 }\r
 \r
 .kp-tcard {\r
@@ -4634,166 +5806,6 @@ body[data-kp-trades-tab] main [role='tabpanel'] ul.trades[data-kp-section='board
 \r
 .kp-tcard .kp-name {\r
   max-width: 100%;\r
-}\r
-\r
-.kp-trade__cards:has(> .kp-tcard:nth-child(2)) .kp-tcard {\r
-  width: 60px;\r
-}\r
-\r
-.kp-trade__total {\r
-  color: var(--mut);\r
-}\r
-\r
-.kp-trade__net {\r
-  grid-column: 1 / -1;\r
-  justify-self: center;\r
-  font-family: var(--mono);\r
-  font-size: var(--t-base);\r
-  font-weight: 700;\r
-}\r
-\r
-.kp-trade__net--up {\r
-  color: var(--ok);\r
-}\r
-\r
-.kp-trade__net--down {\r
-  color: var(--danger);\r
-}\r
-\r
-.kp-trade__net--flat {\r
-  color: var(--mut);\r
-}\r
-\r
-.kp-trade--wide {\r
-  display: grid;\r
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);\r
-  align-items: stretch;\r
-  gap: var(--s-3);\r
-}\r
-\r
-.kp-trade--wide > .kp-swap {\r
-  align-self: center;\r
-  color: var(--acc);\r
-}\r
-\r
-.kp-trade__summary {\r
-  display: inline-flex;\r
-  align-items: center;\r
-  gap: var(--s-3);\r
-  margin-left: auto;\r
-  margin-right: var(--s-2);\r
-}\r
-\r
-.kp-pill {\r
-  padding: 2px 10px;\r
-  border: 1px solid currentColor;\r
-  border-radius: var(--r-pill);\r
-  font-family: var(--mono);\r
-  font-size: var(--t-sm);\r
-  font-weight: 700;\r
-}\r
-\r
-.kp-pill--up {\r
-  color: var(--ok);\r
-}\r
-\r
-.kp-pill--down {\r
-  color: var(--danger);\r
-}\r
-\r
-.kp-pill--flat {\r
-  color: var(--mut);\r
-}\r
-\r
-.kp-trade__box {\r
-  container-type: inline-size;\r
-  display: flex;\r
-  flex-direction: column;\r
-  gap: var(--s-2);\r
-  padding: var(--s-2) var(--s-3) var(--s-3);\r
-  border: 1px solid var(--line);\r
-  border-radius: var(--r-lg);\r
-  background: var(--panel2);\r
-}\r
-\r
-.kp-trade__box-head {\r
-  display: flex;\r
-  flex-wrap: wrap;\r
-  align-items: center;\r
-  gap: var(--s-1) var(--s-3);\r
-}\r
-\r
-.kp-trade__box-total {\r
-  margin-left: auto;\r
-}\r
-\r
-.kp-trade__grid {\r
-  display: grid;\r
-  grid-template-columns: repeat(10, minmax(0, 1fr));\r
-  gap: 6px;\r
-}\r
-\r
-@container (max-width: 480px) {\r
-  .kp-trade__grid {\r
-    grid-template-columns: repeat(5, minmax(0, 1fr));\r
-  }\r
-}\r
-\r
-.kp-trade__grid .kp-tcard {\r
-  width: auto;\r
-}\r
-\r
-.kp-trade__box .kp-badge {\r
-  right: 2px;\r
-  bottom: 2px;\r
-  padding: 0 4px;\r
-  font-size: 9px;\r
-}\r
-\r
-.kp-trade__note {\r
-  font-size: var(--t-meta);\r
-  font-weight: 600;\r
-}\r
-\r
-.kp-trade__note--warn {\r
-  color: var(--warn);\r
-}\r
-\r
-.kp-trade__note--new {\r
-  color: var(--ok);\r
-}\r
-\r
-.kp-trade__note--muted {\r
-  color: var(--fg2);\r
-}\r
-\r
-.kp-trade-host .tact .talk {\r
-  display: none !important;\r
-}\r
-\r
-.kp-trade-host .tact:not(:has(> :not(.talk))) {\r
-  display: none !important;\r
-}\r
-\r
-.kp-talk {\r
-  display: inline-grid;\r
-  place-items: center;\r
-  width: 22px;\r
-  height: 22px;\r
-  margin-left: 6px;\r
-  padding: 0;\r
-  border: none;\r
-  border-radius: 50%;\r
-  background: transparent;\r
-  color: var(--mut);\r
-  font-size: 13px;\r
-  vertical-align: middle;\r
-  cursor: pointer;\r
-}\r
-\r
-.kp-talk:hover {\r
-  background: var(--raise);\r
-  color: var(--fg);\r
 }\r
 \r
 .kp-count-host {\r
@@ -5082,100 +6094,840 @@ body.kp-free-mode main .under .btn-open[data-kp-label]::after {\r
   content: attr(data-kp-label);\r
   font-size: var(--t-base, 1rem);\r
 }\r
-
-.kp-auto-open__trigger {
-  position: relative;
-  display: inline-grid;
-  place-items: center;
-  font-size: 18px;
-}
-
-.kp-auto-open__trigger.is-live::after {
-  content: '';
-  position: absolute;
-  top: 6px;
-  right: 6px;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--ok);
-  box-shadow: 0 0 6px var(--ok);
-}
-
-.kp-auto-open {
-  position: fixed;
-  top: 72px;
-  right: 16px;
-  z-index: 900;
-  display: flex;
-  flex-direction: column;
-  gap: var(--s-3);
-  width: min(380px, calc(100vw - 32px));
-  padding: var(--s-4);
-  border: 1px solid var(--line2);
-  border-radius: var(--r-lg);
-  background: var(--panel);
-  box-shadow: var(--sh-1);
-  color: var(--fg);
-}
-
-.kp-auto-open[hidden] {
-  display: none;
-}
-
-.kp-auto-open__head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.kp-auto-open__status {
-  margin: 0;
-  font-size: var(--t-sm);
-  font-weight: 600;
-}
-
-.kp-auto-open .kp-field {
-  flex-wrap: wrap;
-}
-
-.kp-auto-open .kp-field .kp-label {
-  flex: 1 0 100%;
-}
-
-.kp-auto-open__log {
-  display: flex;
-  flex-direction: column;
-  gap: var(--s-1);
-}
-
-.kp-auto-open__log-row {
-  display: flex;
-  align-items: center;
-  gap: var(--s-2);
-  font-size: var(--t-sm);
-}
-
-.kp-auto-open__gems {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  margin-left: auto;
-  font-family: var(--mono);
-}
-
-/* The site's "Tu es toujours là ?" prompt is a browser-only idle pause (nothing is sent to the server); the
-   auto-open runs on its own requests, so the prompt would only cover the page while it works. */
-body.kp-auto-open-on [role='dialog'][aria-labelledby='idle-t'] {
-  display: none !important;
-}
+\r
+.kp-auto-open__trigger {\r
+  position: relative;\r
+  display: inline-grid;\r
+  place-items: center;\r
+  font-size: 18px;\r
+}\r
+\r
+.kp-auto-open__trigger.is-live::after {\r
+  content: '';\r
+  position: absolute;\r
+  top: 6px;\r
+  right: 6px;\r
+  width: 8px;\r
+  height: 8px;\r
+  border-radius: 50%;\r
+  background: var(--ok);\r
+  box-shadow: 0 0 6px var(--ok);\r
+}\r
+\r
+.kp-auto-open {\r
+  position: fixed;\r
+  top: 72px;\r
+  right: 16px;\r
+  z-index: 900;\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: var(--s-3);\r
+  width: min(380px, calc(100vw - 32px));\r
+  padding: var(--s-4);\r
+  border: 1px solid var(--line2);\r
+  border-radius: var(--r-lg);\r
+  background: var(--panel);\r
+  box-shadow: var(--sh-1);\r
+  color: var(--fg);\r
+}\r
+\r
+.kp-auto-open[hidden] {\r
+  display: none;\r
+}\r
+\r
+.kp-auto-open__head {\r
+  display: flex;\r
+  align-items: center;\r
+  justify-content: space-between;\r
+}\r
+\r
+.kp-auto-open__status {\r
+  margin: 0;\r
+  font-size: var(--t-sm);\r
+  font-weight: 600;\r
+}\r
+\r
+.kp-auto-open .kp-field {\r
+  flex-wrap: wrap;\r
+}\r
+\r
+.kp-auto-open .kp-field .kp-label {\r
+  flex: 1 0 100%;\r
+}\r
+\r
+.kp-auto-open__log {\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: var(--s-1);\r
+}\r
+\r
+.kp-auto-open__log-row {\r
+  display: flex;\r
+  align-items: center;\r
+  gap: var(--s-2);\r
+  font-size: var(--t-sm);\r
+}\r
+\r
+.kp-auto-open__gems {\r
+  display: inline-flex;\r
+  align-items: center;\r
+  gap: 4px;\r
+  margin-left: auto;\r
+  font-family: var(--mono);\r
+}\r
+\r
+/* The site's "Tu es toujours là ?" prompt is a browser-only idle pause (nothing is sent to the server); the\r
+   auto-open runs on its own requests, so the prompt would only cover the page while it works. */\r
+body.kp-auto-open-on [role='dialog'][aria-labelledby='idle-t'] {\r
+  display: none !important;\r
+}\r
+\r
+body.kp-header .hdr a.navlink.support {\r
+  display: none !important;\r
+}\r
+\r
+body.kp-activity:not(.kp-activity--native) main [role='tabpanel'] > :not(.kp-act):not([role='dialog']):not(:has([role='dialog'])) {\r
+  display: none !important;\r
+}\r
+\r
+/* The market hero (kicker, title, intro, Cartes / Éveil) used half a screen: one slim line is enough. */\r
+body.kp-market main > section.head {\r
+  display: flex;\r
+  align-items: center;\r
+  justify-content: space-between;\r
+  gap: var(--s-4);\r
+  min-height: 0 !important;\r
+  margin-block: 0 !important;\r
+  padding-block: var(--s-3) !important;\r
+}\r
+\r
+body.kp-market main > section.head .eyebrow,\r
+body.kp-market main > section.head .lead {\r
+  display: none !important;\r
+}\r
+\r
+body.kp-market main > section.head .h1 {\r
+  margin: 0 !important;\r
+  font-size: 24px !important;\r
+  line-height: 1.15 !important;\r
+}\r
+\r
+body.kp-market main > section.head .mode {\r
+  margin: 0 !important;\r
+}\r
+\r
+.kp-act,\r
+.kp-act__content {\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: var(--s-3);\r
+}\r
+\r
+.kp-act__bar {\r
+  display: flex;\r
+  flex-wrap: wrap;\r
+  align-items: center;\r
+  gap: var(--s-2) var(--s-4);\r
+}\r
+\r
+.kp-act__bar .kp-title {\r
+  flex: none;\r
+}\r
+\r
+.kp-act.is-native .kp-act__content,\r
+.kp-act.is-native .kp-act__bar .kp-title,\r
+.kp-act.is-native .kp-act__summary {\r
+  display: none;\r
+}\r
+\r
+.kp-act.is-native .kp-act__bar {\r
+  justify-content: flex-end;\r
+}\r
+\r
+.kp-act__summary {\r
+  display: flex;\r
+  flex: 1 1 280px;\r
+  flex-wrap: wrap;\r
+  align-items: center;\r
+  gap: var(--s-2) var(--s-3);\r
+  min-width: 0;\r
+}\r
+\r
+.kp-act__summary[hidden] {\r
+  display: none;\r
+}\r
+\r
+.kp-act__lede {\r
+  color: var(--warn);\r
+  font-size: var(--t-sm);\r
+  font-weight: 600;\r
+}\r
+\r
+.kp-act__lede.is-calm {\r
+  color: var(--mut);\r
+  font-weight: 500;\r
+}\r
+\r
+.kp-act__stats {\r
+  display: flex;\r
+  flex-wrap: wrap;\r
+  gap: var(--s-2);\r
+  margin-left: auto;\r
+}\r
+\r
+.kp-act__stat {\r
+  display: inline-flex;\r
+  align-items: center;\r
+  gap: 8px;\r
+  padding: 4px 12px;\r
+  border: 1px solid var(--line);\r
+  border-radius: var(--r-pill);\r
+  background: var(--panel);\r
+  color: var(--fg2);\r
+  font: 500 var(--t-sm) var(--body);\r
+}\r
+\r
+.kp-act__stat strong {\r
+  color: var(--fg);\r
+  font-family: var(--mono);\r
+}\r
+\r
+button.kp-act__stat {\r
+  cursor: pointer;\r
+}\r
+\r
+button.kp-act__stat:hover,\r
+.kp-act__stat.is-on {\r
+  border-color: var(--acc);\r
+  background: var(--acc-soft);\r
+}\r
+\r
+.kp-act__ledger {\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: var(--s-2);\r
+  padding: var(--s-3) var(--s-4);\r
+  border: 1px solid var(--line);\r
+  border-radius: var(--r-lg);\r
+  background: var(--panel);\r
+}\r
+\r
+.kp-act__ledger[hidden] {\r
+  display: none;\r
+}\r
+\r
+.kp-act__bar-track {\r
+  display: flex;\r
+  height: 10px;\r
+  overflow: hidden;\r
+  border-radius: var(--r-pill);\r
+  background: var(--bg2);\r
+}\r
+\r
+.kp-act__legend {\r
+  display: flex;\r
+  flex-wrap: wrap;\r
+  gap: var(--s-1) var(--s-4);\r
+  margin: var(--s-2) 0 0;\r
+  padding: 0;\r
+  color: var(--fg2);\r
+  font-size: var(--t-sm);\r
+  list-style: none;\r
+}\r
+\r
+.kp-act__legend i {\r
+  display: inline-block;\r
+  width: 10px;\r
+  height: 10px;\r
+  margin-right: 6px;\r
+  border-radius: 2px;\r
+}\r
+\r
+.kp-act__sales {\r
+  display: flex;\r
+  align-items: center;\r
+  gap: var(--s-2);\r
+  margin: 0;\r
+  color: var(--fg2);\r
+  font-size: var(--t-sm);\r
+}\r
+\r
+.kp-act__toolbar {\r
+  display: flex;\r
+  flex-wrap: wrap;\r
+  align-items: center;\r
+  justify-content: space-between;\r
+  gap: var(--s-3);\r
+}\r
+\r
+.kp-act__tabs {\r
+  display: flex;\r
+  flex-wrap: wrap;\r
+  gap: 4px;\r
+  padding: 4px;\r
+  border: 1px solid var(--line);\r
+  border-radius: var(--r-lg);\r
+  background: var(--panel);\r
+}\r
+\r
+.kp-act__tab {\r
+  display: inline-flex;\r
+  align-items: center;\r
+  gap: 8px;\r
+  padding: 7px 12px;\r
+  border: 0;\r
+  border-radius: var(--r-md);\r
+  background: transparent;\r
+  color: var(--fg2);\r
+  font: 600 var(--t-sm) var(--body);\r
+  cursor: pointer;\r
+  transition: background 0.15s, color 0.15s;\r
+}\r
+\r
+.kp-act__tab:hover {\r
+  background: var(--raise);\r
+  color: var(--fg);\r
+}\r
+\r
+.kp-act__tab.on {\r
+  background: var(--acc);\r
+  color: #fff;\r
+  box-shadow: 0 2px 10px color-mix(in srgb, var(--acc) 40%, transparent);\r
+}\r
+\r
+.kp-act__tab.is-empty:not(.on) {\r
+  opacity: 0.55;\r
+}\r
+\r
+.kp-act__tab .n {\r
+  min-width: 20px;\r
+  padding: 1px 6px;\r
+  border-radius: var(--r-pill);\r
+  background: var(--bg2);\r
+  color: var(--fg2);\r
+  font: 700 11px var(--mono);\r
+  text-align: center;\r
+}\r
+\r
+.kp-act__tab.on .n {\r
+  background: rgb(255 255 255 / 0.22);\r
+  color: #fff;\r
+}\r
+\r
+.kp-act__tab.has-todo:not(.on) .n {\r
+  background: var(--warn);\r
+  color: var(--bg);\r
+}\r
+\r
+.kp-act__tools {\r
+  display: flex;\r
+  flex-wrap: wrap;\r
+  align-items: center;\r
+  gap: var(--s-2);\r
+}\r
+\r
+.kp-act__search {\r
+  flex: 1 1 160px;\r
+  min-width: 140px;\r
+  max-width: 260px;\r
+}\r
+\r
+.kp-act__sort {\r
+  flex: 0 0 auto;\r
+  width: auto;\r
+}\r
+\r
+.kp-act__tools .kp-btn[hidden] {\r
+  display: none;\r
+}\r
+\r
+.kp-act__body {\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: var(--s-4);\r
+}\r
+\r
+.kp-act__notice {\r
+  margin: 0;\r
+  color: var(--mut);\r
+  font-size: var(--t-sm);\r
+}\r
+\r
+.kp-act__notice--error {\r
+  color: var(--danger);\r
+}\r
+\r
+.kp-act__group {\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: var(--s-2);\r
+}\r
+\r
+.kp-act__group-title {\r
+  display: flex;\r
+  align-items: center;\r
+  gap: var(--s-2);\r
+  margin: 0;\r
+  color: var(--fg2);\r
+  font: 700 var(--t-sm) var(--disp);\r
+  letter-spacing: 0.06em;\r
+  text-transform: uppercase;\r
+}\r
+\r
+.kp-act__group-title .mono {\r
+  color: var(--mut);\r
+  font-weight: 500;\r
+}\r
+\r
+.kp-act__list {\r
+  display: grid;\r
+  grid-template-columns: minmax(0, 1fr);\r
+  gap: var(--s-3);\r
+  align-items: start;\r
+  margin: 0;\r
+  padding: 0;\r
+  list-style: none;\r
+}\r
+\r
+.kp-act__row {\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: var(--s-3);\r
+  min-width: 0;\r
+  padding: var(--s-3);\r
+  border: 1px solid var(--line);\r
+  border-radius: var(--r-lg);\r
+  background: var(--panel);\r
+  transition: opacity 0.15s, border-color 0.15s;\r
+}\r
+\r
+.kp-act__row:hover {\r
+  border-color: var(--line2);\r
+}\r
+\r
+.kp-act__row--todo {\r
+  border-color: var(--warn);\r
+  box-shadow: inset 3px 0 0 var(--warn);\r
+}\r
+\r
+.kp-act__row--done {\r
+  background: color-mix(in srgb, var(--panel) 70%, var(--bg));\r
+}\r
+\r
+.kp-act__row.is-focus {\r
+  animation: kp-act-focus 2.6s ease-out;\r
+}\r
+\r
+@keyframes kp-act-focus {\r
+  0%,\r
+  60% {\r
+    box-shadow: 0 0 0 2px var(--acc);\r
+  }\r
+\r
+  100% {\r
+    box-shadow: 0 0 0 0 transparent;\r
+  }\r
+}\r
+\r
+.kp-act__head {\r
+  display: flex;\r
+  align-items: center;\r
+  gap: var(--s-3);\r
+  min-width: 0;\r
+  cursor: pointer;\r
+}\r
+\r
+.kp-act__kind {\r
+  --kc: var(--acc);\r
+  display: grid;\r
+  flex: none;\r
+  place-items: center;\r
+  width: 34px;\r
+  height: 34px;\r
+  border: 1px solid color-mix(in srgb, var(--kc) 55%, transparent);\r
+  border-radius: 50%;\r
+  background: color-mix(in srgb, var(--kc) 14%, transparent);\r
+  color: var(--kc);\r
+  font: 700 16px var(--disp);\r
+}\r
+\r
+.kp-act__kind[data-kind='bid'] {\r
+  --kc: var(--gold);\r
+}\r
+\r
+.kp-act__kind[data-kind='order'] {\r
+  --kc: var(--cyan);\r
+}\r
+\r
+.kp-act__kind[data-kind='tradeIn'],\r
+.kp-act__kind[data-kind='tradeOut'] {\r
+  --kc: var(--E);\r
+}\r
+\r
+.kp-act__kind[data-kind='counter'] {\r
+  --kc: var(--ok);\r
+}\r
+\r
+.kp-act__txt {\r
+  display: flex;\r
+  flex: 1;\r
+  flex-direction: column;\r
+  gap: 2px;\r
+  min-width: 0;\r
+}\r
+\r
+.kp-act__state {\r
+  display: flex;\r
+  flex: none;\r
+  flex-direction: column;\r
+  align-items: flex-end;\r
+  gap: 2px;\r
+  max-width: 55%;\r
+  text-align: right;\r
+}\r
+\r
+.kp-act__status {\r
+  font-size: var(--t-meta);\r
+  font-weight: 700;\r
+}\r
+\r
+.kp-act__status--good {\r
+  color: var(--ok);\r
+}\r
+\r
+.kp-act__status--bad {\r
+  color: var(--danger);\r
+}\r
+\r
+.kp-act__status--warn {\r
+  color: var(--warn);\r
+}\r
+\r
+.kp-act__status--accent {\r
+  color: var(--acc);\r
+}\r
+\r
+.kp-act__status--muted {\r
+  color: var(--mut);\r
+}\r
+\r
+.kp-act__cards,\r
+.kp-act__full {\r
+  display: grid;\r
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);\r
+  gap: var(--s-2);\r
+  align-items: center;\r
+}\r
+\r
+.kp-act__full {\r
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);\r
+  align-items: start;\r
+}\r
+\r
+.kp-act__side {\r
+  display: flex;\r
+  flex-direction: column;\r
+  align-items: center;\r
+  gap: var(--s-2);\r
+  min-width: 0;\r
+  text-align: center;\r
+}\r
+\r
+.kp-act__tiles {\r
+  display: flex;\r
+  flex-wrap: wrap;\r
+  align-items: flex-start;\r
+  justify-content: center;\r
+  gap: var(--s-2);\r
+}\r
+\r
+.kp-act__tiles .kp-tcard {\r
+  width: 72px;\r
+}\r
+\r
+.kp-act__more,\r
+.kp-act__chakra {\r
+  align-self: center;\r
+  color: var(--fg2);\r
+  font: 700 var(--t-base) var(--mono);\r
+}\r
+\r
+.kp-act__chakra {\r
+  color: var(--cyan);\r
+}\r
+\r
+.kp-art--missing {\r
+  display: grid;\r
+  place-items: center;\r
+  width: 72px;\r
+  color: var(--mut);\r
+}\r
+\r
+.kp-act__foot {\r
+  display: flex;\r
+  flex-wrap: wrap;\r
+  align-items: center;\r
+  justify-content: space-between;\r
+  gap: var(--s-2);\r
+}\r
+\r
+.kp-act__net {\r
+  padding: 3px 10px;\r
+  font-size: var(--t-sm);\r
+  font-weight: 700;\r
+  white-space: nowrap;\r
+}\r
+\r
+.kp-act__acts {\r
+  display: flex;\r
+  align-items: center;\r
+  gap: var(--s-2);\r
+  margin-left: auto;\r
+}\r
+\r
+.kp-act__acts .kp-btn {\r
+  text-decoration: none;\r
+}\r
+\r
+.kp-act__detail {\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: var(--s-3);\r
+  padding-top: var(--s-3);\r
+  border-top: 1px solid var(--line);\r
+}\r
+\r
+.kp-act__facts {\r
+  display: grid;\r
+  grid-template-columns: max-content minmax(0, 1fr);\r
+  gap: 4px var(--s-4);\r
+  margin: 0;\r
+  font-size: var(--t-sm);\r
+}\r
+\r
+.kp-act__facts dt {\r
+  color: var(--mut);\r
+}\r
+\r
+.kp-act__facts dd {\r
+  margin: 0;\r
+}\r
+\r
+.kp-act__link {\r
+  color: var(--acc);\r
+  text-decoration: underline;\r
+}\r
+\r
+.kp-act__list--board {\r
+  grid-template-columns: repeat(5, minmax(0, 1fr));\r
+  gap: var(--s-2);\r
+}\r
+\r
+.kp-act__list--minis {\r
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));\r
+  gap: var(--s-2);\r
+}\r
+\r
+.kp-act__row--compact {\r
+  gap: var(--s-2);\r
+  padding: var(--s-2);\r
+}\r
+\r
+.kp-act__row--compact .kp-act__head {\r
+  gap: var(--s-2);\r
+}\r
+\r
+.kp-act__row--compact .kp-act__kind {\r
+  width: 24px;\r
+  height: 24px;\r
+  font-size: 12px;\r
+}\r
+\r
+.kp-act__row--compact .kp-act__state {\r
+  max-width: 50%;\r
+}\r
+\r
+.kp-act__row--compact .kp-act__tiles .kp-tcard {\r
+  width: 56px;\r
+}\r
+\r
+.kp-act__row--compact .kp-act__side .kp-label {\r
+  font-size: 10px;\r
+}\r
+\r
+.kp-act__row--compact .kp-act__acts .kp-btn {\r
+  padding: 3px 6px;\r
+}\r
+\r
+.kp-act__row--wide .kp-act__head {\r
+  flex-wrap: wrap;\r
+}\r
+\r
+.kp-act__row--wide .kp-act__txt {\r
+  flex: 1 1 140px;\r
+}\r
+\r
+.kp-act__row--wide .kp-act__state {\r
+  flex-direction: row;\r
+  align-items: center;\r
+  gap: var(--s-3);\r
+  max-width: none;\r
+}\r
+\r
+.kp-act__row--wide .kp-act__acts {\r
+  margin-left: 0;\r
+}\r
+\r
+.kp-act__boxes {\r
+  display: grid;\r
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);\r
+  align-items: stretch;\r
+  gap: var(--s-3);\r
+}\r
+\r
+.kp-act__boxes > .kp-swap {\r
+  color: var(--acc);\r
+}\r
+\r
+.kp-act__box {\r
+  container-type: inline-size;\r
+  display: flex;\r
+  flex-direction: column;\r
+  gap: var(--s-2);\r
+  padding: var(--s-2) var(--s-3) var(--s-3);\r
+  border: 1px solid var(--line);\r
+  border-radius: var(--r-lg);\r
+  background: var(--panel2);\r
+}\r
+\r
+.kp-act__box-head {\r
+  display: flex;\r
+  flex-wrap: wrap;\r
+  align-items: center;\r
+  gap: var(--s-1) var(--s-3);\r
+}\r
+\r
+.kp-act__box-total {\r
+  margin-left: auto;\r
+}\r
+\r
+.kp-act__grid {\r
+  display: grid;\r
+  grid-template-columns: repeat(10, minmax(0, 1fr));\r
+  gap: 6px;\r
+}\r
+\r
+@container (max-width: 480px) {\r
+  .kp-act__grid {\r
+    grid-template-columns: repeat(5, minmax(0, 1fr));\r
+  }\r
+}\r
+\r
+.kp-act__grid .kp-tcard {\r
+  width: auto;\r
+}\r
+\r
+.kp-act__box .kp-badge {\r
+  right: 2px;\r
+  bottom: 2px;\r
+  padding: 0 4px;\r
+  font-size: 9px;\r
+}\r
+\r
+.kp-act__note {\r
+  font-size: var(--t-meta);\r
+  font-weight: 600;\r
+}\r
+\r
+.kp-act__note--warn {\r
+  color: var(--warn);\r
+}\r
+\r
+.kp-act__note--new {\r
+  color: var(--ok);\r
+}\r
+\r
+.kp-act__note--muted {\r
+  color: var(--fg2);\r
+}\r
+\r
+.kp-act__row--mini {\r
+  gap: var(--s-2);\r
+  padding: var(--s-2) var(--s-3);\r
+}\r
+\r
+.kp-act__mini {\r
+  display: grid;\r
+  grid-template-columns: 44px minmax(0, 1fr) auto auto;\r
+  align-items: center;\r
+  gap: var(--s-3);\r
+  cursor: pointer;\r
+}\r
+\r
+.kp-act__mini .kp-act__txt {\r
+  gap: 1px;\r
+}\r
+\r
+.kp-act__mini .kp-note {\r
+  white-space: normal;\r
+}\r
+\r
+.kp-act__money {\r
+  display: flex;\r
+  flex-direction: column;\r
+  align-items: flex-end;\r
+  gap: 2px;\r
+}\r
+\r
+.kp-act__amount {\r
+  color: var(--cyan);\r
+  font: 700 var(--t-base) var(--mono);\r
+  white-space: nowrap;\r
+}\r
+\r
+.kp-act__money .kp-act__net {\r
+  padding: 1px 6px;\r
+  font-size: var(--t-meta);\r
+}\r
+\r
+.kp-act__mini .kp-art--missing {\r
+  width: 44px;\r
+}\r
+\r
+@media (max-width: 1100px) {\r
+  .kp-act__list--board {\r
+    grid-template-columns: repeat(3, minmax(0, 1fr));\r
+  }\r
+}\r
+\r
+@media (max-width: 760px) {\r
+  .kp-act__boxes {\r
+    grid-template-columns: minmax(0, 1fr);\r
+  }\r
+\r
+  .kp-act__list--board {\r
+    grid-template-columns: repeat(2, minmax(0, 1fr));\r
+  }\r
+\r
+  .kp-act__list--minis {\r
+    grid-template-columns: minmax(0, 1fr);\r
+  }\r
+\r
+  .kp-act__tab-label {\r
+    display: none;\r
+  }\r
+\r
+  .kp-act__tab.on .kp-act__tab-label {\r
+    display: inline;\r
+  }\r
+}\r
 `;
 
   // src/main.js
   var features = [
     market_counter_default,
     market_offers_default,
-    market_trades_default,
+    market_activity_default,
     collection_ghosts_default,
     collection_albums_default,
     collection_locks_default,
@@ -5187,7 +6939,8 @@ body.kp-auto-open-on [role='dialog'][aria-labelledby='idle-t'] {
     profile_background_default,
     offer_dialog_default,
     free_packs_default,
-    auto_open_default
+    auto_open_default,
+    header_nav_default
   ];
   var mounted = /* @__PURE__ */ new Map();
   function syncFeatures() {
